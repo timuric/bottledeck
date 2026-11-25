@@ -95,9 +95,11 @@ fn check_branch_behind_notice(dir: &Path) -> Option<String> {
 
 impl RepoContext {
     pub fn discover(worktree_paths: &[String]) -> Self {
-        let Some(root) = worktree_paths.iter().find(|p| {
-            Path::new(p).is_dir() && !p.contains("/tmp/") && !p.contains("/var/folders/")
-        }) else {
+        let Some(root) = worktree_paths
+            .iter()
+            .find(|p| Path::new(p).is_dir() && !p.contains("/tmp/") && !p.contains("/var/folders/"))
+            .or_else(|| worktree_paths.iter().find(|p| Path::new(p).is_dir()))
+        else {
             return Self::default();
         };
 

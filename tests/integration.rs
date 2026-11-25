@@ -422,6 +422,21 @@ fn cross_session_originator_subagent_mcp_tools_and_truncation() {
     let tmp = TempDir::new().unwrap();
     let repo_dir = tmp.path().join("demo-app");
     fs::create_dir_all(&repo_dir).unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo_dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/demo-app.git",
+        ])
+        .current_dir(&repo_dir)
+        .status()
+        .unwrap();
     fs::write(
         repo_dir.join("mise.toml"),
         "[tasks.guide]\nrun = \"echo guide\"\n[tasks.changes]\nrun = \"echo diff\"\n",
