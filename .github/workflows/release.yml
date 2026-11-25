@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Determine release tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CC_x86_64_apple_darwin: clang
+          CFLAGS_x86_64_apple_darwin: "--target=x86_64-apple-darwin"
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          strip "target/${{ matrix.target }}/release/bottledeck" || true
+
+      - name: Package archive & checksum
+        shell: bash
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          ARCHIVE="bottledeck-${TAG}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist/stage
+          cp "target/${{ matrix.target }}/release/bottledeck" dist/stage/bottledeck
+          cp README.md LICENSE dist/stage/
+          tar -C dist/stage -czf "dist/${ARCHIVE}" bottledeck README.md LICENSE
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          else
+            (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          fi
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish:
+    name: Publish GitHub Release & Update Homebrew Formula
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine release tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS.txt
+        shell: bash
+        run: |
+          cat artifacts/*.sha256 | sort -k2 > artifacts/SHA256SUMS.txt
+          cat artifacts/SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          NOTES=$(cat <<EOF
+          ## Install or Upgrade
+
+          **Quick install / upgrade (macOS & Linux):**
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/timuric/bottledeck/main/install.sh | sh
+          \`\`\`
+
+          **Already installed?**
+          \`\`\`sh
+          bottledeck update
+          \`\`\`
+
+          **Homebrew:**
+          \`\`\`sh
+          brew tap timuric/bottledeck https://github.com/timuric/bottledeck
+          brew install bottledeck
+          # upgrade later:
+          brew upgrade bottledeck
+          \`\`\`
+          EOF
+          )
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" artifacts/*.tar.gz artifacts/SHA256SUMS.txt --clobber
+          else
+            gh release create "${TAG}" \
+              artifacts/*.tar.gz \
+              artifacts/SHA256SUMS.txt \
+              --title "bottledeck ${TAG}" \
+              --generate-notes \
+              --notes "${NOTES}"
+          fi
+
+      - name: Update Formula/bottledeck.rb on main
+        shell: bash
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          SHA_MAC_ARM="$(awk '/aarch64-apple-darwin\.tar\.gz$/ { print $1 }' artifacts/SHA256SUMS.txt)"
+          SHA_MAC_X64="$(awk '/x86_64-apple-darwin\.tar\.gz$/ { print $1 }' artifacts/SHA256SUMS.txt)"
+          SHA_LIN_X64="$(awk '/x86_64-unknown-linux-gnu\.tar\.gz$/ { print $1 }' artifacts/SHA256SUMS.txt)"
+          SHA_LIN_ARM="$(awk '/aarch64-unknown-linux-gnu\.tar\.gz$/ { print $1 }' artifacts/SHA256SUMS.txt)"
+
+          mkdir -p Formula
+          cat > Formula/bottledeck.rb <<EOF
+          class Bottledeck < Formula
+            desc "Zero-touch multi-harness telemetry, Ratatui dashboard, and bottleneck analyzer for coding agents"
+            homepage "https://github.com/timuric/bottledeck"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/timuric/bottledeck/releases/download/${TAG}/bottledeck-${TAG}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              else
+                url "https://github.com/timuric/bottledeck/releases/download/${TAG}/bottledeck-${TAG}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X64}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/timuric/bottledeck/releases/download/${TAG}/bottledeck-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LIN_ARM}"
+              else
+                url "https://github.com/timuric/bottledeck/releases/download/${TAG}/bottledeck-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LIN_X64}"
+              end
+            end
+
+            def install
+              bin.install "bottledeck"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/bottledeck --version")
+            end
+          end
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          git add Formula/bottledeck.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): update Homebrew formula for ${TAG}"
+            git push origin main
+          fi
