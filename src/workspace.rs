@@ -173,6 +173,7 @@ pub struct WorkspaceResolver<'a> {
     db: Option<&'a Connection>,
     cache: HashMap<String, WorkspaceInfo>,
     known_repos: HashMap<String, (String, String)>, // short_name -> (repo_id, repo_name)
+    pending_writes: Vec<WorkspaceInfo>,
 }
 
 impl<'a> WorkspaceResolver<'a> {
@@ -181,13 +182,61 @@ impl<'a> WorkspaceResolver<'a> {
             db,
             cache: HashMap::new(),
             known_repos: HashMap::new(),
+            pending_writes: Vec::new(),
         };
         me.load_existing();
         me
     }
 
+    /// Create a detached resolver pre-seeded from `conn` so it can be reused across many files
+    /// without holding an immutable borrow on `conn` during write transactions.
+    pub fn new_detached(conn: &Connection) -> WorkspaceResolver<'static> {
+        let mut me = WorkspaceResolver {
+            db: None,
+            cache: HashMap::new(),
+            known_repos: HashMap::new(),
+            pending_writes: Vec::new(),
+        };
+        me.load_from_conn(conn);
+        me
+    }
+
+    /// Persist any newly discovered workspaces queued while running in detached mode.
+    pub fn flush_pending(&mut self, conn: &Connection) {
+        if self.pending_writes.is_empty() {
+            return;
+        }
+        let now = Utc::now().timestamp_millis();
+        for resolved in self.pending_writes.drain(..) {
+            let _ = conn.execute(
+                "INSERT INTO workspaces (
+                  workspace_id, repo_id, repo_name, worktree_path, git_common_dir, is_worktree, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(worktree_path) DO UPDATE SET
+                  repo_id = excluded.repo_id,
+                  repo_name = excluded.repo_name,
+                  git_common_dir = COALESCE(excluded.git_common_dir, workspaces.git_common_dir),
+                  is_worktree = excluded.is_worktree,
+                  updated_at = excluded.updated_at",
+                params![
+                    resolved.workspace_id,
+                    resolved.repo_id,
+                    resolved.repo_name,
+                    resolved.worktree_path,
+                    resolved.git_common_dir,
+                    if resolved.is_worktree { 1 } else { 0 },
+                    now,
+                ],
+            );
+        }
+    }
+
     fn load_existing(&mut self) {
         let Some(conn) = self.db else { return };
+        self.load_from_conn(conn);
+    }
+
+    fn load_from_conn(&mut self, conn: &Connection) {
         let Ok(mut stmt) = conn.prepare(
             "SELECT workspace_id, repo_id, repo_name, worktree_path, git_common_dir, is_worktree FROM workspaces",
         ) else {
@@ -355,6 +404,8 @@ impl<'a> WorkspaceResolver<'a> {
                     Utc::now().timestamp_millis(),
                 ],
             );
+        } else {
+            self.pending_writes.push(resolved.clone());
         }
 
         if !resolved.repo_id.starts_with("inferred/") {

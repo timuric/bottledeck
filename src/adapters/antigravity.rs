@@ -1,10 +1,11 @@
 use crate::adapters::{
-    ParsedFile, SpanBuildArgs, build_command_spans, detect_handoff_text, detect_tool_error,
-    detect_truncation, dominant_span_repo, extract_tool_error_preview, is_doc_path, make_id,
+    ParsedFile, SpanBuildArgs, build_command_spans, classify_tool_duration, detect_handoff_text,
+    detect_tool_error, detect_truncation, dominant_span_repo, extract_tool_error_preview,
+    is_doc_path, is_edit_tool, make_id, merge_intervals_ms, normalize_target_path,
     normalize_tool_name, to_epoch_ms, walk_files,
 };
-use crate::config::estimate_tokens_str;
-use crate::db::{FileReadRecord, SessionRecord, ToolCallRecord};
+use crate::config::{default_context_window, estimate_tokens_str};
+use crate::db::{FileReadRecord, LlmCallRecord, SessionRecord, ToolCallRecord};
 use crate::shell::{extract_duration_ms_from_text, extract_exit_code_from_text};
 use crate::workspace::WorkspaceResolver;
 use anyhow::Result;
@@ -112,7 +113,7 @@ fn infer_cwd_from_text(text: &str) -> Option<String> {
             .unwrap()
     });
     for caps in re.captures_iter(text) {
-        let cand = caps[1].trim_end_matches(|c| matches!(c, '.' | ':' | ';' | ')' | '`' | ','));
+        let cand = caps[1].trim_end_matches(['.', ':', ';', ')', '`', ',']);
         if !cand.contains("/.t3/userdata/") && !cand.contains("/.system_generated/") {
             return Some(cand.to_string());
         }
@@ -221,13 +222,20 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     let mut started_at: Option<i64> = None;
     let mut ended_at: Option<i64> = None;
     let mut turn_count: i64 = 0;
+    let mut user_turn_count: i64 = 0;
     let mut input_tokens: i64 = 0;
     let mut output_tokens: i64 = 0;
     let mut cached_tokens: i64 = 0;
+    let mut thinking_tokens: i64 = 0;
+    let mut api_duration_ms: i64 = 0;
+    let mut max_context_tokens: i64 = 0;
+    let mut last_event_ts: Option<i64> = None;
 
+    let mut tool_intervals: Vec<(i64, i64)> = Vec::new();
     let mut spans = Vec::new();
     let mut file_reads = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut llm_calls = Vec::new();
     let mut seq_idx: i64 = 0;
     let mut is_handoff = false;
     let mut first_user_seen = false;
@@ -244,37 +252,109 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             ended_at = Some(ended_at.map_or(t, |cur| cur.max(t)));
         }
 
-        if !first_user_seen && ev.get("type").and_then(Value::as_str) == Some("USER_INPUT") {
+        let ev_type = ev.get("type").and_then(Value::as_str).unwrap_or("");
+        if ev_type == "USER_INPUT" {
             if let Some(txt) = ev.get("content").and_then(Value::as_str)
                 && !txt.trim().is_empty()
             {
-                first_user_seen = true;
-                if detect_handoff_text(txt) {
-                    is_handoff = true;
+                user_turn_count += 1;
+                if !first_user_seen {
+                    first_user_seen = true;
+                    if detect_handoff_text(txt) {
+                        is_handoff = true;
+                    }
                 }
             }
+            if ts.is_some() {
+                last_event_ts = ts;
+            }
+            continue;
         }
 
-        if ev.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+        if ev_type != "PLANNER_RESPONSE" {
+            if ts.is_some() {
+                last_event_ts = ts;
+            }
             continue;
         }
 
         turn_count += 1;
-        if model.is_none()
-            && let Some(m) = ev.get("model").and_then(Value::as_str)
-        {
-            model = Some(m.to_string());
+        let step_model = ev.get("model").and_then(Value::as_str).map(str::to_string);
+        if model.is_none() {
+            model = step_model.clone();
         }
         // In Antigravity transcripts, `input_tokens` is already uncached delta input tokens
         // (separate from `cache_read_tokens`), so do not subtract `cache_read_tokens`.
-        let raw_in = ev.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+        let raw_in = ev
+            .get("input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
         let cache_r = ev
             .get("cache_read_tokens")
             .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        let out_t = ev
+            .get("output_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        let think_t = ev
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(estimate_tokens_str)
             .unwrap_or(0);
-        input_tokens += raw_in.max(0);
-        output_tokens += ev.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
-        cached_tokens += cache_r.max(0);
+        input_tokens += raw_in;
+        output_tokens += out_t;
+        cached_tokens += cache_r;
+        thinking_tokens += think_t;
+
+        let ctx_toks = raw_in + cache_r;
+        max_context_tokens = max_context_tokens.max(ctx_toks);
+        let step_api_ms = match (last_event_ts, ts) {
+            (Some(prev), Some(cur)) if cur > prev && cur - prev <= 600_000 => Some(cur - prev),
+            _ => None,
+        };
+        if let Some(d) = step_api_ms {
+            api_duration_ms += d;
+        }
+        if ts.is_some() {
+            last_event_ts = ts;
+        }
+
+        let step_idx = ev
+            .get("step_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(i as i64);
+        let call_ts = ts
+            .or(started_at)
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let step_ws = cwd.as_deref().and_then(|c| resolver.resolve(c));
+        llm_calls.push(LlmCallRecord {
+            call_id: make_id(
+                "llm",
+                &[&source_file, &step_idx.to_string(), &i.to_string()],
+            ),
+            session_id: session_id.clone(),
+            source_file: source_file.clone(),
+            agent_kind: "antigravity".to_string(),
+            repo_id: step_ws.as_ref().map(|w| w.repo_id.clone()),
+            turn_idx: turn_count,
+            model: step_model.or_else(|| model.clone()),
+            input_tokens: raw_in,
+            cache_read_tokens: cache_r,
+            cache_write_tokens: 0,
+            output_tokens: out_t,
+            thinking_tokens: think_t,
+            duration_ms: step_api_ms,
+            ttft_ms: None,
+            thinking_ms: None,
+            stop_reason: ev.get("status").and_then(Value::as_str).map(str::to_string),
+            context_tokens: ctx_toks,
+            context_window: default_context_window(model.as_deref(), "antigravity"),
+            started_at: call_ts,
+        });
 
         let Some(tcs) = ev.get("tool_calls").and_then(Value::as_array) else {
             continue;
@@ -291,6 +371,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
 
             let mut result_text = String::new();
             let mut log_compacted = false;
+            let mut result_ts: Option<i64> = None;
             while i + generic_offset < events.len()
                 && events[i + generic_offset]
                     .get("type")
@@ -301,6 +382,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                 generic_offset += 1;
                 if let Some(c) = g.get("content").and_then(Value::as_str) {
                     result_text = c.to_string();
+                    result_ts = to_epoch_ms(g.get("created_at"));
                     log_compacted = g
                         .get("truncated_fields")
                         .and_then(Value::as_array)
@@ -308,14 +390,6 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                     break;
                 }
             }
-
-            let step_idx = ev
-                .get("step_index")
-                .and_then(Value::as_i64)
-                .unwrap_or(i as i64);
-            let call_ts = ts
-                .or(started_at)
-                .unwrap_or_else(|| Utc::now().timestamp_millis());
 
             if name == "run_command" {
                 let Some(cmd) = arg_str(args, &["CommandLine", "command"]) else {
@@ -327,7 +401,15 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                 {
                     exit_code = masked;
                 }
-                let duration_ms = extract_duration_ms_from_text(&result_text);
+                let explicit_dur = extract_duration_ms_from_text(&result_text);
+                let (duration_ms, is_explicit) = if let Some(d) = explicit_dur {
+                    (Some(d), true)
+                } else {
+                    (result_ts.map(|rt| rt - call_ts), false)
+                };
+                if let Some(d) = classify_tool_duration(duration_ms, is_explicit).0 {
+                    tool_intervals.push((call_ts, call_ts + d));
+                }
                 let built = build_command_spans(
                     SpanBuildArgs {
                         command_line: &cmd,
@@ -341,6 +423,8 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                         base_cwd: cwd.as_deref(),
                         exit_code: Some(exit_code),
                         duration_ms,
+                        is_explicit_duration: is_explicit,
+                        interrupted: false,
                         stdout_text: &result_text,
                         stderr_text: if exit_code != 0 { &result_text } else { "" },
                         started_at: call_ts,
@@ -352,6 +436,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             } else {
                 let raw_name = tc.get("name").and_then(Value::as_str).unwrap_or("");
                 let (norm_name, is_mcp) = normalize_tool_name(raw_name);
+                let is_edit = is_edit_tool(raw_name);
                 let is_error = detect_tool_error(&result_text, false);
                 let out_tokens = estimate_tokens_str(&result_text);
                 let s_step = step_idx.to_string();
@@ -363,6 +448,22 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                     cwd.clone()
                 };
                 let ws = call_cwd.as_deref().and_then(|c| resolver.resolve(c));
+                let repo_root = ws.as_ref().map(|w| w.worktree_path.as_str());
+                let norm_target = if target_path.is_empty() {
+                    None
+                } else {
+                    Some(normalize_target_path(&target_path, repo_root).1)
+                };
+
+                let explicit_dur = extract_duration_ms_from_text(&result_text);
+                let (dur_ms, _) = if let Some(d) = explicit_dur {
+                    classify_tool_duration(Some(d), true)
+                } else {
+                    classify_tool_duration(result_ts.map(|rt| rt - call_ts), false)
+                };
+                if let Some(d) = dur_ms {
+                    tool_intervals.push((call_ts, call_ts + d));
+                }
 
                 let is_truncated = if log_compacted {
                     false
@@ -374,6 +475,8 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                 };
 
                 if !norm_name.is_empty() {
+                    let tc_seq = seq_idx;
+                    seq_idx += 1;
                     tool_calls.push(ToolCallRecord {
                         call_id: make_id("tc", &[&source_file, &s_step, &s_t]),
                         session_id: session_id.clone(),
@@ -382,10 +485,15 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                         repo_id: ws.as_ref().map(|w| w.repo_id.clone()),
                         repo_name: ws.as_ref().map(|w| w.repo_name.clone()),
                         turn_idx: turn_count,
+                        seq_idx: tc_seq,
+                        tool_call_id: Some(format!("{step_idx}_{t_idx}")),
                         tool_name: norm_name,
+                        target_path: norm_target.clone(),
                         is_mcp,
+                        is_edit,
                         is_error,
-                        duration_ms: extract_duration_ms_from_text(&result_text),
+                        interrupted: false,
+                        duration_ms: dur_ms,
                         output_bytes: result_text.len() as i64,
                         output_tokens: out_tokens,
                         is_truncated,
@@ -395,17 +503,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                 }
 
                 if name == "read_file" && !target_path.is_empty() {
-                    let target_name = if target_path.contains("/.system_generated/steps/")
-                        && target_path.ends_with("/output.txt")
-                    {
-                        "steps/output.txt".to_string()
-                    } else {
-                        Path::new(&target_path)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(&target_path)
-                            .to_string()
-                    };
+                    let (target_name, rel_path) = normalize_target_path(&target_path, repo_root);
                     file_reads.push(FileReadRecord {
                         read_id: make_id("rd", &[&source_file, &s_step, &s_t]),
                         session_id: session_id.clone(),
@@ -414,6 +512,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                         repo_name: ws.as_ref().map(|w| w.repo_name.clone()),
                         turn_idx: turn_count,
                         target_name,
+                        target_path: Some(rel_path),
                         is_doc: is_doc_path(&target_path),
                         output_tokens: out_tokens,
                         started_at: call_ts,
@@ -434,8 +533,15 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     let dom = dominant_span_repo(&spans);
     let total_tool_ms: i64 = spans.iter().filter_map(|s| s.duration_ms).sum::<i64>()
         + tool_calls.iter().filter_map(|t| t.duration_ms).sum::<i64>();
+    let merged_wall = merge_intervals_ms(&tool_intervals);
+    let tool_wall_ms = if merged_wall > 0 {
+        merged_wall
+    } else {
+        total_tool_ms
+    };
     // Antigravity subagent sessions start with a SYSTEM_MESSAGE and never receive USER_INPUT
     let is_subagent = !first_user_seen;
+    let context_window = default_context_window(model.as_deref(), "antigravity");
 
     let session = SessionRecord {
         session_id,
@@ -460,11 +566,31 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
         started_at,
         ended_at,
         turn_count,
+        user_turn_count: user_turn_count.max(if turn_count > 0 { 1 } else { 0 }),
         input_tokens,
         output_tokens,
         cached_tokens,
+        cache_write_tokens: 0,
+        thinking_tokens,
         cost_usd: None,
         total_tool_ms,
+        tool_wall_ms,
+        api_duration_ms,
+        api_retry_ms: 0,
+        thinking_duration_ms: 0,
+        ttft_ms_sum: 0,
+        ttft_count: 0,
+        compaction_count: 0,
+        aborted_turns: 0,
+        api_errors: 0,
+        outcome: Some("completed".to_string()),
+        parent_session_id: None,
+        lines_added: 0,
+        lines_removed: 0,
+        max_context_tokens,
+        context_window,
+        effort: None,
+        turn_origin: None,
         is_subagent,
         originator,
         subagent_kind: Some(if is_subagent {
@@ -480,6 +606,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
         spans,
         file_reads,
         tool_calls,
+        llm_calls,
         line_count,
     })
 }

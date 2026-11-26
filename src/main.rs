@@ -411,11 +411,12 @@ fn run() -> Result<ExitCode> {
                     stats.files_ingested, stats.files_skipped, stats.files_scanned
                 );
                 println!(
-                    "  sessions: +{} | command_spans: +{} | tool_calls: +{} | file_reads: +{}",
+                    "  sessions: +{} | command_spans: +{} | tool_calls: +{} | file_reads: +{} | llm_calls: +{}",
                     stats.sessions_upserted,
                     stats.spans_inserted,
                     stats.tool_calls_inserted,
-                    stats.file_reads_inserted
+                    stats.file_reads_inserted,
+                    stats.llm_calls_inserted
                 );
                 for (name, info) in &stats.by_adapter {
                     if info.files_found > 0 {

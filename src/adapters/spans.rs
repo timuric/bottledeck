@@ -64,27 +64,42 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             .map(str::to_string)
             .unwrap_or_else(|| make_id("wrap", &[&source_file, &s_idx, &s_ts]));
 
+        let raw_agent = rec
+            .get("agent_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("cli-wrap");
         let session_id = rec
             .get("session_id")
             .and_then(Value::as_str)
-            .map(str::to_string)
+            .map(|sid| {
+                if sid.contains(':') {
+                    sid.to_string()
+                } else {
+                    match raw_agent {
+                        "claude-code" | "claude" => format!("claude:{sid}"),
+                        "codex" => format!("codex:{sid}"),
+                        "antigravity" | "agy" => format!("antigravity:{sid}"),
+                        "kimi" | "kimi-code" => format!("kimi:{sid}"),
+                        _ => sid.to_string(),
+                    }
+                }
+            })
             .or_else(|| {
                 rec.get("process_key")
                     .and_then(Value::as_str)
                     .map(|k| format!("proc:{k}"))
             });
 
+        let raw_dur = rec.get("duration_ms").and_then(Value::as_i64);
+        let (duration_ms, is_long_duration) =
+            crate::adapters::classify_tool_duration(raw_dur, true);
+
         spans.push(CommandSpanRecord {
             span_id,
             session_id,
             source_file: source_file.clone(),
             source_kind: "wrap".to_string(),
-            agent_kind: Some(
-                rec.get("agent_kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("cli-wrap")
-                    .to_string(),
-            ),
+            agent_kind: Some(raw_agent.to_string()),
             tool_call_id: rec
                 .get("tool_call_id")
                 .and_then(Value::as_str)
@@ -113,7 +128,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             cmd_template: parsed.cmd_template,
             raw_redacted: redact_secrets(&joined).chars().take(400).collect(),
             exit_code: rec.get("exit_code").and_then(Value::as_i64),
-            duration_ms: rec.get("duration_ms").and_then(Value::as_i64),
+            duration_ms,
             stdout_bytes,
             stdout_tokens: estimate_tokens_bytes(stdout_bytes.max(0) as usize),
             stderr_bytes,
@@ -129,6 +144,9 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             piped_filter: None,
             state_dir_hint: crate::shell::extract_state_dir_hint(&joined, None),
             is_truncated: false,
+            is_chained: false,
+            is_long_duration,
+            interrupted: false,
             started_at,
         });
     }
@@ -138,6 +156,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
         spans,
         file_reads: Vec::new(),
         tool_calls: Vec::new(),
+        llm_calls: Vec::new(),
         line_count,
     })
 }

@@ -17,12 +17,16 @@ pub fn format_commands_report(
     let mut lines = vec![
         format!("# Commands in `{repo_name}` (sorted by `{sort_by}`, showing {})", cmds.len()),
         String::new(),
-        "| Command Template | Cat | CLI | Runs | Errs | Err% | Piped | Top Pipe | p50 Out | Eff Toks | Total Wait | Harnesses | Noise |".to_string(),
-        "| :--- | :--- | :---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: | :--- | :--- |".to_string(),
+        "| Command Template | Cat | CLI | Runs | Errs | Err% | Piped | Top Pipe | p50 Out | Eff Toks | p50/p95 Wait | Total Wait | Harnesses | Noise |".to_string(),
+        "| :--- | :--- | :---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | :---: | ---: | :--- | :--- |".to_string(),
     ];
     for c in cmds {
+        let p_wait = match c.p95_wait_s {
+            Some(p95) => format!("{:.1}s/{p95:.1}s", c.p50_wait_s),
+            None => format!("{:.1}s/-", c.p50_wait_s),
+        };
         lines.push(format!(
-            "| `{}` | {} | {} | {} | {} | {:.0}% | {} | {} | {} | {} | {:.1}s | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {:.0}% | {} | {} | {} | {} | {} | {:.1}s | {} | {} |",
             c.cmd_template,
             c.category,
             if c.is_repo_cli { "yes" } else { "-" },
@@ -33,6 +37,7 @@ pub fn format_commands_report(
             c.top_pipe_filter.as_deref().unwrap_or("-"),
             format_compact(c.p50_stdout_tokens),
             format_compact(c.effective_tokens),
+            p_wait,
             c.total_wait_s,
             c.harness_summary,
             c.dominant_noise.as_deref().unwrap_or("-")
@@ -451,9 +456,55 @@ pub fn format_diagnosis_prompt(
     }
     if let Some(cost) = k.total_cost_usd {
         lines.push(format!(
-            "- **Reported API cost:** ${cost:.2} across {} session(s) with cost telemetry",
-            k.cost_sessions
+            "- **Cost:** ${cost:.2} reported ({} sess) | ~${:.2} total estimated across all harnesses ({} total model tokens, {} cache-write, {} thinking)",
+            k.cost_sessions,
+            k.estimated_cost_usd,
+            format_compact(k.total_model_tokens),
+            format_compact(k.total_cache_write_tokens),
+            format_compact(k.total_thinking_tokens)
         ));
+    } else if k.estimated_cost_usd > 0.0 {
+        lines.push(format!(
+            "- **Estimated API cost:** ~${:.2} ({} total model tokens, {} cache-write, {} thinking)",
+            k.estimated_cost_usd,
+            format_compact(k.total_model_tokens),
+            format_compact(k.total_cache_write_tokens),
+            format_compact(k.total_thinking_tokens)
+        ));
+    }
+    lines.push(format!(
+        "- **Latency decomposition:** session wall {} (p50 {}) | API wait {} ({} sess{}) | thinking {} | retries {} | tool wall {} vs {} serial ({:.1}x parallel)",
+        format_duration_human(k.latency.total_session_wall_s),
+        format_duration_human(k.latency.median_session_wall_s),
+        format_duration_human(k.latency.total_api_wait_s),
+        k.latency.sessions_with_api_timing,
+        k.latency
+            .avg_ttft_ms
+            .map(|t| format!(", avg TTFT {t}ms"))
+            .unwrap_or_default(),
+        format_duration_human(k.latency.total_thinking_s),
+        format_duration_human(k.latency.total_api_retry_s),
+        format_duration_human(k.latency.total_tool_wall_s),
+        format_duration_human(k.latency.total_tool_serial_s),
+        k.latency.tool_parallelism_ratio
+    ));
+    lines.push(format!(
+        "- **Context & outcomes:** {} compaction(s) ({} sess) | peak context {} ({} sess >=80%) | {} aborted ({:.1}%) | {} API errors | +{} / -{} lines",
+        k.context_health.total_compactions,
+        k.context_health.compacted_sessions,
+        k.context_health
+            .avg_peak_context_pct
+            .map(|p| format!("avg {p:.0}%"))
+            .unwrap_or_else(|| "n/a".into()),
+        k.context_health.sessions_over_80_pct,
+        k.outcomes.aborted_sessions,
+        k.outcomes.abort_rate * 100.0,
+        k.outcomes.total_api_errors,
+        k.outcomes.total_lines_added,
+        k.outcomes.total_lines_removed
+    ));
+    if let Some(notice) = &patterns.harness_mix_shift_notice {
+        lines.push(format!("- **Harness Mix Shift:** {notice}"));
     }
     if let Some(notice) = &patterns.branch_behind_notice {
         lines.push(format!("- **Repo Ref Notice:** {notice}"));
@@ -515,6 +566,58 @@ pub fn format_diagnosis_prompt(
                 s.total_wait_s,
                 s.harness_summary,
                 s.sequence.replace('|', "/")
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if !patterns.tool_trajectories.is_empty() {
+        lines.push("## 3b. Unified Tool Trajectories (Shell + Read/Edit/MCP)".to_string());
+        lines.push(String::new());
+        for s in patterns.tool_trajectories.iter().take(6) {
+            lines.push(format!(
+                "- {}/{} sessions ({} runs, {:.1}s): `{}` | **Harnesses:** {}",
+                s.sessions,
+                s.total_sessions,
+                s.occurrences,
+                s.total_wait_s,
+                s.sequence,
+                s.harness_summary
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if !patterns.file_edit_churn.is_empty() {
+        lines.push("## 3c. File Edit Churn & Rework Hotspots".to_string());
+        lines.push(String::new());
+        for f in patterns.file_edit_churn.iter().take(6) {
+            lines.push(format!(
+                "- `{}`: {} edits across {} sessions (max {}x/session, {} edit->fail->edit rework cycles) | **Harnesses:** {}",
+                f.target_path, f.edits, f.sessions, f.max_edits_in_session, f.rework_cycles, f.harness_summary
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if !patterns.model_breakdown.is_empty() {
+        lines.push("## 3d. Per-Model Breakdown".to_string());
+        lines.push(String::new());
+        for m in patterns.model_breakdown.iter().take(6) {
+            lines.push(format!(
+                "- `{}` ({}): {} sess, {} calls, {} toks, cache {}, est ~${:.2}{}",
+                m.model,
+                m.agent_kind,
+                m.sessions,
+                m.llm_calls,
+                format_compact(m.total_tokens),
+                m.cache_hit_rate
+                    .map(|v| format!("{:.1}%", v * 100.0))
+                    .unwrap_or_else(|| "n/a".into()),
+                m.est_cost_usd,
+                m.avg_api_wait_s
+                    .map(|v| format!(", avg API {v:.1}s"))
+                    .unwrap_or_default()
             ));
         }
         lines.push(String::new());
@@ -624,6 +727,28 @@ pub fn format_repo_report(report: &RepoReport, format: &str) -> String {
                     .map(|c| format!("{c:.2}"))
                     .unwrap_or_else(|| "null".to_string())
             ),
+            format!("  estimated_cost_usd: {:.2}", k.estimated_cost_usd),
+            format!("  total_model_tokens: {}", k.total_model_tokens),
+            format!("  total_cache_write_tokens: {}", k.total_cache_write_tokens),
+            format!("  total_thinking_tokens: {}", k.total_thinking_tokens),
+            format!("  total_api_wait_s: {}", k.latency.total_api_wait_s),
+            format!("  total_tool_wall_s: {}", k.latency.total_tool_wall_s),
+            format!(
+                "  tool_parallelism_ratio: {}",
+                k.latency.tool_parallelism_ratio
+            ),
+            format!(
+                "  avg_ttft_ms: {}",
+                k.latency
+                    .avg_ttft_ms
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "null".to_string())
+            ),
+            format!(
+                "  total_compactions: {}",
+                k.context_health.total_compactions
+            ),
+            format!("  abort_rate: {}", k.outcomes.abort_rate),
             format!(
                 "  detected_config: [{}]",
                 k.detected_config
@@ -669,7 +794,10 @@ pub fn format_repo_report(report: &RepoReport, format: &str) -> String {
             k.command_error_rate * 100.0
         ),
         format!(
-            "- **Uncached+output session tokens:** p50 **{}** / p95 **{}** | **Weighted cache hit:** {}",
+            "- **Model tokens:** {} total ({} cache-write, {} thinking) | **Uncached+output/sess:** p50 **{}** / p95 **{}** | **Weighted cache hit:** {}",
+            format_compact(k.total_model_tokens),
+            format_compact(k.total_cache_write_tokens),
+            format_compact(k.total_thinking_tokens),
             format_compact(k.median_tokens_per_session),
             format_compact(k.p95_tokens_per_session),
             k.cache_hit_rate
@@ -677,12 +805,31 @@ pub fn format_repo_report(report: &RepoReport, format: &str) -> String {
                 .unwrap_or_else(|| "n/a".to_string())
         ),
         format!(
-            "- **Tool wait:** p50 **{}**/session ({} total){}",
-            format_duration_human(k.median_tool_wait_s),
-            format_duration_human(k.total_tool_wait_s),
+            "- **Latency:** session wall **{}** (p50 {}) | API **{}**{} | thinking **{}** | retries **{}** | tool wall **{}** ({:.1}x parallel, p50 **{}**/sess)",
+            format_duration_human(k.latency.total_session_wall_s),
+            format_duration_human(k.latency.median_session_wall_s),
+            format_duration_human(k.latency.total_api_wait_s),
+            k.latency
+                .avg_ttft_ms
+                .map(|t| format!(", TTFT {t}ms"))
+                .unwrap_or_default(),
+            format_duration_human(k.latency.total_thinking_s),
+            format_duration_human(k.latency.total_api_retry_s),
+            format_duration_human(k.latency.total_tool_wall_s),
+            k.latency.tool_parallelism_ratio,
+            format_duration_human(k.median_tool_wait_s)
+        ),
+        format!(
+            "- **Cost & outcomes:** est. **~${:.2}**{} | compactions **{}** ({} sess >=80% ctx) | aborts **{}** ({:.1}%) | API errs **{}**",
+            k.estimated_cost_usd,
             k.total_cost_usd
-                .map(|c| format!(" | **Reported cost:** ${c:.2} ({} sess)", k.cost_sessions))
-                .unwrap_or_default()
+                .map(|c| format!(" (${c:.2} reported across {} sess)", k.cost_sessions))
+                .unwrap_or_default(),
+            k.context_health.total_compactions,
+            k.context_health.sessions_over_80_pct,
+            k.outcomes.aborted_sessions,
+            k.outcomes.abort_rate * 100.0,
+            k.outcomes.total_api_errors
         ),
         format!(
             "- **Repo CLI adoption:** {} | **Escape-hatch rebound:** {:.1}% | **Orientation tax:** {} tokens",
@@ -733,17 +880,21 @@ pub fn format_repo_report(report: &RepoReport, format: &str) -> String {
     if !report.top_commands.is_empty() {
         lines.push("## Top Commands by Output Tokens".to_string());
         lines.push(String::new());
-        lines.push("| Command Template | Category | Runs | p50 Out Toks | Total Out Toks | p50 Wait | Err % | Harnesses | Noise |".to_string());
-        lines.push("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | :--- | :--- |".to_string());
+        lines.push("| Command Template | Category | Runs | p50 Out Toks | Total Out Toks | p50/p95 Wait | Err % | Harnesses | Noise |".to_string());
+        lines.push("| :--- | :--- | ---: | ---: | ---: | :---: | ---: | :--- | :--- |".to_string());
         for c in &report.top_commands {
+            let p_wait = match c.p95_wait_s {
+                Some(p95) => format!("{:.1}s/{p95:.1}s", c.p50_wait_s),
+                None => format!("{:.1}s/-", c.p50_wait_s),
+            };
             lines.push(format!(
-                "| `{}` | {} | {} | {} | {} | {:.1}s | {:.0}% | {} | {} |",
+                "| `{}` | {} | {} | {} | {} | {} | {:.0}% | {} | {} |",
                 c.cmd_template,
                 c.category,
                 c.runs,
                 format_compact(c.p50_stdout_tokens),
                 format_compact(c.total_stdout_tokens),
-                c.p50_wait_s,
+                p_wait,
                 c.error_rate * 100.0,
                 c.harness_summary,
                 c.dominant_noise.as_deref().unwrap_or("-")
@@ -766,7 +917,15 @@ pub fn format_diff_report(diff: &DiffReport, format: &str) -> String {
     let mut lines = vec![
         format!("# Bottledeck — Before/After Diff for `{}`", diff.repo_name),
         String::new(),
-        format!("- **Split point:** {}", diff.since),
+        format!(
+            "- **Split point:** {} ({})",
+            diff.since,
+            if diff.matched_window {
+                "matched pre/post window"
+            } else {
+                "all-before fallback"
+            }
+        ),
         format!("- **Verdict:** `{}`", diff.verdict),
         String::new(),
         "| Metric | Before | After | Delta |".to_string(),
@@ -807,7 +966,54 @@ pub fn format_diff_report(diff: &DiffReport, format: &str) -> String {
             diff.before.rebound_rate * 100.0,
             diff.after.rebound_rate * 100.0
         ),
+        format!(
+            "| Estimated cost | ${:.2} | ${:.2} | - |",
+            diff.before.estimated_cost_usd, diff.after.estimated_cost_usd
+        ),
+        format!(
+            "| Weighted cache hit | {} | {} | - |",
+            diff.before
+                .cache_hit_rate
+                .map(|v| format!("{:.1}%", v * 100.0))
+                .unwrap_or_else(|| "n/a".into()),
+            diff.after
+                .cache_hit_rate
+                .map(|v| format!("{:.1}%", v * 100.0))
+                .unwrap_or_else(|| "n/a".into())
+        ),
+        format!(
+            "| Session abort rate | {:.1}% | {:.1}% | - |",
+            diff.before.abort_rate * 100.0,
+            diff.after.abort_rate * 100.0
+        ),
     ];
+
+    if !diff.by_harness.is_empty() {
+        lines.push(String::new());
+        lines.push("## Per-Harness Stratified Deltas".to_string());
+        lines.push(String::new());
+        lines.push(
+            "| Harness | Sess (B -> A) | Cmds (B -> A) | Med Toks (B -> A) | Avg Out/Cmd (B -> A) | Err% (B -> A) |"
+                .to_string(),
+        );
+        lines.push("| :--- | :---: | :---: | :---: | :---: | :---: |".to_string());
+        for h in &diff.by_harness {
+            lines.push(format!(
+                "| `{}` | {} -> {} | {} -> {} | {} -> {} | {} -> {} | {:.1}% -> {:.1}% |",
+                h.agent_kind,
+                h.before_sessions,
+                h.after_sessions,
+                h.before_commands,
+                h.after_commands,
+                format_compact(h.before_median_tokens),
+                format_compact(h.after_median_tokens),
+                format_compact(h.before_avg_stdout_tokens),
+                format_compact(h.after_avg_stdout_tokens),
+                h.before_error_rate * 100.0,
+                h.after_error_rate * 100.0
+            ));
+        }
+    }
 
     if !diff.guardrails.is_empty() {
         lines.push(String::new());

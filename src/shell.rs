@@ -47,6 +47,7 @@ pub struct ShellSegment {
     pub cd_hint: Option<String>,
     pub is_pipe_consumer: bool,
     pub piped_filter: Option<String>,
+    pub separator: String,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +201,15 @@ pub fn split_shell_commands(command_line: &str) -> Vec<ShellSegment> {
                 i += 1;
                 continue;
             }
+            if ch == '&' && next != Some('&') && next != Some('>') && !cur.ends_with('>') {
+                let trimmed = cur.trim().to_string();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    raw_segs.push((trimmed, "&".to_string()));
+                }
+                cur.clear();
+                i += 1;
+                continue;
+            }
             if ch == '|' && next != Some('|') {
                 let trimmed = cur.trim().to_string();
                 if !trimmed.is_empty() && !trimmed.starts_with('#') {
@@ -226,8 +236,24 @@ pub fn split_shell_commands(command_line: &str) -> Vec<ShellSegment> {
     let mut out = Vec::new();
     let mut active_dir: Option<String> = None;
 
-    for (idx, (raw, _sep)) in raw_segs.iter().enumerate() {
-        let tokens = tokenize_shell(raw);
+    for (idx, (raw, sep)) in raw_segs.iter().enumerate() {
+        let mut tokens = tokenize_shell(raw);
+        // Strip leading shell control-flow keywords (`do`, `then`, `else`, `elif`) so loop/conditional
+        // bodies like `for f in ...; do cargo test; done` are preserved rather than discarded.
+        while let Some(first) = tokens.first() {
+            if matches!(first.as_str(), "do" | "then" | "else" | "elif" | "{" | "!") {
+                tokens.remove(0);
+            } else {
+                break;
+            }
+        }
+        while let Some(last) = tokens.last() {
+            if matches!(last.as_str(), "done" | "fi" | "}") {
+                tokens.pop();
+            } else {
+                break;
+            }
+        }
         if tokens.is_empty() {
             continue;
         }
@@ -244,18 +270,7 @@ pub fn split_shell_commands(command_line: &str) -> Vec<ShellSegment> {
         }
         if matches!(
             tokens[0].as_str(),
-            "if" | "then"
-                | "else"
-                | "elif"
-                | "fi"
-                | "for"
-                | "do"
-                | "done"
-                | "while"
-                | "case"
-                | "esac"
-                | "{"
-                | "}"
+            "if" | "fi" | "for" | "done" | "while" | "until" | "case" | "esac" | "{" | "}"
         ) {
             continue;
         }
@@ -285,6 +300,7 @@ pub fn split_shell_commands(command_line: &str) -> Vec<ShellSegment> {
             cd_hint: active_dir.clone(),
             is_pipe_consumer,
             piped_filter,
+            separator: sep.clone(),
         });
     }
 
@@ -313,6 +329,25 @@ fn normalize_arg(tok: &str) -> String {
     if tok.chars().all(|c| c.is_ascii_digit()) {
         return "<num>".to_string();
     }
+    // Keep recognizable script filenames (e.g. `scripts/deploy.sh` -> `deploy.sh`) so distinct scripts
+    // don't all collapse into `python3 <path>` or `node <path>`.
+    let lower = tok.to_ascii_lowercase();
+    let is_script = lower.ends_with(".py")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".cjs")
+        || lower.ends_with(".js")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".rb")
+        || lower.ends_with(".pl")
+        || lower.ends_with(".sql");
+    if is_script
+        && let Some(base) = Path::new(tok).file_name().and_then(|s| s.to_str())
+        && !base.is_empty()
+        && base.len() <= 40
+    {
+        return base.to_string();
+    }
     if tok.contains('/') || tok.contains('.') {
         return "<path>".to_string();
     }
@@ -325,6 +360,47 @@ fn normalize_arg(tok: &str) -> String {
 pub fn parse_command_tokens(raw_tokens: &[String], raw_text: &str) -> Option<ParsedCommand> {
     static ENV_RE: OnceLock<Regex> = OnceLock::new();
     let env_re = ENV_RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=").unwrap());
+
+    // Unwrap `bash -c "..."` / `sh -c "..."` / `zsh -c "..."` into the inner command tokens
+    let unwrapped_owned: Vec<String>;
+    let raw_tokens: &[String] = if raw_tokens.len() >= 3 {
+        let b0 = Path::new(&raw_tokens[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(raw_tokens[0].as_str());
+        if matches!(b0, "bash" | "sh" | "zsh") {
+            if let Some(c_pos) = raw_tokens
+                .iter()
+                .skip(1)
+                .position(|t| t == "-c" || t == "-lc" || t == "-ec" || t == "-euo")
+            {
+                let inner_idx = if raw_tokens[1 + c_pos] == "-euo" {
+                    1 + c_pos + 3
+                } else {
+                    1 + c_pos + 1
+                };
+                if let Some(inner_cmd) = raw_tokens.get(inner_idx) {
+                    let inner_segs = split_shell_commands(inner_cmd);
+                    if let Some(first) = inner_segs.into_iter().next()
+                        && !first.tokens.is_empty()
+                    {
+                        unwrapped_owned = first.tokens;
+                        &unwrapped_owned
+                    } else {
+                        raw_tokens
+                    }
+                } else {
+                    raw_tokens
+                }
+            } else {
+                raw_tokens
+            }
+        } else {
+            raw_tokens
+        }
+    } else {
+        raw_tokens
+    };
 
     let mut idx = 0usize;
     while idx < raw_tokens.len() {
@@ -339,16 +415,37 @@ pub fn parse_command_tokens(raw_tokens: &[String], raw_text: &str) -> Option<Par
             .unwrap_or(t.as_str());
         if matches!(
             base,
-            "env" | "command" | "time" | "nice" | "nohup" | "sudo" | "exec"
+            "env" | "command" | "time" | "nice" | "nohup" | "sudo" | "exec" | "xargs"
         ) {
             idx += 1;
             while idx < raw_tokens.len() && raw_tokens[idx].starts_with('-') {
-                idx += 1;
+                if matches!(
+                    raw_tokens[idx].as_str(),
+                    "-u" | "-g" | "-I" | "-n" | "-P" | "-L"
+                ) {
+                    idx += 2;
+                } else {
+                    idx += 1;
+                }
             }
             continue;
         }
         if base == "timeout" {
-            idx += 2;
+            idx += 1;
+            while idx < raw_tokens.len() && raw_tokens[idx].starts_with('-') {
+                if matches!(
+                    raw_tokens[idx].as_str(),
+                    "-s" | "-k" | "--signal" | "--kill-after"
+                ) {
+                    idx += 2;
+                } else {
+                    idx += 1;
+                }
+            }
+            // Skip duration token (e.g. `10`, `30s`, `5m`)
+            if idx < raw_tokens.len() {
+                idx += 1;
+            }
             continue;
         }
         break;
@@ -487,96 +584,97 @@ pub fn parse_command_tokens(raw_tokens: &[String], raw_text: &str) -> Option<Par
     // 1. `mise run job -- run --name <NAME> -- <inner>` -> `mise job:<NAME>` (or inner cmd)
     // 2. `mise run verify -- --scope <SCOPE>` -> `mise run verify --scope=<SCOPE>`
     // 3. `ssh <host> "<remote cmd>"` -> `ssh <host> <remote_bin>`
-    if cmd_bin == "mise" && args.first().is_some_and(|a| a == "run" || a == "r") {
-        if let Some(task_name) = args.get(1) {
-            if task_name == "job" {
-                let mut job_action = None;
-                let mut job_name = None;
-                let mut inner_cmd = None;
-                let mut k = 2usize;
-                let mut dd_count = 0usize;
-                while k < args.len() {
-                    if args[k] == "--" {
-                        dd_count += 1;
-                        if dd_count == 2 && k + 1 < args.len() {
-                            inner_cmd = Some(args[k + 1].clone());
-                            break;
-                        }
-                        k += 1;
-                        continue;
-                    }
-                    if job_action.is_none() && !args[k].starts_with('-') {
-                        job_action = Some(args[k].clone());
-                    } else if args[k] == "--name" && k + 1 < args.len() {
-                        job_name = Some(args[k + 1].clone());
-                        k += 2;
-                        continue;
-                    } else if let Some(val) = args[k].strip_prefix("--name=") {
-                        job_name = Some(val.to_string());
+    if cmd_bin == "mise"
+        && args.first().is_some_and(|a| a == "run" || a == "r")
+        && let Some(task_name) = args.get(1)
+    {
+        if task_name == "job" {
+            let mut job_action = None;
+            let mut job_name = None;
+            let mut inner_cmd = None;
+            let mut k = 2usize;
+            let mut dd_count = 0usize;
+            while k < args.len() {
+                if args[k] == "--" {
+                    dd_count += 1;
+                    if dd_count == 2 && k + 1 < args.len() {
+                        inner_cmd = Some(args[k + 1].clone());
+                        break;
                     }
                     k += 1;
+                    continue;
                 }
-                let action = job_action.unwrap_or_else(|| "run".to_string());
-                let label = if let Some(name) = job_name {
-                    format!("mise job:{action}:{name}")
-                } else if let Some(inner) = inner_cmd {
-                    format!(
-                        "mise job:{action}:{}",
-                        Path::new(&inner)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(&inner)
-                    )
+                if job_action.is_none() && !args[k].starts_with('-') {
+                    job_action = Some(args[k].clone());
+                } else if args[k] == "--name" && k + 1 < args.len() {
+                    job_name = Some(args[k + 1].clone());
+                    k += 2;
+                    continue;
+                } else if let Some(val) = args[k].strip_prefix("--name=") {
+                    job_name = Some(val.to_string());
+                }
+                k += 1;
+            }
+            let action = job_action.unwrap_or_else(|| "run".to_string());
+            let label = if let Some(name) = job_name {
+                format!("mise job:{action}:{name}")
+            } else if let Some(inner) = inner_cmd {
+                format!(
+                    "mise job:{action}:{}",
+                    Path::new(&inner)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&inner)
+                )
+            } else {
+                format!("mise run job {action}")
+            };
+            let mut raw_redacted = redact_secrets(raw_text);
+            if raw_redacted.len() > 400 {
+                raw_redacted = raw_redacted.chars().take(400).collect();
+            }
+            return Some(ParsedCommand {
+                cmd_bin,
+                cmd_template: label,
+                category: if action == "wait" || action == "status" {
+                    "polling"
                 } else {
-                    format!("mise run job {action}")
-                };
-                let mut raw_redacted = redact_secrets(raw_text);
-                if raw_redacted.len() > 400 {
-                    raw_redacted = raw_redacted.chars().take(400).collect();
-                }
-                return Some(ParsedCommand {
-                    cmd_bin,
-                    cmd_template: label,
-                    category: if action == "wait" || action == "status" {
-                        "polling"
-                    } else {
-                        "repo_task"
-                    },
-                    is_repo_cli: true,
-                    is_orientation: false,
-                    raw_redacted,
-                });
-            }
+                    "repo_task"
+                },
+                is_repo_cli: true,
+                is_orientation: false,
+                raw_redacted,
+            });
+        }
 
-            if task_name == "verify" {
-                let mut scope_val = None;
-                for k in 2..args.len() {
-                    if (args[k] == "--scope" || args[k] == "--task") && k + 1 < args.len() {
-                        scope_val = Some(format!("{}={}", args[k], args[k + 1]));
-                        break;
-                    }
-                    if args[k].starts_with("--scope=") || args[k].starts_with("--task=") {
-                        scope_val = Some(args[k].clone());
-                        break;
-                    }
+        if task_name == "verify" {
+            let mut scope_val = None;
+            for k in 2..args.len() {
+                if (args[k] == "--scope" || args[k] == "--task") && k + 1 < args.len() {
+                    scope_val = Some(format!("{}={}", args[k], args[k + 1]));
+                    break;
                 }
-                let label = match scope_val {
-                    Some(s) => format!("mise run verify {s}"),
-                    None => "mise run verify".to_string(),
-                };
-                let mut raw_redacted = redact_secrets(raw_text);
-                if raw_redacted.len() > 400 {
-                    raw_redacted = raw_redacted.chars().take(400).collect();
+                if args[k].starts_with("--scope=") || args[k].starts_with("--task=") {
+                    scope_val = Some(args[k].clone());
+                    break;
                 }
-                return Some(ParsedCommand {
-                    cmd_bin,
-                    cmd_template: label,
-                    category: "repo_task",
-                    is_repo_cli: true,
-                    is_orientation: false,
-                    raw_redacted,
-                });
             }
+            let label = match scope_val {
+                Some(s) => format!("mise run verify {s}"),
+                None => "mise run verify".to_string(),
+            };
+            let mut raw_redacted = redact_secrets(raw_text);
+            if raw_redacted.len() > 400 {
+                raw_redacted = raw_redacted.chars().take(400).collect();
+            }
+            return Some(ParsedCommand {
+                cmd_bin,
+                cmd_template: label,
+                category: "repo_task",
+                is_repo_cli: true,
+                is_orientation: false,
+                raw_redacted,
+            });
         }
     }
 
@@ -666,11 +764,10 @@ pub fn parse_command_tokens(raw_tokens: &[String], raw_text: &str) -> Option<Par
     }
 
     let mut subcommands_left: usize = if is_subcmd_bin { 1 } else { 0 };
-    if cmd_bin == "mise" && args.first().is_some_and(|a| a == "run" || a == "r") {
-        subcommands_left = 2;
-    } else if is_js_runner && args.first().is_some_and(|a| a == "run") {
-        subcommands_left = 2;
-    } else if cmd_bin == "gh" {
+    if (cmd_bin == "mise" && args.first().is_some_and(|a| a == "run" || a == "r"))
+        || (is_js_runner && args.first().is_some_and(|a| a == "run"))
+        || cmd_bin == "gh"
+    {
         subcommands_left = 2;
     } else if matches!(cmd_bin.as_str(), "make" | "just") {
         subcommands_left = 1;
@@ -734,11 +831,35 @@ pub fn parse_command_tokens(raw_tokens: &[String], raw_text: &str) -> Option<Par
         .take(4)
         .collect();
 
+    let is_script_interpreter = matches!(
+        cmd_bin.as_str(),
+        "python" | "python3" | "node" | "deno" | "bun" | "ruby" | "perl" | "bash" | "sh" | "zsh"
+    );
+    if is_script_interpreter
+        && let Some(first_script) = args.iter().find(|a| {
+            !a.starts_with('-') && {
+                let l = a.to_ascii_lowercase();
+                l.ends_with(".py")
+                    || l.ends_with(".sh")
+                    || l.ends_with(".mjs")
+                    || l.ends_with(".cjs")
+                    || l.ends_with(".js")
+                    || l.ends_with(".ts")
+                    || l.ends_with(".rb")
+                    || l.ends_with(".pl")
+                    || l.ends_with(".sql")
+            }
+        })
+    {
+        template_parts.push(normalize_arg(first_script));
+    }
+
     if !unique_flags.is_empty() {
         template_parts.extend(unique_flags.iter().cloned());
     } else if positional_count > 0
         && !is_subcmd_bin
         && !is_local_script
+        && !is_script_interpreter
         && let Some(first_pos) = args.iter().find(|a| !a.starts_with('-'))
     {
         template_parts.push(normalize_arg(first_pos));
@@ -961,26 +1082,86 @@ pub fn classify_output_noise(text: &str, exit_code: Option<i64>) -> Option<Strin
     }
 }
 
+fn extract_json_str_field(s: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let pos = s.find(&needle)?;
+    let mut out = String::new();
+    let mut esc = false;
+    for ch in s[pos + needle.len()..].chars() {
+        if esc {
+            out.push(if ch == 'n' || ch == 't' { ' ' } else { ch });
+            esc = false;
+        } else if ch == '\\' {
+            esc = true;
+        } else if ch == '"' {
+            break;
+        } else {
+            out.push(ch);
+        }
+    }
+    let cleaned = out.trim();
+    (!cleaned.is_empty() && !cleaned.starts_with('{')).then(|| cleaned.chars().take(240).collect())
+}
+
 /// Strip harness wrapper envelopes (Codex chunk JSON, Antigravity timestamps, Wall time headers)
 /// so error previews show the actual human-readable error message.
 pub fn clean_error_preview(raw: &str) -> String {
+    const WRAPPER_PREFIXES: &[&str] = &[
+        "Script completed",
+        "Wall time",
+        "Chunk ID:",
+        "Original token count:",
+        "Total output lines:",
+        "Created At:",
+        "Completed At:",
+        "Command exited with code",
+        "Process exited with code",
+        "{\"chunk_id\"",
+        "[{\"status\":\"fulfilled\"",
+        "{\"status\":\"fulfilled\"",
+    ];
+    const ERROR_MARKERS: &[&str] = &[
+        "error",
+        "failed",
+        "fatal:",
+        "command not found",
+        "operation not permitted",
+        "permission denied",
+        "unknown argument",
+        "unknown command",
+        "unknown option",
+        "no such column",
+        "no such table",
+        "choose --scope",
+        "pass a single statement",
+        "eperm",
+        "could not resolve",
+        "timed out",
+        "forbidden:",
+        "validation:",
+        "conflict:",
+        "no github credential",
+    ];
+
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    // Try extracting meaningful fields from JSON envelopes (MCP failures or Codex chunk JSON)
     if let Some(json_start) = trimmed.find('{') {
         let candidate = &trimmed[json_start..];
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
-            if let Some(msg) = v.get("message").and_then(|x| x.as_str())
-                && !msg.trim().is_empty()
+            if let Some(msg) = v
+                .get("message")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
             {
                 let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("");
                 let s = if code.is_empty() {
-                    msg.trim().to_string()
+                    msg.to_string()
                 } else {
-                    format!("{code}: {}", msg.trim())
+                    format!("{code}: {msg}")
                 };
                 return s.chars().take(240).collect();
             }
@@ -989,98 +1170,38 @@ pub fn clean_error_preview(raw: &str) -> String {
                 .or_else(|| v.get("value").and_then(|x| x.get("output")))
                 .or_else(|| v.get("response"))
                 .and_then(|x| x.as_str())
-                && !out.trim().is_empty()
+                .filter(|s| !s.trim().is_empty())
             {
                 return clean_error_preview(out);
             }
         } else {
-            // Partial/truncated JSON from stored previews: extract `"message":"..."` or `"output":"..."`
-            for key in ["\"message\":\"", "\"output\":\"", "\"response\":\""] {
-                if let Some(pos) = candidate.find(key) {
-                    let rest = &candidate[pos + key.len()..];
-                    let mut extracted = String::new();
-                    let mut esc = false;
-                    for ch in rest.chars() {
-                        if esc {
-                            match ch {
-                                'n' => extracted.push(' '),
-                                't' => extracted.push(' '),
-                                other => extracted.push(other),
-                            }
-                            esc = false;
-                            continue;
-                        }
-                        if ch == '\\' {
-                            esc = true;
-                            continue;
-                        }
-                        if ch == '"' {
-                            break;
-                        }
-                        extracted.push(ch);
-                    }
-                    let cleaned = extracted.trim();
-                    if !cleaned.is_empty() && !cleaned.starts_with('{') {
-                        return cleaned.chars().take(240).collect();
-                    }
+            for key in ["message", "output", "response"] {
+                if let Some(val) = extract_json_str_field(candidate, key) {
+                    return val;
                 }
             }
         }
     }
 
-    // Split on newlines OR stored ` | ` / ` / ` separators and drop wrapper metadata lines
-    let mut high_signal: Vec<String> = Vec::new();
-    let mut kept: Vec<String> = Vec::new();
-    for piece in trimmed
+    let (mut high_signal, mut kept) = (Vec::new(), Vec::new());
+    for p in trimmed
         .split('\n')
         .flat_map(|l| l.split(" | "))
         .flat_map(|l| l.split(" / "))
+        .map(str::trim)
     {
-        let p = piece.trim();
         if p.is_empty()
-            || p.starts_with("Script completed")
-            || p.starts_with("Wall time")
-            || p.starts_with("Chunk ID:")
-            || p.starts_with("Original token count:")
-            || p.starts_with("Total output lines:")
-            || p.starts_with("Created At:")
-            || p.starts_with("Completed At:")
-            || p.starts_with("Command exited with code")
-            || p.starts_with("Process exited with code")
-            || p == "Output:"
-            || p == "Command output:"
-            || p.starts_with("{\"chunk_id\"")
-            || p.starts_with("[{\"status\":\"fulfilled\"")
-            || p.starts_with("{\"status\":\"fulfilled\"")
+            || matches!(p, "Output:" | "Command output:")
+            || WRAPPER_PREFIXES.iter().any(|pre| p.starts_with(pre))
         {
             continue;
         }
         let pl = p.to_ascii_lowercase();
-        let is_err_line = pl.contains("error")
-            || pl.contains("failed")
-            || pl.contains("fatal:")
-            || pl.contains("command not found")
-            || pl.contains("operation not permitted")
-            || pl.contains("permission denied")
-            || pl.contains("unknown argument")
-            || pl.contains("unknown command")
-            || pl.contains("unknown option")
-            || pl.contains("no such column")
-            || pl.contains("no such table")
-            || pl.contains("choose --scope")
-            || pl.contains("pass a single statement")
-            || pl.contains("eperm")
-            || pl.contains("could not resolve")
-            || pl.contains("timed out")
-            || pl.contains("forbidden:")
-            || pl.contains("validation:")
-            || pl.contains("conflict:")
-            || pl.contains("no github credential");
-        if is_err_line && high_signal.len() < 3 {
-            high_signal.push(p.to_string());
+        if high_signal.len() < 3 && ERROR_MARKERS.iter().any(|m| pl.contains(m)) {
+            high_signal.push(p);
         }
         if kept.len() < 3 {
-            kept.push(p.to_string());
+            kept.push(p);
         }
     }
 
@@ -1089,17 +1210,15 @@ pub fn clean_error_preview(raw: &str) -> String {
     } else {
         kept
     };
-
-    let out = if chosen.is_empty() {
-        // Drop pure timestamp-only previews rather than showing noise
+    if chosen.is_empty() {
         if trimmed.starts_with("Created At:") || trimmed.starts_with("Script completed") {
-            return String::new();
+            String::new()
+        } else {
+            trimmed.chars().take(240).collect()
         }
-        trimmed.to_string()
     } else {
-        chosen.join(" | ")
-    };
-    out.chars().take(240).collect()
+        chosen.join(" | ").chars().take(240).collect()
+    }
 }
 
 pub fn extract_stderr_preview(text: &str, exit_code: Option<i64>) -> Option<String> {
@@ -1126,21 +1245,51 @@ pub fn extract_stderr_preview(text: &str, exit_code: Option<i64>) -> Option<Stri
 }
 
 pub fn extract_exit_code_from_text(text: &str, is_error: bool) -> i64 {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
+    static STRICT_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let strict = STRICT_PATTERNS.get_or_init(|| {
+        vec![
+            Regex::new(r"(?im)^(?:Command|Process) exited with code (\d+)").unwrap(),
+            Regex::new(r"(?im)^Exit code:\s*(\d+)").unwrap(),
+            Regex::new(r#""exit_code"\s*:\s*(\d+)"#).unwrap(),
+        ]
+    });
+    // Check structured wrapper lines in the head (first 12 lines) or tail (last 8 lines) first
+    // so passing test output quoting an inner subprocess failure isn't misclassified as an error.
+    let lines: Vec<&str> = text.lines().collect();
+    let head_end = lines.len().min(12);
+    let tail_start = lines.len().saturating_sub(8);
+    let edge_text = if head_end >= tail_start {
+        text.to_string()
+    } else {
+        format!(
+            "{}\n{}",
+            lines[..head_end].join("\n"),
+            lines[tail_start..].join("\n")
+        )
+    };
+    for re in strict {
+        if let Some(caps) = re.captures(&edge_text)
+            && let Ok(code) = caps[1].parse::<i64>()
+        {
+            return code;
+        }
+    }
+    static LOOSE_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let loose = LOOSE_PATTERNS.get_or_init(|| {
         vec![
             Regex::new(r"(?i)Command exited with code (\d+)").unwrap(),
             Regex::new(r"(?i)Process exited with code (\d+)").unwrap(),
             Regex::new(r"(?i)Exit code:\s*(\d+)").unwrap(),
             Regex::new(r"(?i)exit status (\d+)").unwrap(),
-            Regex::new(r#""exit_code"\s*:\s*(\d+)"#).unwrap(),
         ]
     });
-    for re in patterns {
-        if let Some(caps) = re.captures(text)
-            && let Ok(code) = caps[1].parse::<i64>()
-        {
-            return code;
+    if is_error || lines.len() <= 16 {
+        for re in loose {
+            if let Some(caps) = re.captures(&edge_text)
+                && let Ok(code) = caps[1].parse::<i64>()
+            {
+                return code;
+            }
         }
     }
     if is_error { 1 } else { 0 }

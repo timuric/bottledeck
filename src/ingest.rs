@@ -1,8 +1,8 @@
 use crate::adapters::{ParsedFile, antigravity, claude, codex, kimi, spans};
 use crate::config::AdapterRoots;
 use crate::db::{
-    delete_records_for_source, insert_command_span, insert_file_read, insert_tool_call,
-    upsert_session,
+    delete_records_for_source, insert_command_span, insert_file_read, insert_llm_call,
+    insert_tool_call, upsert_session,
 };
 use crate::workspace::WorkspaceResolver;
 use anyhow::Result;
@@ -38,6 +38,7 @@ pub struct SyncStats {
     pub spans_inserted: usize,
     pub file_reads_inserted: usize,
     pub tool_calls_inserted: usize,
+    pub llm_calls_inserted: usize,
     pub by_adapter: BTreeMap<String, AdapterSyncStats>,
     pub errors: Vec<SyncError>,
 }
@@ -118,6 +119,9 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
 
     let mut stats = SyncStats::default();
     let mut discovered_paths: HashSet<String> = HashSet::new();
+    // Reuse a single pre-seeded WorkspaceResolver across the whole sync to avoid spawning
+    // repeated `git rev-parse` subprocesses on every file.
+    let mut shared_resolver = WorkspaceResolver::new_detached(conn);
 
     for (adapter, files) in sources {
         let adapter_name = adapter.name().to_string();
@@ -132,12 +136,25 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
                 continue;
             };
             let size_bytes = meta.len() as i64;
-            let mtime_ms = meta
+            let mut mtime_ms = meta
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            // For Kimi sessions, also incorporate sibling `state.json` mtime so metadata updates trigger re-ingest.
+            if matches!(adapter, AdapterKind::Kimi)
+                && let Some(state_path) = file_path
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::parent)
+                    .map(|d| d.join("state.json"))
+                && let Ok(sm) = fs::metadata(&state_path)
+                && let Ok(st) = sm.modified()
+                && let Ok(dur) = st.duration_since(UNIX_EPOCH)
+            {
+                mtime_ms = mtime_ms.max(dur.as_millis() as i64);
+            }
 
             let prev: Option<(i64, i64)> = conn
                 .query_row(
@@ -153,14 +170,12 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
                 continue;
             }
 
-            let parsed_res = {
-                let mut resolver = WorkspaceResolver::new(Some(conn));
-                adapter.parse(&file_path, &mut resolver)
-            };
+            let parsed_res = adapter.parse(&file_path, &mut shared_resolver);
 
             match parsed_res {
                 Ok(parsed) => {
                     let tx = conn.transaction()?;
+                    shared_resolver.flush_pending(&tx);
                     delete_records_for_source(&tx, &path_str)?;
                     // When upgrading from compact `transcript.jsonl` to `transcript_full.jsonl`,
                     // purge any previously ingested records from the sibling compact file.
@@ -193,6 +208,10 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
                     for tc in &parsed.tool_calls {
                         insert_tool_call(&tx, tc)?;
                         stats.tool_calls_inserted += 1;
+                    }
+                    for lc in &parsed.llm_calls {
+                        insert_llm_call(&tx, lc)?;
+                        stats.llm_calls_inserted += 1;
                     }
                     tx.execute(
                         "INSERT INTO ingest_files (file_path, adapter, size_bytes, mtime_ms, line_count, updated_at)
@@ -227,6 +246,7 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
         }
     }
 
+    shared_resolver.flush_pending(conn);
     prune_deleted_sources(conn, &discovered_paths)?;
     reconcile_workspaces_and_sessions(conn)?;
     Ok(stats)
@@ -307,7 +327,11 @@ fn reconcile_workspaces_and_sessions(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
-    // 2. Find inferred/dir workspaces that clearly match a canonical repo (e.g. `<repo>-<slug>`, `/worktrees/<repo>/`)
+    // 2. Find inferred/dir workspaces that clearly match a canonical repo (longest short name first so
+    //    `app-server` isn't hijacked by `app`).
+    let mut canon_sorted: Vec<(&String, &(String, String))> = canonical_by_short.iter().collect();
+    canon_sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
+
     let mut remaps: Vec<(String, String, String)> = Vec::new(); // (old_repo_id, new_repo_id, new_repo_name)
     {
         let mut stmt = conn.prepare(
@@ -325,13 +349,14 @@ fn reconcile_workspaces_and_sessions(conn: &mut Connection) -> Result<()> {
             let (old_id, old_name, wt_path) = row;
             let lower_path = wt_path.replace('\\', "/").to_ascii_lowercase();
             let lower_name = old_name.to_ascii_lowercase();
-            for (short, (canon_id, canon_name)) in &canonical_by_short {
+            for (short, (canon_id, canon_name)) in &canon_sorted {
                 let matches_worktree = lower_path.contains(&format!("/worktrees/{short}/"))
-                    || lower_path.contains(&format!("/{short}-"))
-                    || lower_path.contains(&format!("/{short}_"))
-                    || lower_name == *short
-                    || lower_name.starts_with(&format!("{short}-"))
-                    || lower_name.starts_with(&format!("{short}_"));
+                    || lower_name == **short
+                    || (lower_path.contains("/worktrees/")
+                        && (lower_path.contains(&format!("/{short}-"))
+                            || lower_path.contains(&format!("/{short}_"))
+                            || lower_name.starts_with(&format!("{short}-"))
+                            || lower_name.starts_with(&format!("{short}_"))));
                 if matches_worktree {
                     remaps.push((old_id.clone(), canon_id.clone(), canon_name.clone()));
                     break;
@@ -362,7 +387,35 @@ fn reconcile_workspaces_and_sessions(conn: &mut Connection) -> Result<()> {
             "UPDATE tool_calls SET repo_id = ?1, repo_name = ?2 WHERE repo_id = ?3",
             params![new_id, new_name, old_id],
         )?;
+        tx.execute(
+            "UPDATE llm_calls SET repo_id = ?1 WHERE repo_id = ?2",
+            params![new_id, old_id],
+        )?;
     }
+
+    // 2b. Reconcile unprefixed wrap `session_id`s to their canonical prefixed session row
+    tx.execute(
+        "UPDATE command_spans
+         SET session_id = (
+           SELECT s.session_id FROM sessions s
+           WHERE s.session_id = 'claude:' || command_spans.session_id
+              OR s.session_id = 'codex:' || command_spans.session_id
+              OR s.session_id = 'antigravity:' || command_spans.session_id
+              OR s.session_id = 'kimi:' || command_spans.session_id
+           LIMIT 1
+         )
+         WHERE source_kind = 'wrap'
+           AND session_id IS NOT NULL
+           AND instr(session_id, ':') = 0
+           AND EXISTS (
+             SELECT 1 FROM sessions s
+             WHERE s.session_id = 'claude:' || command_spans.session_id
+                OR s.session_id = 'codex:' || command_spans.session_id
+                OR s.session_id = 'antigravity:' || command_spans.session_id
+                OR s.session_id = 'kimi:' || command_spans.session_id
+           )",
+        [],
+    )?;
 
     // 3. Re-attribute neutral-cwd sessions (e.g. `~`, `~/.t3`) whose spans or raw commands clearly target one canonical repo
     let mut neutral_sessions: Vec<(String, Option<String>)> = Vec::new();
@@ -475,6 +528,13 @@ fn reconcile_workspaces_and_sessions(conn: &mut Connection) -> Result<()> {
              repo_name = (SELECT s.repo_name FROM sessions s WHERE s.session_id = file_reads.session_id)
          WHERE repo_id IS NULL
            AND EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = file_reads.session_id AND s.repo_id IS NOT NULL)",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE llm_calls
+         SET repo_id = (SELECT s.repo_id FROM sessions s WHERE s.session_id = llm_calls.session_id)
+         WHERE repo_id IS NULL
+           AND EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = llm_calls.session_id AND s.repo_id IS NOT NULL)",
         [],
     )?;
 

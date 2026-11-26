@@ -5,7 +5,7 @@ pub mod kimi;
 pub mod spans;
 
 use crate::config::estimate_tokens_bytes;
-use crate::db::{CommandSpanRecord, FileReadRecord, SessionRecord, ToolCallRecord};
+use crate::db::{CommandSpanRecord, FileReadRecord, LlmCallRecord, SessionRecord, ToolCallRecord};
 use crate::shell::{
     classify_output_noise, extract_state_dir_hint, extract_stderr_preview, parse_command_tokens,
     redact_secrets, split_shell_commands,
@@ -23,7 +23,84 @@ pub struct ParsedFile {
     pub spans: Vec<CommandSpanRecord>,
     pub file_reads: Vec<FileReadRecord>,
     pub tool_calls: Vec<ToolCallRecord>,
+    pub llm_calls: Vec<LlmCallRecord>,
     pub line_count: i64,
+}
+
+/// Merge overlapping `[start_ms, end_ms]` intervals to compute true parallel wall-clock time.
+pub fn merge_intervals_ms(intervals: &[(i64, i64)]) -> i64 {
+    let mut clean: Vec<(i64, i64)> = intervals
+        .iter()
+        .copied()
+        .filter(|(s, e)| *e > *s && *s > 0)
+        .collect();
+    if clean.is_empty() {
+        return 0;
+    }
+    clean.sort_unstable_by_key(|&(s, e)| (s, e));
+    let mut total: i64 = 0;
+    let (mut cur_s, mut cur_e) = clean[0];
+    for (s, e) in clean.into_iter().skip(1) {
+        if s <= cur_e {
+            cur_e = cur_e.max(e);
+        } else {
+            total += cur_e - cur_s;
+            cur_s = s;
+            cur_e = e;
+        }
+    }
+    total + (cur_e - cur_s)
+}
+
+/// Return true if a tool name represents a file creation/modification tool.
+pub fn is_edit_tool(raw_name: &str) -> bool {
+    matches!(
+        raw_name.trim().to_ascii_lowercase().as_str(),
+        "edit"
+            | "edit_file"
+            | "write"
+            | "write_file"
+            | "multiedit"
+            | "multi_edit"
+            | "apply_patch"
+            | "filechange"
+            | "file_change"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "notebookedit"
+            | "str_replace_editor"
+            | "create_file"
+    )
+}
+
+/// Normalize a file target path against an optional workspace root so `src/a/mod.rs` and `src/b/mod.rs`
+/// stay distinct while keeping a short basename for display.
+pub fn normalize_target_path(raw: &str, repo_root: Option<&str>) -> (String, String) {
+    let cleaned = raw.trim().replace('\\', "/");
+    let display_name =
+        if cleaned.contains("/.system_generated/steps/") && cleaned.ends_with("/output.txt") {
+            "steps/output.txt".to_string()
+        } else {
+            Path::new(&cleaned)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&cleaned)
+                .to_string()
+        };
+    let rel_path = if let Some(root) = repo_root {
+        let r = root.replace('\\', "/");
+        let r_slash = if r.ends_with('/') { r } else { format!("{r}/") };
+        if let Some(stripped) = cleaned.strip_prefix(&r_slash)
+            && !stripped.is_empty()
+        {
+            stripped.to_string()
+        } else {
+            cleaned
+        }
+    } else {
+        cleaned
+    };
+    (display_name, rel_path)
 }
 
 /// Detect whether a tool/command output was truncated by the agent harness.
@@ -180,14 +257,14 @@ pub fn extract_shell_file_read_paths(raw_cmd: &str, cmd_bin: &str) -> Vec<String
             continue;
         }
         if t.starts_with('-') {
-            if matches!(t.as_str(), "-n" | "-c" | "-e" | "-f" | "-b" | "-v" | "-w") {
-                if !(cmd_bin == "sed" && t == "-n") {
-                    if cmd_bin == "sed" && t == "-e" {
-                        saw_sed_expr = true;
-                    }
-                    i += 2;
-                    continue;
+            if matches!(t.as_str(), "-n" | "-c" | "-e" | "-f" | "-b" | "-v" | "-w")
+                && !(cmd_bin == "sed" && t == "-n")
+            {
+                if cmd_bin == "sed" && t == "-e" {
+                    saw_sed_expr = true;
                 }
+                i += 2;
+                continue;
             }
             i += 1;
             continue;
@@ -266,16 +343,16 @@ pub fn to_epoch_ms(val: Option<&Value>) -> Option<i64> {
     if let Some(n) = v.as_i64() {
         return Some(if n < 1_000_000_000_000 { n * 1000 } else { n });
     }
-    if let Some(f) = v.as_f64() {
-        if f.is_finite() {
-            let n = f.round() as i64;
-            return Some(if n < 1_000_000_000_000 { n * 1000 } else { n });
-        }
+    if let Some(f) = v.as_f64()
+        && f.is_finite()
+    {
+        let n = f.round() as i64;
+        return Some(if n < 1_000_000_000_000 { n * 1000 } else { n });
     }
-    if let Some(s) = v.as_str() {
-        if let Ok(dt) = DateTime::parse_from_rfc3339(s.trim()) {
-            return Some(dt.timestamp_millis());
-        }
+    if let Some(s) = v.as_str()
+        && let Ok(dt) = DateTime::parse_from_rfc3339(s.trim())
+    {
+        return Some(dt.timestamp_millis());
     }
     None
 }
@@ -371,11 +448,20 @@ pub fn dominant_span_repo(spans: &[CommandSpanRecord]) -> Option<(String, String
 }
 
 pub fn clamp_tool_duration(ms: Option<i64>) -> Option<i64> {
-    let v = ms?;
-    if !(0..=600_000).contains(&v) {
-        return None;
+    classify_tool_duration(ms, false).0
+}
+
+/// Validate a tool duration and flag long-running (>600s) jobs instead of silently dropping them.
+/// Explicit durations (from harness timers) allow up to 1 hour; timestamp-diff fallbacks allow up to 30 minutes.
+pub fn classify_tool_duration(ms: Option<i64>, is_explicit: bool) -> (Option<i64>, bool) {
+    let Some(v) = ms else {
+        return (None, false);
+    };
+    let cap = if is_explicit { 3_600_000 } else { 1_800_000 };
+    if !(0..=cap).contains(&v) {
+        return (None, false);
     }
-    Some(v)
+    (Some(v), v > 600_000)
 }
 
 pub struct SpanBuildArgs<'a> {
@@ -390,6 +476,8 @@ pub struct SpanBuildArgs<'a> {
     pub base_cwd: Option<&'a str>,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
+    pub is_explicit_duration: bool,
+    pub interrupted: bool,
     pub stdout_text: &'a str,
     pub stderr_text: &'a str,
     pub started_at: i64,
@@ -455,9 +543,15 @@ pub fn build_command_spans(
     let stderr_preview = extract_stderr_preview(err_src, args.exit_code);
 
     let count = parsed_segs.len() as i64;
+    let is_chained = count > 1
+        || segs
+            .iter()
+            .any(|s| matches!(s.separator.as_str(), "&&" | "||" | ";" | "\n" | "&"));
     let per_stdout_bytes = total_stdout_bytes / count;
     let per_stdout_tokens = total_stdout_tokens / count;
-    let per_duration = args.duration_ms.map(|d| d / count);
+    let (validated_dur, is_long_duration) =
+        classify_tool_duration(args.duration_ms, args.is_explicit_duration);
+    let per_duration = validated_dur.map(|d| d / count);
 
     let is_truncated = detect_truncation(args.stdout_text);
     let base_ws = args.base_cwd.and_then(|c| resolver.resolve(c));
@@ -500,6 +594,17 @@ pub fn build_command_spans(
         let seq_s = seq.to_string();
         let started_s = args.started_at.to_string();
         let tc_part = args.tool_call_id.as_deref().unwrap_or(&started_s);
+        // Only infer exit 0 on non-final segments when joined by `&&` (and overall command succeeded).
+        // For `||`, `;`, `&`, or `\n` (even when the trailing RHS like `true` or `echo done` was filtered),
+        // an earlier segment's exit code is masked/unknown — never fake 0.
+        let masked_by_trailing_sep = matches!(seg.separator.as_str(), "||" | ";" | "\n" | "&");
+        let seg_exit_code = if is_last && !masked_by_trailing_sep {
+            args.exit_code
+        } else if seg.separator == "&&" && args.exit_code == Some(0) {
+            Some(0)
+        } else {
+            None
+        };
 
         spans.push(CommandSpanRecord {
             span_id: make_id(
@@ -524,7 +629,7 @@ pub fn build_command_spans(
             cmd_bin: parsed.cmd_bin.clone(),
             cmd_template: parsed.cmd_template.clone(),
             raw_redacted: parsed.raw_redacted.clone(),
-            exit_code: if is_last { args.exit_code } else { Some(0) },
+            exit_code: seg_exit_code,
             duration_ms: per_duration,
             stdout_bytes: per_stdout_bytes,
             stdout_tokens: per_stdout_tokens,
@@ -539,6 +644,9 @@ pub fn build_command_spans(
             piped_filter: seg.piped_filter.clone(),
             state_dir_hint: extract_state_dir_hint(&seg.raw, seg.cd_hint.as_deref()),
             is_truncated: is_last && is_truncated,
+            is_chained,
+            is_long_duration,
+            interrupted: args.interrupted,
             started_at: if args.started_at > 0 {
                 args.started_at
             } else {

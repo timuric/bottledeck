@@ -1,5 +1,8 @@
-use crate::analyze::{format_compact, format_harness_breakdown, is_normal_vcs_workflow_cmd};
-use crate::config::TimeRange;
+use crate::analyze::{
+    ContextHealthSummary, LatencyBreakdown, OutcomeSummary, effective_context_tokens,
+    format_compact, format_duration_human, format_harness_breakdown, is_normal_vcs_workflow_cmd,
+};
+use crate::config::{TimeRange, default_context_window, estimate_cost_usd};
 use crate::repo_context::RepoContext;
 use crate::shell::clean_error_preview;
 use anyhow::Result;
@@ -75,6 +78,9 @@ pub struct HarnessBreakdown {
     pub tool_calls: usize,
     pub median_total_tokens: i64,
     pub avg_uncached_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub thinking_tokens: i64,
+    pub est_cost_usd: f64,
     pub weighted_cache_hit: Option<f64>,
     pub median_cache_hit: Option<f64>,
     pub p25_cache_hit: Option<f64>,
@@ -82,9 +88,57 @@ pub struct HarnessBreakdown {
     pub truncated_outputs: usize,
     pub truncated_sessions_pct: f64,
     pub median_tool_wait_s: f64,
+    pub median_tool_wall_s: f64,
+    pub avg_api_wait_s: Option<f64>,
+    pub avg_ttft_ms: Option<i64>,
+    pub compaction_rate: f64,
+    pub abort_rate: f64,
+    pub avg_peak_context_pct: Option<f64>,
+    pub lines_changed: i64,
     pub error_rate: f64,
     pub rebound_rate: f64,
     pub top_friction_cmds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelBreakdown {
+    pub model: String,
+    pub agent_kind: String,
+    pub sessions: usize,
+    pub llm_calls: usize,
+    pub total_tokens: i64,
+    pub input_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cached_tokens: i64,
+    pub output_tokens: i64,
+    pub thinking_tokens: i64,
+    pub cache_hit_rate: Option<f64>,
+    pub est_cost_usd: f64,
+    pub avg_api_wait_s: Option<f64>,
+    pub avg_ttft_ms: Option<i64>,
+    pub api_errors: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubagentRollup {
+    pub parent_sessions_with_children: usize,
+    pub linked_subagents: usize,
+    pub unlinked_subagents: usize,
+    pub max_fanout: usize,
+    pub subagent_total_tokens: i64,
+    pub subagent_est_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileEditChurnStat {
+    pub target_path: String,
+    pub edits: usize,
+    pub edit_errors: usize,
+    pub sessions: usize,
+    pub max_edits_in_session: usize,
+    pub rework_cycles: usize,
+    pub by_harness: BTreeMap<String, usize>,
+    pub harness_summary: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,6 +182,8 @@ pub struct ToolStat {
     pub truncated_count: usize,
     pub truncated_rate: f64,
     pub avg_output_kb: f64,
+    pub p50_wait_s: Option<f64>,
+    pub p95_wait_s: Option<f64>,
     pub total_wait_s: f64,
     pub agents: Vec<String>,
     pub by_harness: BTreeMap<String, usize>,
@@ -203,6 +259,7 @@ pub struct BurstStorm {
 pub struct SessionOverview {
     pub session_id: String,
     pub agent_kind: String,
+    pub model: Option<String>,
     pub originator: String,
     pub role: String,
     pub is_handoff: bool,
@@ -213,8 +270,14 @@ pub struct SessionOverview {
     pub total_tokens: i64,
     pub uncached_tokens: i64,
     pub cache_hit_rate: Option<f64>,
+    pub est_cost_usd: f64,
     pub stdout_kb: f64,
     pub total_wait_s: f64,
+    pub tool_wall_s: f64,
+    pub api_wait_s: f64,
+    pub outcome: Option<String>,
+    pub peak_context_pct: Option<f64>,
+    pub compaction_count: i64,
     pub error_count: usize,
     pub top_families: Vec<String>,
 }
@@ -225,6 +288,7 @@ pub struct CrossSessionPatternsReport {
     pub repo_name: String,
     pub window: String,
     pub branch_behind_notice: Option<String>,
+    pub harness_mix_shift_notice: Option<String>,
     pub sessions_analyzed: usize,
     pub main_sessions: usize,
     pub subagent_sessions: usize,
@@ -233,12 +297,19 @@ pub struct CrossSessionPatternsReport {
     pub recent_cmds: usize,
     pub early_error_rate: f64,
     pub recent_error_rate: f64,
+    pub latency: LatencyBreakdown,
+    pub context_health: ContextHealthSummary,
+    pub outcomes: OutcomeSummary,
     pub pareto: ParetoSummary,
     pub handoff_summary: Option<HandoffSummary>,
+    pub subagent_rollup: Option<SubagentRollup>,
     pub harness_comparison: Vec<HarnessBreakdown>,
+    pub model_breakdown: Vec<ModelBreakdown>,
     pub universal_friction_cmds: Vec<String>,
     pub recurring_motifs: Vec<RecurringMotif>,
     pub repeating_sequences: Vec<RepeatingSequence>,
+    pub tool_trajectories: Vec<RepeatingSequence>,
+    pub file_edit_churn: Vec<FileEditChurnStat>,
     pub temporal_drift: Vec<TemporalDriftItem>,
     pub cold_start_errors: Vec<ColdStartErrorClass>,
     pub context_bloat_drivers: Vec<BloatDriver>,
@@ -251,30 +322,90 @@ pub struct CrossSessionPatternsReport {
 struct Sess {
     session_id: String,
     agent_kind: String,
+    model: Option<String>,
     originator: String,
     role: String,
     is_subagent: bool,
     is_handoff: bool,
     started_at: i64,
+    ended_at: i64,
     turn_count: i64,
     input_tokens: i64,
+    cache_write_tokens: i64,
     output_tokens: i64,
     cached_tokens: i64,
+    thinking_tokens: i64,
+    cost_usd: Option<f64>,
     total_tool_ms: i64,
+    tool_wall_ms: i64,
+    api_duration_ms: i64,
+    api_retry_ms: i64,
+    thinking_duration_ms: i64,
+    ttft_ms_sum: i64,
+    ttft_count: i64,
+    compaction_count: i64,
+    aborted_turns: i64,
+    api_errors: i64,
+    outcome: Option<String>,
+    parent_session_id: Option<String>,
+    lines_added: i64,
+    lines_removed: i64,
+    max_context_tokens: i64,
+    context_window: Option<i64>,
 }
 
 impl Sess {
     fn total_tokens(&self) -> i64 {
-        self.input_tokens + self.cached_tokens + self.output_tokens
+        self.input_tokens
+            + self.cache_write_tokens
+            + self.cached_tokens
+            + self.output_tokens
+            + self.thinking_tokens
     }
 
     fn cache_hit_rate(&self) -> Option<f64> {
-        let denom = self.input_tokens + self.cached_tokens;
+        let denom = self.input_tokens + self.cache_write_tokens + self.cached_tokens;
         if denom > 0 {
             Some(self.cached_tokens as f64 / denom as f64)
         } else {
             None
         }
+    }
+
+    fn effective_cost_usd(&self) -> f64 {
+        if let Some(c) = self.cost_usd
+            && c > 0.0
+        {
+            return c;
+        }
+        estimate_cost_usd(
+            self.model.as_deref(),
+            &self.agent_kind,
+            self.input_tokens,
+            self.cached_tokens,
+            self.cache_write_tokens,
+            self.output_tokens,
+            self.thinking_tokens,
+        )
+    }
+
+    fn wall_ms(&self) -> i64 {
+        if self.ended_at > self.started_at && self.started_at > 0 {
+            (self.ended_at - self.started_at).min(86_400_000)
+        } else {
+            0
+        }
+    }
+
+    fn peak_context_pct(&self) -> Option<f64> {
+        if self.max_context_tokens <= 0 {
+            return None;
+        }
+        let win = self
+            .context_window
+            .filter(|&w| w > 0)
+            .or_else(|| default_context_window(self.model.as_deref(), &self.agent_kind))?;
+        Some(((self.max_context_tokens as f64 / win as f64) * 100.0).min(150.0))
     }
 }
 
@@ -282,6 +413,7 @@ struct Span {
     session_id: String,
     agent_kind: String,
     turn_idx: i64,
+    seq_idx: i64,
     workspace_id: Option<String>,
     category: String,
     is_repo_cli: bool,
@@ -300,10 +432,18 @@ struct Span {
 struct TCall {
     session_id: String,
     agent_kind: String,
+    turn_idx: i64,
+    seq_idx: i64,
     tool_name: String,
+    is_mcp: bool,
     is_error: bool,
+    duration_ms: Option<i64>,
     output_bytes: i64,
+    output_tokens: i64,
     is_truncated: bool,
+    target_path: Option<String>,
+    is_edit: bool,
+    started_at: i64,
 }
 
 fn percentile_i64(values: &[i64], p: f64) -> i64 {
@@ -462,6 +602,190 @@ fn classify_cold_error(sp: &Span) -> Option<String> {
     None
 }
 
+const SESS_SELECT_COLS: &str = "session_id, agent_kind, model, COALESCE(originator, 'default'),
+                COALESCE(subagent_kind, CASE WHEN is_subagent != 0 THEN 'subagent' ELSE 'main' END),
+                is_subagent, is_handoff, COALESCE(started_at, ended_at, 0), COALESCE(ended_at, started_at, 0),
+                turn_count, input_tokens, cache_write_tokens, output_tokens, cached_tokens, thinking_tokens,
+                cost_usd, total_tool_ms, tool_wall_ms, api_duration_ms, api_retry_ms, thinking_duration_ms,
+                ttft_ms_sum, ttft_count, compaction_count, aborted_turns, api_errors, outcome,
+                parent_session_id, lines_added, lines_removed, max_context_tokens, context_window";
+
+fn map_sess_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Sess> {
+    Ok(Sess {
+        session_id: r.get(0)?,
+        agent_kind: r.get(1)?,
+        model: r.get(2)?,
+        originator: r.get(3)?,
+        role: r.get(4)?,
+        is_subagent: r.get::<_, i64>(5)? != 0,
+        is_handoff: r.get::<_, i64>(6)? != 0,
+        started_at: r.get(7)?,
+        ended_at: r.get(8)?,
+        turn_count: r.get(9)?,
+        input_tokens: r.get(10)?,
+        cache_write_tokens: r.get(11)?,
+        output_tokens: r.get(12)?,
+        cached_tokens: r.get(13)?,
+        thinking_tokens: r.get(14)?,
+        cost_usd: r.get(15)?,
+        total_tool_ms: r.get(16)?,
+        tool_wall_ms: r.get(17)?,
+        api_duration_ms: r.get(18)?,
+        api_retry_ms: r.get(19)?,
+        thinking_duration_ms: r.get(20)?,
+        ttft_ms_sum: r.get(21)?,
+        ttft_count: r.get(22)?,
+        compaction_count: r.get(23)?,
+        aborted_turns: r.get(24)?,
+        api_errors: r.get(25)?,
+        outcome: r.get(26)?,
+        parent_session_id: r.get(27)?,
+        lines_added: r.get(28)?,
+        lines_removed: r.get(29)?,
+        max_context_tokens: r.get(30)?,
+        context_window: r.get(31)?,
+    })
+}
+
+fn summarize_sess_latency(sessions: &[Sess]) -> LatencyBreakdown {
+    let mut wall_s_vec = Vec::new();
+    let mut api_s_vec = Vec::new();
+    let mut total_wall_ms: i64 = 0;
+    let mut total_api_ms: i64 = 0;
+    let mut total_retry_ms: i64 = 0;
+    let mut total_think_ms: i64 = 0;
+    let mut total_tool_serial_ms: i64 = 0;
+    let mut total_tool_wall_ms: i64 = 0;
+    let mut ttft_sum: i64 = 0;
+    let mut ttft_cnt: i64 = 0;
+    let mut sessions_with_api = 0usize;
+
+    for s in sessions {
+        let w = s.wall_ms();
+        if w > 0 {
+            total_wall_ms += w;
+            wall_s_vec.push(w as f64 / 1000.0);
+        }
+        if s.api_duration_ms > 0 {
+            sessions_with_api += 1;
+            total_api_ms += s.api_duration_ms;
+            api_s_vec.push(s.api_duration_ms as f64 / 1000.0);
+        }
+        total_retry_ms += s.api_retry_ms.max(0);
+        total_think_ms += s.thinking_duration_ms.max(0);
+        total_tool_serial_ms += s.total_tool_ms.max(0);
+        let tw = if s.tool_wall_ms > 0 {
+            s.tool_wall_ms
+        } else {
+            s.total_tool_ms.max(0)
+        };
+        total_tool_wall_ms += tw;
+        ttft_sum += s.ttft_ms_sum.max(0);
+        ttft_cnt += s.ttft_count.max(0);
+    }
+
+    let other_idle_ms = (total_wall_ms - total_api_ms - total_tool_wall_ms).max(0);
+    let parallelism = if total_tool_wall_ms > 0 && total_tool_serial_ms > 0 {
+        r1((total_tool_serial_ms as f64 / total_tool_wall_ms as f64).max(1.0))
+    } else {
+        1.0
+    };
+
+    LatencyBreakdown {
+        total_session_wall_s: r1(total_wall_ms as f64 / 1000.0),
+        median_session_wall_s: r1(percentile_f64(&wall_s_vec, 50.0)),
+        total_api_wait_s: r1(total_api_ms as f64 / 1000.0),
+        median_api_wait_s: r1(percentile_f64(&api_s_vec, 50.0)),
+        total_api_retry_s: r1(total_retry_ms as f64 / 1000.0),
+        total_thinking_s: r1(total_think_ms as f64 / 1000.0),
+        total_tool_serial_s: r1(total_tool_serial_ms as f64 / 1000.0),
+        total_tool_wall_s: r1(total_tool_wall_ms as f64 / 1000.0),
+        tool_parallelism_ratio: parallelism,
+        avg_ttft_ms: if ttft_cnt > 0 {
+            Some(ttft_sum / ttft_cnt)
+        } else {
+            None
+        },
+        other_idle_s: r1(other_idle_ms as f64 / 1000.0),
+        sessions_with_api_timing: sessions_with_api,
+    }
+}
+
+fn summarize_sess_context_health(sessions: &[Sess]) -> ContextHealthSummary {
+    let mut pcts = Vec::new();
+    let mut over_80 = 0usize;
+    let mut total_compactions = 0i64;
+    let mut compacted_sessions = 0usize;
+    for s in sessions {
+        if let Some(pct) = s.peak_context_pct() {
+            pcts.push(pct);
+            if pct >= 80.0 {
+                over_80 += 1;
+            }
+        }
+        if s.compaction_count > 0 {
+            total_compactions += s.compaction_count;
+            compacted_sessions += 1;
+        }
+    }
+    ContextHealthSummary {
+        sessions_with_context_data: pcts.len(),
+        avg_peak_context_pct: if pcts.is_empty() {
+            None
+        } else {
+            Some(r1(pcts.iter().sum::<f64>() / pcts.len() as f64))
+        },
+        p95_peak_context_pct: if pcts.len() >= 3 {
+            Some(r1(percentile_f64(&pcts, 95.0)))
+        } else {
+            None
+        },
+        sessions_over_80_pct: over_80,
+        total_compactions,
+        compacted_sessions,
+    }
+}
+
+fn summarize_sess_outcomes(sessions: &[Sess]) -> OutcomeSummary {
+    let mut completed = 0usize;
+    let mut aborted = 0usize;
+    let mut errored = 0usize;
+    let mut unknown = 0usize;
+    let mut aborted_turns = 0i64;
+    let mut api_errors = 0i64;
+    let mut aborted_tokens = 0i64;
+    let mut lines_added = 0i64;
+    let mut lines_removed = 0i64;
+    for s in sessions {
+        aborted_turns += s.aborted_turns.max(0);
+        api_errors += s.api_errors.max(0);
+        lines_added += s.lines_added.max(0);
+        lines_removed += s.lines_removed.max(0);
+        if s.outcome.as_deref() == Some("aborted") || s.aborted_turns > 0 {
+            aborted += 1;
+            aborted_tokens += s.total_tokens();
+        } else {
+            match s.outcome.as_deref() {
+                Some("error") => errored += 1,
+                Some("completed") => completed += 1,
+                _ => unknown += 1,
+            }
+        }
+    }
+    OutcomeSummary {
+        completed_sessions: completed,
+        aborted_sessions: aborted,
+        error_sessions: errored,
+        unknown_sessions: unknown,
+        abort_rate: r3(aborted as f64 / sessions.len().max(1) as f64),
+        total_aborted_turns: aborted_turns,
+        total_api_errors: api_errors,
+        aborted_session_tokens: aborted_tokens,
+        total_lines_added: lines_added,
+        total_lines_removed: lines_removed,
+    }
+}
+
 pub fn analyze_cross_session_patterns(
     conn: &Connection,
     repo_id: &str,
@@ -478,39 +802,21 @@ pub fn analyze_cross_session_patterns(
         )
         .unwrap_or_else(|_| repo_id.to_string());
 
-    let mut s_stmt = conn.prepare(
-        "SELECT session_id, agent_kind, COALESCE(originator, 'default'),
-                COALESCE(subagent_kind, CASE WHEN is_subagent != 0 THEN 'subagent' ELSE 'main' END),
-                is_subagent, is_handoff, COALESCE(started_at, ended_at, 0),
-                turn_count, input_tokens, output_tokens, cached_tokens, total_tool_ms
+    let mut s_stmt = conn.prepare(&format!(
+        "SELECT {SESS_SELECT_COLS}
          FROM sessions
          WHERE repo_id = ?1
            AND COALESCE(started_at, ended_at, 0) >= ?2
            AND COALESCE(started_at, ended_at, 0) < ?3
-         ORDER BY started_at ASC",
-    )?;
+         ORDER BY started_at ASC"
+    ))?;
     let sessions: Vec<Sess> = s_stmt
-        .query_map(params![repo_id, since_ms, until_ms], |r| {
-            Ok(Sess {
-                session_id: r.get(0)?,
-                agent_kind: r.get(1)?,
-                originator: r.get(2)?,
-                role: r.get(3)?,
-                is_subagent: r.get::<_, i64>(4)? != 0,
-                is_handoff: r.get::<_, i64>(5)? != 0,
-                started_at: r.get(6)?,
-                turn_count: r.get(7)?,
-                input_tokens: r.get(8)?,
-                output_tokens: r.get(9)?,
-                cached_tokens: r.get(10)?,
-                total_tool_ms: r.get(11)?,
-            })
-        })?
+        .query_map(params![repo_id, since_ms, until_ms], map_sess_row)?
         .flatten()
         .collect();
 
     let mut sp_stmt = conn.prepare(
-        "SELECT COALESCE(session_id, 'orphan'), COALESCE(agent_kind, 'unknown'), turn_idx, workspace_id,
+        "SELECT COALESCE(session_id, 'orphan'), COALESCE(agent_kind, 'unknown'), turn_idx, seq_idx, workspace_id,
                 category, is_repo_cli, cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
                 stdout_bytes, stdout_tokens, stderr_preview, is_truncated, started_at
          FROM command_spans
@@ -518,8 +824,7 @@ pub fn analyze_cross_session_patterns(
            AND started_at >= ?2 AND started_at < ?3
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))
          ORDER BY session_id ASC, turn_idx ASC, seq_idx ASC, started_at ASC",
@@ -530,45 +835,55 @@ pub fn analyze_cross_session_patterns(
                 session_id: r.get(0)?,
                 agent_kind: r.get(1)?,
                 turn_idx: r.get(2)?,
-                workspace_id: r.get(3)?,
-                category: r.get(4)?,
-                is_repo_cli: r.get::<_, i64>(5)? != 0,
-                cmd_bin: r.get(6)?,
-                cmd_template: r.get(7)?,
-                raw_redacted: r.get(8)?,
-                exit_code: r.get(9)?,
-                duration_ms: r.get(10)?,
-                stdout_bytes: r.get(11)?,
-                stdout_tokens: r.get(12)?,
-                stderr_preview: r.get(13)?,
-                is_truncated: r.get::<_, i64>(14)? != 0,
-                started_at: r.get(15)?,
+                seq_idx: r.get(3)?,
+                workspace_id: r.get(4)?,
+                category: r.get(5)?,
+                is_repo_cli: r.get::<_, i64>(6)? != 0,
+                cmd_bin: r.get(7)?,
+                cmd_template: r.get(8)?,
+                raw_redacted: r.get(9)?,
+                exit_code: r.get(10)?,
+                duration_ms: r.get(11)?,
+                stdout_bytes: r.get(12)?,
+                stdout_tokens: r.get(13)?,
+                stderr_preview: r.get(14)?,
+                is_truncated: r.get::<_, i64>(15)? != 0,
+                started_at: r.get(16)?,
             })
         })?
         .flatten()
         .collect();
 
     let mut tc_stmt = conn.prepare(
-        "SELECT session_id, agent_kind, tool_name, is_error, output_bytes, is_truncated
+        "SELECT session_id, agent_kind, turn_idx, seq_idx, tool_name, is_mcp, is_error, duration_ms,
+                output_bytes, output_tokens, is_truncated, target_path, is_edit, started_at
          FROM tool_calls
          WHERE repo_id = ?1
            AND started_at >= ?2 AND started_at < ?3
            AND session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
-           )",
+           )
+         ORDER BY session_id ASC, turn_idx ASC, seq_idx ASC, started_at ASC",
     )?;
     let tcalls: Vec<TCall> = tc_stmt
         .query_map(params![repo_id, since_ms, until_ms], |r| {
             Ok(TCall {
                 session_id: r.get(0)?,
                 agent_kind: r.get(1)?,
-                tool_name: r.get(2)?,
-                is_error: r.get::<_, i64>(3)? != 0,
-                output_bytes: r.get(4)?,
-                is_truncated: r.get::<_, i64>(5)? != 0,
+                turn_idx: r.get(2)?,
+                seq_idx: r.get(3)?,
+                tool_name: r.get(4)?,
+                is_mcp: r.get::<_, i64>(5)? != 0,
+                is_error: r.get::<_, i64>(6)? != 0,
+                duration_ms: r.get(7)?,
+                output_bytes: r.get(8)?,
+                output_tokens: r.get(9)?,
+                is_truncated: r.get::<_, i64>(10)? != 0,
+                target_path: r.get(11)?,
+                is_edit: r.get::<_, i64>(12)? != 0,
+                started_at: r.get(13)?,
             })
         })?
         .flatten()
@@ -589,11 +904,233 @@ pub fn analyze_cross_session_patterns(
 
     let mut spans_by_session: HashMap<&str, Vec<&Span>> = HashMap::new();
     for sp in &spans {
-        spans_by_session
-            .entry(sp.session_id.as_str())
-            .or_default()
-            .push(sp);
+        if sp.session_id != "orphan" {
+            spans_by_session
+                .entry(sp.session_id.as_str())
+                .or_default()
+                .push(sp);
+        }
     }
+
+    let latency = summarize_sess_latency(&sessions);
+    let context_health = summarize_sess_context_health(&sessions);
+    let outcomes = summarize_sess_outcomes(&sessions);
+
+    // Subagent parent-child rollup
+    let subagent_rollup = if subagent_sessions > 0 {
+        let mut children_by_parent: HashMap<&str, usize> = HashMap::new();
+        let mut linked = 0usize;
+        let mut unlinked = 0usize;
+        let mut sub_tokens = 0i64;
+        let mut sub_cost = 0.0f64;
+        for s in &sessions {
+            if s.is_subagent {
+                sub_tokens += s.total_tokens();
+                sub_cost += s.effective_cost_usd();
+                if let Some(pid) = s.parent_session_id.as_deref() {
+                    linked += 1;
+                    *children_by_parent.entry(pid).or_insert(0) += 1;
+                } else {
+                    unlinked += 1;
+                }
+            }
+        }
+        let max_fanout = children_by_parent.values().copied().max().unwrap_or(0);
+        Some(SubagentRollup {
+            parent_sessions_with_children: children_by_parent.len(),
+            linked_subagents: linked,
+            unlinked_subagents: unlinked,
+            max_fanout,
+            subagent_total_tokens: sub_tokens,
+            subagent_est_cost_usd: (sub_cost * 100.0).round() / 100.0,
+        })
+    } else {
+        None
+    };
+
+    // Per-model breakdown (uses granular `llm_calls` when present, supplemented by session-level fallback)
+    let model_breakdown = {
+        struct ModAcc {
+            sessions: HashSet<String>,
+            llm_calls: usize,
+            input_tokens: i64,
+            cache_write_tokens: i64,
+            cached_tokens: i64,
+            output_tokens: i64,
+            thinking_tokens: i64,
+            est_cost_usd: f64,
+            api_ms: i64,
+            api_cnt: usize,
+            ttft_ms: i64,
+            ttft_cnt: usize,
+            api_errors: i64,
+        }
+        let mut by_model: HashMap<(String, String), ModAcc> = HashMap::new();
+        let mut sids_with_llm: HashSet<String> = HashSet::new();
+        if let Ok(mut lm_stmt) = conn.prepare(
+            "SELECT session_id, agent_kind, COALESCE(model, 'unknown'),
+                    input_tokens, cache_write_tokens, cached_tokens, output_tokens, thinking_tokens,
+                    duration_ms, ttft_ms, is_error
+             FROM llm_calls
+             WHERE repo_id = ?1
+               AND started_at >= ?2 AND started_at < ?3
+               AND session_id IN (
+                   SELECT session_id FROM sessions
+                   WHERE COALESCE(started_at, ended_at, 0) >= ?2
+                     AND COALESCE(started_at, ended_at, 0) < ?3
+               )",
+        ) && let Ok(rows) = lm_stmt.query_map(params![repo_id, since_ms, until_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, i64>(10)? != 0,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (sid, ag, model, inp, cw, cac, out_t, think, dur, ttft, is_err) = row;
+                sids_with_llm.insert(sid.clone());
+                let cost = estimate_cost_usd(Some(&model), &ag, inp, cac, cw, out_t, think);
+                let e = by_model.entry((model, ag)).or_insert_with(|| ModAcc {
+                    sessions: HashSet::new(),
+                    llm_calls: 0,
+                    input_tokens: 0,
+                    cache_write_tokens: 0,
+                    cached_tokens: 0,
+                    output_tokens: 0,
+                    thinking_tokens: 0,
+                    est_cost_usd: 0.0,
+                    api_ms: 0,
+                    api_cnt: 0,
+                    ttft_ms: 0,
+                    ttft_cnt: 0,
+                    api_errors: 0,
+                });
+                e.sessions.insert(sid);
+                e.llm_calls += 1;
+                e.input_tokens += inp;
+                e.cache_write_tokens += cw;
+                e.cached_tokens += cac;
+                e.output_tokens += out_t;
+                e.thinking_tokens += think;
+                e.est_cost_usd += cost;
+                if let Some(d) = dur
+                    && d > 0
+                {
+                    e.api_ms += d;
+                    e.api_cnt += 1;
+                }
+                if let Some(t) = ttft
+                    && t > 0
+                {
+                    e.ttft_ms += t;
+                    e.ttft_cnt += 1;
+                }
+                if is_err {
+                    e.api_errors += 1;
+                }
+            }
+        }
+        // Fallback for sessions without per-call `llm_calls` records (e.g., Codex summary-only)
+        for s in &sessions {
+            if sids_with_llm.contains(&s.session_id) {
+                continue;
+            }
+            let model = s
+                .model
+                .clone()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            let e = by_model
+                .entry((model, s.agent_kind.clone()))
+                .or_insert_with(|| ModAcc {
+                    sessions: HashSet::new(),
+                    llm_calls: 0,
+                    input_tokens: 0,
+                    cache_write_tokens: 0,
+                    cached_tokens: 0,
+                    output_tokens: 0,
+                    thinking_tokens: 0,
+                    est_cost_usd: 0.0,
+                    api_ms: 0,
+                    api_cnt: 0,
+                    ttft_ms: 0,
+                    ttft_cnt: 0,
+                    api_errors: 0,
+                });
+            e.sessions.insert(s.session_id.clone());
+            e.llm_calls += s.turn_count.max(0) as usize;
+            e.input_tokens += s.input_tokens;
+            e.cache_write_tokens += s.cache_write_tokens;
+            e.cached_tokens += s.cached_tokens;
+            e.output_tokens += s.output_tokens;
+            e.thinking_tokens += s.thinking_tokens;
+            e.est_cost_usd += s.effective_cost_usd();
+            if s.api_duration_ms > 0 {
+                e.api_ms += s.api_duration_ms;
+                e.api_cnt += 1;
+            }
+            if s.ttft_count > 0 && s.ttft_ms_sum > 0 {
+                e.ttft_ms += s.ttft_ms_sum;
+                e.ttft_cnt += s.ttft_count as usize;
+            }
+            e.api_errors += s.api_errors.max(0);
+        }
+        let mut out: Vec<ModelBreakdown> = by_model
+            .into_iter()
+            .map(|((model, ag), m)| {
+                let total = m.input_tokens
+                    + m.cache_write_tokens
+                    + m.cached_tokens
+                    + m.output_tokens
+                    + m.thinking_tokens;
+                let denom = m.input_tokens + m.cache_write_tokens + m.cached_tokens;
+                ModelBreakdown {
+                    model,
+                    agent_kind: ag,
+                    sessions: m.sessions.len(),
+                    llm_calls: m.llm_calls,
+                    total_tokens: total,
+                    input_tokens: m.input_tokens,
+                    cache_write_tokens: m.cache_write_tokens,
+                    cached_tokens: m.cached_tokens,
+                    output_tokens: m.output_tokens,
+                    thinking_tokens: m.thinking_tokens,
+                    cache_hit_rate: if denom > 0 {
+                        Some(r3(m.cached_tokens as f64 / denom as f64))
+                    } else {
+                        None
+                    },
+                    est_cost_usd: (m.est_cost_usd * 100.0).round() / 100.0,
+                    avg_api_wait_s: if m.api_cnt > 0 {
+                        Some(r1((m.api_ms as f64 / 1000.0) / m.api_cnt as f64))
+                    } else {
+                        None
+                    },
+                    avg_ttft_ms: if m.ttft_cnt > 0 {
+                        Some(m.ttft_ms / m.ttft_cnt as i64)
+                    } else {
+                        None
+                    },
+                    api_errors: m.api_errors,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.est_cost_usd
+                .total_cmp(&a.est_cost_usd)
+                .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+        });
+        out.truncate(15);
+        out
+    };
 
     // Midpoint timestamp across sessions
     let start_times: Vec<i64> = sessions
@@ -821,20 +1358,66 @@ pub fn analyze_cross_session_patterns(
         let waits: Vec<f64> = g_sess
             .iter()
             .map(|s| s.total_tool_ms as f64 / 1000.0)
-            .filter(|&v| v > 0.0)
+            .collect();
+        let wall_waits: Vec<f64> = g_sess
+            .iter()
+            .map(|s| {
+                let tw = if s.tool_wall_ms > 0 {
+                    s.tool_wall_ms
+                } else {
+                    s.total_tool_ms
+                };
+                tw as f64 / 1000.0
+            })
             .collect();
         let sum_in: i64 = g_sess.iter().map(|s| s.input_tokens).sum();
+        let sum_cw: i64 = g_sess.iter().map(|s| s.cache_write_tokens).sum();
         let sum_cached: i64 = g_sess.iter().map(|s| s.cached_tokens).sum();
+        let sum_thinking: i64 = g_sess.iter().map(|s| s.thinking_tokens).sum();
+        let sum_est_cost: f64 = g_sess.iter().map(|s| s.effective_cost_usd()).sum();
         let avg_uncached = if g_sess.is_empty() {
             0
         } else {
-            sum_in / g_sess.len() as i64
+            (sum_in + sum_cw) / g_sess.len() as i64
         };
-        let weighted_cache = if sum_in + sum_cached > 0 {
-            Some(r3(sum_cached as f64 / (sum_in + sum_cached) as f64))
+        let cache_denom = sum_in + sum_cw + sum_cached;
+        let weighted_cache = if cache_denom > 0 {
+            Some(r3(sum_cached as f64 / cache_denom as f64))
         } else {
             None
         };
+        let api_waits: Vec<f64> = g_sess
+            .iter()
+            .filter(|s| s.api_duration_ms > 0)
+            .map(|s| s.api_duration_ms as f64 / 1000.0)
+            .collect();
+        let avg_api_wait_s = if api_waits.is_empty() {
+            None
+        } else {
+            Some(r1(api_waits.iter().sum::<f64>() / api_waits.len() as f64))
+        };
+        let ttft_sum: i64 = g_sess.iter().map(|s| s.ttft_ms_sum.max(0)).sum();
+        let ttft_cnt: i64 = g_sess.iter().map(|s| s.ttft_count.max(0)).sum();
+        let avg_ttft_ms = if ttft_cnt > 0 {
+            Some(ttft_sum / ttft_cnt)
+        } else {
+            None
+        };
+        let compacted_n = g_sess.iter().filter(|s| s.compaction_count > 0).count();
+        let aborted_n = g_sess
+            .iter()
+            .filter(|s| s.outcome.as_deref() == Some("aborted") || s.aborted_turns > 0)
+            .count();
+        let ctx_pcts: Vec<f64> = g_sess.iter().filter_map(|s| s.peak_context_pct()).collect();
+        let avg_peak_context_pct = if ctx_pcts.is_empty() {
+            None
+        } else {
+            Some(r1(ctx_pcts.iter().sum::<f64>() / ctx_pcts.len() as f64))
+        };
+        let lines_changed: i64 = g_sess
+            .iter()
+            .map(|s| s.lines_added.max(0) + s.lines_removed.max(0))
+            .sum();
         let per_sess_cache: Vec<f64> = g_sess.iter().filter_map(|s| s.cache_hit_rate()).collect();
         let med_cache = if per_sess_cache.is_empty() {
             None
@@ -926,6 +1509,9 @@ pub fn analyze_cross_session_patterns(
             tool_calls: g_tcalls.len(),
             median_total_tokens: percentile_i64(&toks, 50.0),
             avg_uncached_tokens: avg_uncached,
+            cache_write_tokens: sum_cw,
+            thinking_tokens: sum_thinking,
+            est_cost_usd: (sum_est_cost * 100.0).round() / 100.0,
             weighted_cache_hit: weighted_cache,
             median_cache_hit: med_cache,
             p25_cache_hit: p25_cache,
@@ -933,6 +1519,13 @@ pub fn analyze_cross_session_patterns(
             truncated_outputs: trunc_cnt,
             truncated_sessions_pct: trunc_sess_pct,
             median_tool_wait_s: r1(percentile_f64(&waits, 50.0)),
+            median_tool_wall_s: r1(percentile_f64(&wall_waits, 50.0)),
+            avg_api_wait_s,
+            avg_ttft_ms,
+            compaction_rate: r3(compacted_n as f64 / g_sess.len().max(1) as f64),
+            abort_rate: r3(aborted_n as f64 / g_sess.len().max(1) as f64),
+            avg_peak_context_pct,
+            lines_changed,
             error_rate: if total_ops == 0 {
                 0.0
             } else {
@@ -970,8 +1563,7 @@ pub fn analyze_cross_session_patterns(
             .get(sp.session_id.as_str())
             .copied()
             .unwrap_or(sp.turn_idx.max(1));
-        let rem = (total_t - sp.turn_idx + 1).clamp(1, 25);
-        sp.stdout_tokens.saturating_mul(rem)
+        effective_context_tokens(sp.stdout_tokens, sp.turn_idx, total_t)
     };
 
     struct MotifAcc {
@@ -1085,7 +1677,125 @@ pub fn analyze_cross_session_patterns(
         15,
     );
 
+    // 2c. Unified Cross-Tool Trajectories (interleaving shell commands + non-shell Read/Edit/MCP tools)
+    let tool_trajectories = mine_unified_trajectories(
+        &spans_by_session,
+        &tcalls,
+        &sess_turns,
+        total_sessions,
+        3,
+        8,
+        2,
+        12,
+    );
+
+    // 2d. File Edit Churn & Edit->Error->Edit Rework Cycles
+    let file_edit_churn = {
+        struct EditAcc {
+            edits: usize,
+            errors: usize,
+            sessions: HashSet<String>,
+            per_sess: HashMap<String, usize>,
+            rework_cycles: usize,
+            by_harness: BTreeMap<String, usize>,
+        }
+        let mut by_path: HashMap<String, EditAcc> = HashMap::new();
+        let mut edits_by_sess_path: HashMap<(&str, &str), Vec<(i64, i64)>> = HashMap::new();
+        for tc in &tcalls {
+            if !tc.is_edit {
+                continue;
+            }
+            let Some(path) = tc.target_path.as_deref() else {
+                continue;
+            };
+            let e = by_path.entry(path.to_string()).or_insert_with(|| EditAcc {
+                edits: 0,
+                errors: 0,
+                sessions: HashSet::new(),
+                per_sess: HashMap::new(),
+                rework_cycles: 0,
+                by_harness: BTreeMap::new(),
+            });
+            e.edits += 1;
+            if tc.is_error {
+                e.errors += 1;
+            }
+            e.sessions.insert(tc.session_id.clone());
+            *e.per_sess.entry(tc.session_id.clone()).or_insert(0) += 1;
+            *e.by_harness.entry(tc.agent_kind.clone()).or_insert(0) += 1;
+            edits_by_sess_path
+                .entry((tc.session_id.as_str(), path))
+                .or_default()
+                .push((tc.turn_idx, tc.started_at));
+        }
+        // Count edit -> failing command -> re-edit rework cycles within 3 turns
+        for ((sid, path), edit_pts) in edits_by_sess_path {
+            if edit_pts.len() < 2 {
+                continue;
+            }
+            let Some(s_spans) = spans_by_session.get(sid) else {
+                continue;
+            };
+            let mut cycles = 0usize;
+            for w in edit_pts.windows(2) {
+                let (t1, ts1) = w[0];
+                let (t2, ts2) = w[1];
+                if t2 - t1 <= 3
+                    && s_spans.iter().any(|sp| {
+                        sp.exit_code.is_some_and(|c| c != 0)
+                            && sp.turn_idx >= t1
+                            && sp.turn_idx <= t2
+                            && sp.started_at >= ts1
+                            && sp.started_at <= ts2
+                    })
+                {
+                    cycles += 1;
+                }
+            }
+            if cycles > 0
+                && let Some(acc) = by_path.get_mut(path)
+            {
+                acc.rework_cycles += cycles;
+            }
+        }
+        let mut out: Vec<FileEditChurnStat> = by_path
+            .into_iter()
+            .filter(|(_, e)| e.edits >= 3)
+            .map(|(path, e)| {
+                let max_s = e.per_sess.values().copied().max().unwrap_or(1);
+                let hs = format_harness_breakdown(&e.by_harness);
+                FileEditChurnStat {
+                    target_path: path,
+                    edits: e.edits,
+                    edit_errors: e.errors,
+                    sessions: e.sessions.len(),
+                    max_edits_in_session: max_s,
+                    rework_cycles: e.rework_cycles,
+                    by_harness: e.by_harness,
+                    harness_summary: hs,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.rework_cycles
+                .cmp(&a.rework_cycles)
+                .then_with(|| b.edits.cmp(&a.edits))
+                .then_with(|| b.sessions.cmp(&a.sessions))
+        });
+        out.truncate(12);
+        out
+    };
+
     // 3. Rate-Normalized Per-1k-Commands Temporal Drift (Early Half vs Recent Half by semantic family)
+    let mut early_by_h: HashMap<&str, usize> = HashMap::new();
+    let mut recent_by_h: HashMap<&str, usize> = HashMap::new();
+    for sp in &spans {
+        if sp.started_at < midpoint_ms {
+            *early_by_h.entry(sp.agent_kind.as_str()).or_insert(0) += 1;
+        } else {
+            *recent_by_h.entry(sp.agent_kind.as_str()).or_insert(0) += 1;
+        }
+    }
     let early_cmds = spans
         .iter()
         .filter(|s| s.started_at < midpoint_ms)
@@ -1096,6 +1806,27 @@ pub fn analyze_cross_session_patterns(
         .filter(|s| s.started_at >= midpoint_ms)
         .count()
         .max(1);
+    let harness_mix_shift_notice = if early_cmds >= 15 && recent_cmds >= 15 {
+        let mut all_ag: HashSet<&str> = HashSet::new();
+        all_ag.extend(early_by_h.keys().copied());
+        all_ag.extend(recent_by_h.keys().copied());
+        let mut worst: Option<(&str, f64, f64, f64)> = None;
+        for ag in all_ag {
+            let es = (*early_by_h.get(ag).unwrap_or(&0) as f64 / early_cmds as f64) * 100.0;
+            let rs = (*recent_by_h.get(ag).unwrap_or(&0) as f64 / recent_cmds as f64) * 100.0;
+            let delta = (rs - es).abs();
+            if delta >= 20.0 && worst.is_none_or(|w| delta > w.3) {
+                worst = Some((ag, es, rs, delta));
+            }
+        }
+        worst.map(|(ag, es, rs, _)| {
+            format!(
+                "Harness mix shifted between early and recent halves ({ag}: {es:.0}% -> {rs:.0}% of commands) — interpret aggregate drift alongside per-harness attribution."
+            )
+        })
+    } else {
+        None
+    };
     let early_errs = spans
         .iter()
         .filter(|s| s.started_at < midpoint_ms && s.exit_code.is_some_and(|c| c != 0))
@@ -1531,15 +2262,14 @@ pub fn analyze_cross_session_patterns(
     let mut doc_reads_by_sess: HashMap<String, Vec<(i64, i64, String)>> = HashMap::new();
     {
         let mut fr_stmt = conn.prepare(
-            "SELECT session_id, turn_idx, started_at, target_name
+            "SELECT session_id, turn_idx, started_at, COALESCE(target_path, target_name)
              FROM file_reads
              WHERE repo_id = ?1
                AND started_at >= ?2 AND started_at < ?3
                AND is_doc = 1
                AND session_id IN (
                    SELECT session_id FROM sessions
-                   WHERE repo_id = ?1
-                     AND COALESCE(started_at, ended_at, 0) >= ?2
+                   WHERE COALESCE(started_at, ended_at, 0) >= ?2
                      AND COALESCE(started_at, ended_at, 0) < ?3
                )",
         )?;
@@ -1741,6 +2471,7 @@ pub fn analyze_cross_session_patterns(
         repo_name,
         window: range.label.clone(),
         branch_behind_notice: repo_ctx.branch_behind_notice,
+        harness_mix_shift_notice,
         sessions_analyzed: sessions.len(),
         main_sessions: main_n,
         subagent_sessions,
@@ -1749,12 +2480,19 @@ pub fn analyze_cross_session_patterns(
         recent_cmds,
         early_error_rate,
         recent_error_rate,
+        latency,
+        context_health,
+        outcomes,
         pareto,
         handoff_summary,
+        subagent_rollup,
         harness_comparison,
+        model_breakdown,
         universal_friction_cmds,
         recurring_motifs,
         repeating_sequences,
+        tool_trajectories,
+        file_edit_churn,
         temporal_drift,
         cold_start_errors,
         context_bloat_drivers,
@@ -1763,6 +2501,241 @@ pub fn analyze_cross_session_patterns(
         top_mcp_errors,
         underused_surfaces,
     })
+}
+
+fn normalize_tool_step(tc: &TCall) -> String {
+    let lower = tc.tool_name.to_ascii_lowercase();
+    if tc.is_edit {
+        let ext = tc
+            .target_path
+            .as_deref()
+            .and_then(|p| p.rsplit('.').next())
+            .filter(|e| !e.contains('/') && e.len() <= 6)
+            .unwrap_or("file");
+        return format!("edit:*.{ext}");
+    }
+    if matches!(lower.as_str(), "read" | "read_file" | "view_file") {
+        let ext = tc
+            .target_path
+            .as_deref()
+            .and_then(|p| p.rsplit('.').next())
+            .filter(|e| !e.contains('/') && e.len() <= 6)
+            .unwrap_or("file");
+        return format!("read:*.{ext}");
+    }
+    if tc.is_mcp {
+        return tc.tool_name.clone();
+    }
+    format!("tool:{}", tc.tool_name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mine_unified_trajectories(
+    spans_by_session: &HashMap<&str, Vec<&Span>>,
+    tcalls: &[TCall],
+    sess_turns: &HashMap<&str, i64>,
+    total_sessions: usize,
+    min_len: usize,
+    max_len: usize,
+    min_sessions: usize,
+    limit: usize,
+) -> Vec<RepeatingSequence> {
+    struct UnifiedEvent {
+        turn_idx: i64,
+        seq_idx: i64,
+        started_at: i64,
+        agent_kind: String,
+        label: String,
+        preview: String,
+        tokens: i64,
+        duration_ms: i64,
+        is_non_shell: bool,
+    }
+
+    let mut events_by_sess: HashMap<&str, Vec<UnifiedEvent>> = HashMap::new();
+    for (sid, list) in spans_by_session {
+        for sp in list {
+            if is_generic_read_or_script(&sp.cmd_template, &sp.category) {
+                continue;
+            }
+            events_by_sess.entry(*sid).or_default().push(UnifiedEvent {
+                turn_idx: sp.turn_idx,
+                seq_idx: sp.seq_idx,
+                started_at: sp.started_at,
+                agent_kind: sp.agent_kind.clone(),
+                label: sp.cmd_template.clone(),
+                preview: trunc(&sp.raw_redacted, 40),
+                tokens: sp.stdout_tokens,
+                duration_ms: sp.duration_ms.unwrap_or(0),
+                is_non_shell: false,
+            });
+        }
+    }
+    for tc in tcalls {
+        if tc.session_id == "orphan" {
+            continue;
+        }
+        let label = normalize_tool_step(tc);
+        let preview = match tc.target_path.as_deref() {
+            Some(p) => format!("{} {}", tc.tool_name, trunc(p, 28)),
+            None => tc.tool_name.clone(),
+        };
+        events_by_sess
+            .entry(tc.session_id.as_str())
+            .or_default()
+            .push(UnifiedEvent {
+                turn_idx: tc.turn_idx,
+                seq_idx: tc.seq_idx,
+                started_at: tc.started_at,
+                agent_kind: tc.agent_kind.clone(),
+                label,
+                preview,
+                tokens: tc.output_tokens,
+                duration_ms: tc.duration_ms.unwrap_or(0),
+                is_non_shell: true,
+            });
+    }
+
+    struct TrajAcc {
+        steps: Vec<String>,
+        sessions: HashSet<String>,
+        agents: HashSet<String>,
+        by_harness: BTreeMap<String, usize>,
+        occurrences: usize,
+        tokens: i64,
+        eff_tokens: i64,
+        wait_ms: i64,
+        sample: String,
+    }
+    let mut acc_map: HashMap<Vec<String>, TrajAcc> = HashMap::new();
+
+    for (sid, mut list) in events_by_sess {
+        list.sort_by_key(|e| (e.turn_idx, e.seq_idx, e.started_at));
+        if list.len() < min_len {
+            continue;
+        }
+        let total_t = sess_turns.get(sid).copied().unwrap_or(1);
+        for len in min_len..=max_len {
+            if list.len() < len {
+                break;
+            }
+            let mut last_end: HashMap<Vec<String>, usize> = HashMap::new();
+            for start in 0..=(list.len() - len) {
+                let slice = &list[start..start + len];
+                if !slice.iter().any(|e| e.is_non_shell) {
+                    continue; // pure shell sequences are already in repeating_sequences
+                }
+                if !slice.windows(2).all(|w| w[1].turn_idx - w[0].turn_idx <= 3) {
+                    continue;
+                }
+                let steps: Vec<String> = slice.iter().map(|e| e.label.clone()).collect();
+                if let Some(&prev) = last_end.get(&steps)
+                    && start < prev
+                {
+                    continue;
+                }
+                last_end.insert(steps.clone(), start + len);
+                let toks: i64 = slice.iter().map(|e| e.tokens).sum();
+                let etoks: i64 = slice
+                    .iter()
+                    .map(|e| effective_context_tokens(e.tokens, e.turn_idx, total_t))
+                    .sum();
+                let wms: i64 = slice.iter().map(|e| e.duration_ms).sum();
+                let entry = acc_map.entry(steps.clone()).or_insert_with(|| {
+                    let prevs: Vec<String> = slice
+                        .iter()
+                        .take(4)
+                        .map(|e| format!("t{}:`{}`", e.turn_idx, e.preview))
+                        .collect();
+                    TrajAcc {
+                        steps,
+                        sessions: HashSet::new(),
+                        agents: HashSet::new(),
+                        by_harness: BTreeMap::new(),
+                        occurrences: 0,
+                        tokens: 0,
+                        eff_tokens: 0,
+                        wait_ms: 0,
+                        sample: prevs.join(" -> "),
+                    }
+                });
+                entry.sessions.insert(sid.to_string());
+                for e in slice {
+                    entry.agents.insert(e.agent_kind.clone());
+                }
+                if let Some(first) = slice.first() {
+                    *entry
+                        .by_harness
+                        .entry(first.agent_kind.clone())
+                        .or_insert(0) += 1;
+                }
+                entry.occurrences += 1;
+                entry.tokens += toks;
+                entry.eff_tokens += etoks;
+                entry.wait_ms += wms;
+            }
+        }
+    }
+
+    let mut cands: Vec<RepeatingSequence> = acc_map
+        .into_values()
+        .filter(|a| {
+            let distinct: HashSet<&str> = a.steps.iter().map(String::as_str).collect();
+            a.sessions.len() >= min_sessions && a.occurrences >= 2 && distinct.len() >= 2
+        })
+        .map(|a| {
+            let mut ags: Vec<String> = a.agents.into_iter().collect();
+            ags.sort();
+            let step_count = a.steps.len();
+            let seq_str = format_collapsed_steps(&a.steps);
+            let hs = format_harness_breakdown(&a.by_harness);
+            RepeatingSequence {
+                step_count,
+                sequence: seq_str,
+                steps: a.steps,
+                sessions: a.sessions.len(),
+                total_sessions,
+                session_prevalence: r3(a.sessions.len() as f64 / total_sessions.max(1) as f64),
+                occurrences: a.occurrences,
+                total_calls: a.occurrences * step_count,
+                total_stdout_tokens: a.tokens,
+                total_effective_tokens: a.eff_tokens,
+                total_wait_s: r1(a.wait_ms as f64 / 1000.0),
+                agents: ags,
+                by_harness: a.by_harness,
+                harness_summary: hs,
+                sample_trace: a.sample,
+            }
+        })
+        .collect();
+
+    cands.sort_by(|a, b| {
+        b.step_count
+            .cmp(&a.step_count)
+            .then_with(|| b.sessions.cmp(&a.sessions))
+            .then_with(|| b.occurrences.cmp(&a.occurrences))
+    });
+    let mut kept: Vec<RepeatingSequence> = Vec::new();
+    for cand in cands {
+        let absorbed = kept.iter().any(|existing| {
+            (existing.step_count > cand.step_count
+                && existing.sessions * 4 >= cand.sessions * 3
+                && is_subslice(&cand.steps, &existing.steps))
+                || (existing.sessions * 4 >= cand.sessions * 3
+                    && shifted_overlap_ratio(&cand.steps, &existing.steps) >= 0.65)
+        });
+        if !absorbed {
+            kept.push(cand);
+        }
+    }
+    kept.sort_by(|a, b| {
+        b.sessions
+            .cmp(&a.sessions)
+            .then_with(|| b.occurrences.cmp(&a.occurrences))
+            .then_with(|| b.step_count.cmp(&a.step_count))
+    });
+    kept.truncate(limit);
+    kept
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1830,10 +2803,7 @@ fn mine_sequences_from_spans(
                 let stoks: i64 = slice.iter().map(|s| s.stdout_tokens).sum();
                 let etoks: i64 = slice
                     .iter()
-                    .map(|s| {
-                        let rem = (total_t - s.turn_idx + 1).clamp(1, 25);
-                        s.stdout_tokens.saturating_mul(rem)
-                    })
+                    .map(|s| effective_context_tokens(s.stdout_tokens, s.turn_idx, total_t))
                     .sum();
                 let wms: i64 = slice.iter().filter_map(|s| s.duration_ms).sum();
 
@@ -2057,7 +3027,7 @@ pub fn query_sequences(
         .collect();
 
     let mut sp_stmt = conn.prepare(
-        "SELECT COALESCE(session_id, 'orphan'), COALESCE(agent_kind, 'unknown'), turn_idx, workspace_id,
+        "SELECT COALESCE(session_id, 'orphan'), COALESCE(agent_kind, 'unknown'), turn_idx, seq_idx, workspace_id,
                 category, is_repo_cli, cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
                 stdout_bytes, stdout_tokens, stderr_preview, is_truncated, started_at
          FROM command_spans
@@ -2065,8 +3035,7 @@ pub fn query_sequences(
            AND started_at >= ?2 AND started_at < ?3
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))
          ORDER BY session_id ASC, turn_idx ASC, seq_idx ASC, started_at ASC",
@@ -2077,19 +3046,20 @@ pub fn query_sequences(
                 session_id: r.get(0)?,
                 agent_kind: r.get(1)?,
                 turn_idx: r.get(2)?,
-                workspace_id: r.get(3)?,
-                category: r.get(4)?,
-                is_repo_cli: r.get::<_, i64>(5)? != 0,
-                cmd_bin: r.get(6)?,
-                cmd_template: r.get(7)?,
-                raw_redacted: r.get(8)?,
-                exit_code: r.get(9)?,
-                duration_ms: r.get(10)?,
-                stdout_bytes: r.get(11)?,
-                stdout_tokens: r.get(12)?,
-                stderr_preview: r.get(13)?,
-                is_truncated: r.get::<_, i64>(14)? != 0,
-                started_at: r.get(15)?,
+                seq_idx: r.get(3)?,
+                workspace_id: r.get(4)?,
+                category: r.get(5)?,
+                is_repo_cli: r.get::<_, i64>(6)? != 0,
+                cmd_bin: r.get(7)?,
+                cmd_template: r.get(8)?,
+                raw_redacted: r.get(9)?,
+                exit_code: r.get(10)?,
+                duration_ms: r.get(11)?,
+                stdout_bytes: r.get(12)?,
+                stdout_tokens: r.get(13)?,
+                stderr_preview: r.get(14)?,
+                is_truncated: r.get::<_, i64>(15)? != 0,
+                started_at: r.get(16)?,
             })
         })?
         .flatten()
@@ -2097,10 +3067,12 @@ pub fn query_sequences(
 
     let mut spans_by_session: HashMap<&str, Vec<&Span>> = HashMap::new();
     for sp in &spans {
-        spans_by_session
-            .entry(sp.session_id.as_str())
-            .or_default()
-            .push(sp);
+        if sp.session_id != "orphan" {
+            spans_by_session
+                .entry(sp.session_id.as_str())
+                .or_default()
+                .push(sp);
+        }
     }
 
     Ok(mine_sequences_from_spans(
@@ -2181,8 +3153,7 @@ pub fn query_tools(
            AND is_mcp = 1
            AND session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            )"
     } else {
@@ -2193,8 +3164,7 @@ pub fn query_tools(
            AND started_at >= ?2 AND started_at < ?3
            AND session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            )"
     };
@@ -2206,6 +3176,7 @@ pub fn query_tools(
         errs: usize,
         truncs: usize,
         bytes: i64,
+        durs: Vec<i64>,
         wait_ms: i64,
         agents: HashSet<String>,
         by_harness: BTreeMap<String, usize>,
@@ -2234,6 +3205,7 @@ pub fn query_tools(
             errs: 0,
             truncs: 0,
             bytes: 0,
+            durs: Vec::new(),
             wait_ms: 0,
             agents: HashSet::new(),
             by_harness: BTreeMap::new(),
@@ -2256,7 +3228,12 @@ pub fn query_tools(
             a.truncs += 1;
         }
         a.bytes += bytes;
-        a.wait_ms += dur.unwrap_or(0);
+        if let Some(d) = dur
+            && d >= 0
+        {
+            a.durs.push(d);
+            a.wait_ms += d;
+        }
         *a.by_harness.entry(ag.clone()).or_insert(0) += 1;
         a.agents.insert(ag);
     }
@@ -2277,6 +3254,16 @@ pub fn query_tools(
                 truncated_count: a.truncs,
                 truncated_rate: r3(a.truncs as f64 / a.calls.max(1) as f64),
                 avg_output_kb: r1((a.bytes as f64 / 1024.0) / a.calls.max(1) as f64),
+                p50_wait_s: if !a.durs.is_empty() {
+                    Some(r1(percentile_i64(&a.durs, 50.0) as f64 / 1000.0))
+                } else {
+                    None
+                },
+                p95_wait_s: if a.durs.len() >= 5 {
+                    Some(r1(percentile_i64(&a.durs, 95.0) as f64 / 1000.0))
+                } else {
+                    None
+                },
                 total_wait_s: r1(a.wait_ms as f64 / 1000.0),
                 agents: ags,
                 by_harness: a.by_harness,
@@ -2316,12 +3303,17 @@ pub fn format_tools_report(
             rows.len()
         ),
         String::new(),
-        "| Tool Name | MCP | Calls | Sess | Errs | Err% | Trunc | Avg KB | Wait | Harnesses | Sample Error |".to_string(),
-        "| :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |".to_string(),
+        "| Tool Name | MCP | Calls | Sess | Errs | Err% | Trunc | Avg KB | p50/p95 Wait | Total Wait | Harnesses | Sample Error |".to_string(),
+        "| :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | :--- | :--- |".to_string(),
     ];
     for t in rows {
+        let p_wait = match (t.p50_wait_s, t.p95_wait_s) {
+            (Some(p50), Some(p95)) => format!("{p50:.1}s/{p95:.1}s"),
+            (Some(p50), None) => format!("{p50:.1}s/-"),
+            _ => "-".to_string(),
+        };
         lines.push(format!(
-            "| `{}` | {} | {} | {} | {} | {:.1}% | {} | {:.1} | {:.1}s | {} | `{}` |",
+            "| `{}` | {} | {} | {} | {} | {:.1}% | {} | {:.1} | {} | {:.1}s | {} | `{}` |",
             t.tool_name,
             if t.is_mcp { "yes" } else { "-" },
             t.calls,
@@ -2330,6 +3322,7 @@ pub fn format_tools_report(
             t.error_rate * 100.0,
             t.truncated_count,
             t.avg_output_kb,
+            p_wait,
             t.total_wait_s,
             t.harness_summary,
             t.sample_error
@@ -2351,33 +3344,15 @@ pub fn query_top_sessions(
     let since_ms = range.since_ms;
     let until_ms = range.upper_bound();
 
-    let mut s_stmt = conn.prepare(
-        "SELECT session_id, agent_kind, COALESCE(originator, 'default'),
-                COALESCE(subagent_kind, CASE WHEN is_subagent != 0 THEN 'subagent' ELSE 'main' END),
-                is_subagent, is_handoff, COALESCE(started_at, ended_at, 0),
-                turn_count, input_tokens, output_tokens, cached_tokens, total_tool_ms
+    let mut s_stmt = conn.prepare(&format!(
+        "SELECT {SESS_SELECT_COLS}
          FROM sessions
          WHERE repo_id = ?1
            AND COALESCE(started_at, ended_at, 0) >= ?2
-           AND COALESCE(started_at, ended_at, 0) < ?3",
-    )?;
+           AND COALESCE(started_at, ended_at, 0) < ?3"
+    ))?;
     let sessions: Vec<Sess> = s_stmt
-        .query_map(params![repo_id, since_ms, until_ms], |r| {
-            Ok(Sess {
-                session_id: r.get(0)?,
-                agent_kind: r.get(1)?,
-                originator: r.get(2)?,
-                role: r.get(3)?,
-                is_subagent: r.get::<_, i64>(4)? != 0,
-                is_handoff: r.get::<_, i64>(5)? != 0,
-                started_at: r.get(6)?,
-                turn_count: r.get(7)?,
-                input_tokens: r.get(8)?,
-                output_tokens: r.get(9)?,
-                cached_tokens: r.get(10)?,
-                total_tool_ms: r.get(11)?,
-            })
-        })?
+        .query_map(params![repo_id, since_ms, until_ms], map_sess_row)?
         .flatten()
         .collect();
 
@@ -2442,6 +3417,7 @@ pub fn query_top_sessions(
                 session_id: String::new(),
                 agent_kind: String::new(),
                 turn_idx: 0,
+                seq_idx: 0,
                 workspace_id: None,
                 category: cat,
                 is_repo_cli: is_cli,
@@ -2483,9 +3459,15 @@ pub fn query_top_sessions(
                 }
                 None => (0, tcalls_err, 0.0, Vec::new()),
             };
+            let tw_ms = if s.tool_wall_ms > 0 {
+                s.tool_wall_ms
+            } else {
+                s.total_tool_ms
+            };
             SessionOverview {
                 session_id: s.session_id.clone(),
                 agent_kind: s.agent_kind.clone(),
+                model: s.model.clone(),
                 originator: s.originator.clone(),
                 role: s.role.clone(),
                 is_handoff: s.is_handoff,
@@ -2496,10 +3478,16 @@ pub fn query_top_sessions(
                 command_count: cmds,
                 tool_call_count: tcalls_n,
                 total_tokens: s.total_tokens(),
-                uncached_tokens: s.input_tokens,
+                uncached_tokens: s.input_tokens + s.cache_write_tokens,
                 cache_hit_rate: s.cache_hit_rate().map(r3),
+                est_cost_usd: (s.effective_cost_usd() * 100.0).round() / 100.0,
                 stdout_kb: kb,
                 total_wait_s: r1(s.total_tool_ms as f64 / 1000.0),
+                tool_wall_s: r1(tw_ms as f64 / 1000.0),
+                api_wait_s: r1(s.api_duration_ms as f64 / 1000.0),
+                outcome: s.outcome.clone(),
+                peak_context_pct: s.peak_context_pct().map(r1),
+                compaction_count: s.compaction_count,
                 error_count: errs,
                 top_families: top_fams,
             }
@@ -2528,27 +3516,31 @@ pub fn format_sessions_report(
     let mut lines = vec![
         format!("# Top Sessions in `{repo_name}` (sorted by `{sort_by}`, showing {})", rows.len()),
         String::new(),
-        "| Harness | Originator | Role | Handoff | Started | Turns | Cmds | Tools | Model Toks | Uncached | Cache Hit | Stdout KB | Wait | Errs | Top Command Families |".to_string(),
-        "| :--- | :--- | :--- | :---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |".to_string(),
+        "| Harness | Model | Role | Started | Turns | Cmds | Tools | Model Toks | Cache Hit | Est $ | API/Tool Wall | Ctx% | Outcome | Errs | Top Families |".to_string(),
+        "| :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | :--- | ---: | :--- |".to_string(),
     ];
     for s in rows {
         lines.push(format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {:.0}s | {} | {} |",
+            "| `{}` | {} | {}{} | {} | {} | {} | {} | {} | {} | ${:.2} | {:.0}s/{:.0}s | {} | {} | {} | {} |",
             s.agent_kind,
-            s.originator,
+            s.model.as_deref().map(|m| trunc(m, 18)).unwrap_or_else(|| "-".into()),
             s.role,
-            if s.is_handoff { "yes" } else { "-" },
+            if s.is_handoff { " (H)" } else { "" },
             &s.started_at[..s.started_at.len().min(16)],
             s.turn_count,
             s.command_count,
             s.tool_call_count,
             format_compact(s.total_tokens),
-            format_compact(s.uncached_tokens),
             s.cache_hit_rate
                 .map(|v| format!("{:.1}%", v * 100.0))
                 .unwrap_or_else(|| "n/a".into()),
-            s.stdout_kb,
-            s.total_wait_s,
+            s.est_cost_usd,
+            s.api_wait_s,
+            s.tool_wall_s,
+            s.peak_context_pct
+                .map(|p| format!("{p:.0}%"))
+                .unwrap_or_else(|| "-".into()),
+            s.outcome.as_deref().unwrap_or("-"),
             s.error_count,
             s.top_families.join(", ")
         ));
@@ -2598,6 +3590,50 @@ pub fn format_patterns_report(rep: &CrossSessionPatternsReport, format: &str) ->
             p.bottom50_avg_stdout_kb
         ),
     ];
+    let lat = &rep.latency;
+    let ctx = &rep.context_health;
+    let out = &rep.outcomes;
+    lines.push(format!(
+        "- **Latency breakdown:** session wall **{}** total (p50 {}) | API wait **{}** ({} sess w/ timing{}) | thinking **{}** | retries **{}** | tool wall **{}** vs **{}** serial ({:.1}x parallelism)",
+        format_duration_human(lat.total_session_wall_s),
+        format_duration_human(lat.median_session_wall_s),
+        format_duration_human(lat.total_api_wait_s),
+        lat.sessions_with_api_timing,
+        lat.avg_ttft_ms
+            .map(|t| format!(", avg TTFT {t}ms"))
+            .unwrap_or_default(),
+        format_duration_human(lat.total_thinking_s),
+        format_duration_human(lat.total_api_retry_s),
+        format_duration_human(lat.total_tool_wall_s),
+        format_duration_human(lat.total_tool_serial_s),
+        lat.tool_parallelism_ratio
+    ));
+    lines.push(format!(
+        "- **Context & outcomes:** compactions **{}** ({} sess) | peak context {} ({} sess >=80%) | aborts **{}** ({:.1}%, {} interrupted turns) | API errors **{}** | diff **+{} / -{}** lines",
+        ctx.total_compactions,
+        ctx.compacted_sessions,
+        ctx.avg_peak_context_pct
+            .map(|v| format!("avg {v:.0}%"))
+            .unwrap_or_else(|| "n/a".into()),
+        ctx.sessions_over_80_pct,
+        out.aborted_sessions,
+        out.abort_rate * 100.0,
+        out.total_aborted_turns,
+        out.total_api_errors,
+        out.total_lines_added,
+        out.total_lines_removed
+    ));
+    if let Some(sub) = &rep.subagent_rollup {
+        lines.push(format!(
+            "- **Subagent rollup:** {} linked (across {} parent sess, max {}x fanout) + {} unlinked | {} total tokens (~${:.2} est.)",
+            sub.linked_subagents,
+            sub.parent_sessions_with_children,
+            sub.max_fanout,
+            sub.unlinked_subagents,
+            format_compact(sub.subagent_total_tokens),
+            sub.subagent_est_cost_usd
+        ));
+    }
     if let Some(h) = &rep.handoff_summary {
         lines.push(format!(
             "- **Context-handoff vs fresh main sessions:** {} handoff sessions avg **{}** model tokens ({:.1} turns) vs {} fresh sessions avg **{}** ({:.1} turns) — **{:.1}x token multiplier**",
@@ -2609,6 +3645,9 @@ pub fn format_patterns_report(rep: &CrossSessionPatternsReport, format: &str) ->
             h.fresh_avg_turns,
             h.token_multiplier
         ));
+    }
+    if let Some(notice) = &rep.harness_mix_shift_notice {
+        lines.push(format!("- **Harness Mix Shift:** {notice}"));
     }
     if let Some(notice) = &rep.branch_behind_notice {
         lines.push(format!("- **Repo Ref Notice:** {notice}"));
@@ -2626,15 +3665,15 @@ pub fn format_patterns_report(rep: &CrossSessionPatternsReport, format: &str) ->
         "## 1. Cross-Harness Asymmetry (Stratified by Harness × Originator × Role)".to_string(),
     );
     lines.push(String::new());
-    lines.push("| Harness | Originator | Role | Sess | Cmds | Tools | Med Model Toks | Avg Uncached | Cache (Wtd/Med/P25) | Avg Out KB | Trunc (Sess%) | Med Wait | Err% | Rebound% |".to_string());
-    lines.push("| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | ---: | ---: | ---: | ---: |".to_string());
+    lines.push("| Harness | Originator | Role | Sess | Cmds | Tools | Med Toks | Est $ | Cache (Wtd/Med/P25) | Tool Wall | Avg API | Ctx% | Abort% | Err% | Rebound% |".to_string());
+    lines.push("| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | :---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string());
     for h in &rep.harness_comparison {
         let fmt_c = |o: Option<f64>| {
             o.map(|v| format!("{:.1}%", v * 100.0))
                 .unwrap_or_else(|| "n/a".into())
         };
         lines.push(format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {}/{}/{} | {:.1} | {} ({:.0}%) | {:.1}s | {:.1}% | {:.1}% |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | ${:.2} | {}/{}/{} | {:.1}s | {} | {} | {:.1}% | {:.1}% | {:.1}% |",
             h.agent_kind,
             h.originator,
             h.role,
@@ -2642,17 +3681,55 @@ pub fn format_patterns_report(rep: &CrossSessionPatternsReport, format: &str) ->
             h.commands,
             h.tool_calls,
             format_compact(h.median_total_tokens),
-            format_compact(h.avg_uncached_tokens),
+            h.est_cost_usd,
             fmt_c(h.weighted_cache_hit),
             fmt_c(h.median_cache_hit),
             fmt_c(h.p25_cache_hit),
-            h.avg_output_kb,
-            h.truncated_outputs,
-            h.truncated_sessions_pct,
-            h.median_tool_wait_s,
+            h.median_tool_wall_s,
+            h.avg_api_wait_s
+                .map(|v| format!("{v:.1}s"))
+                .unwrap_or_else(|| "-".into()),
+            h.avg_peak_context_pct
+                .map(|v| format!("{v:.0}%"))
+                .unwrap_or_else(|| "-".into()),
+            h.abort_rate * 100.0,
             h.error_rate * 100.0,
             h.rebound_rate * 100.0,
         ));
+    }
+
+    if !rep.model_breakdown.is_empty() {
+        lines.push(String::new());
+        lines.push("## 1b. Per-Model Usage, Latency & Estimated Cost".to_string());
+        lines.push(String::new());
+        lines.push("| Model | Harness | Sess | Calls | Total Toks | Cache Write | Thinking | Cache Hit | Est $ | Avg API | Avg TTFT | API Errs |".to_string());
+        lines.push(
+            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+                .to_string(),
+        );
+        for m in &rep.model_breakdown {
+            lines.push(format!(
+                "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | ${:.2} | {} | {} | {} |",
+                m.model,
+                m.agent_kind,
+                m.sessions,
+                m.llm_calls,
+                format_compact(m.total_tokens),
+                format_compact(m.cache_write_tokens),
+                format_compact(m.thinking_tokens),
+                m.cache_hit_rate
+                    .map(|v| format!("{:.1}%", v * 100.0))
+                    .unwrap_or_else(|| "n/a".into()),
+                m.est_cost_usd,
+                m.avg_api_wait_s
+                    .map(|v| format!("{v:.1}s"))
+                    .unwrap_or_else(|| "-".into()),
+                m.avg_ttft_ms
+                    .map(|v| format!("{v}ms"))
+                    .unwrap_or_else(|| "-".into()),
+                m.api_errors
+            ));
+        }
     }
 
     if !p.storm_lifts.is_empty() {
@@ -2776,6 +3853,54 @@ pub fn format_patterns_report(rep: &CrossSessionPatternsReport, format: &str) ->
                 s.total_wait_s,
                 s.harness_summary,
                 s.sequence.replace('|', "/")
+            ));
+        }
+    }
+
+    if !rep.tool_trajectories.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "## 5c. Unified Tool Trajectories (Shell + Read/Edit/MCP Interleaved)".to_string(),
+        );
+        lines.push(String::new());
+        lines
+            .push("| Steps | Sessions | Runs | Toks | Wait | Harnesses | Trajectory |".to_string());
+        lines.push("| ---: | ---: | ---: | ---: | ---: | :--- | :--- |".to_string());
+        for s in &rep.tool_trajectories {
+            lines.push(format!(
+                "| {} | {}/{} ({:.0}%) | {} | {} | {:.1}s | {} | `{}` |",
+                s.step_count,
+                s.sessions,
+                s.total_sessions,
+                s.session_prevalence * 100.0,
+                s.occurrences,
+                format_compact(s.total_stdout_tokens),
+                s.total_wait_s,
+                s.harness_summary,
+                s.sequence.replace('|', "/")
+            ));
+        }
+    }
+
+    if !rep.file_edit_churn.is_empty() {
+        lines.push(String::new());
+        lines.push("## 5d. File Edit Churn & Edit->Fail->Edit Rework Hotspots".to_string());
+        lines.push(String::new());
+        lines.push(
+            "| File Path | Edits | Sess | Max/Sess | Rework Cycles | Edit Errs | Harnesses |"
+                .to_string(),
+        );
+        lines.push("| :--- | ---: | ---: | ---: | ---: | ---: | :--- |".to_string());
+        for f in &rep.file_edit_churn {
+            lines.push(format!(
+                "| `{}` | {} | {} | {} | {} | {} | {} |",
+                f.target_path,
+                f.edits,
+                f.sessions,
+                f.max_edits_in_session,
+                f.rework_cycles,
+                f.edit_errors,
+                f.harness_summary
             ));
         }
     }

@@ -1,4 +1,4 @@
-use crate::config::{TimeRange, parse_window_ms};
+use crate::config::{TimeRange, default_context_window, estimate_cost_usd, parse_window_ms};
 use crate::repo_context::RepoContext;
 use crate::shell::clean_error_preview;
 use crate::workspace::{WorkspaceResolver, is_ephemeral_or_neutral_path};
@@ -55,6 +55,46 @@ pub struct FleetReport {
     pub systemic_patterns: Vec<SystemicPattern>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LatencyBreakdown {
+    pub total_session_wall_s: f64,
+    pub median_session_wall_s: f64,
+    pub total_api_wait_s: f64,
+    pub median_api_wait_s: f64,
+    pub total_api_retry_s: f64,
+    pub total_thinking_s: f64,
+    pub total_tool_serial_s: f64,
+    pub total_tool_wall_s: f64,
+    pub tool_parallelism_ratio: f64,
+    pub avg_ttft_ms: Option<i64>,
+    pub other_idle_s: f64,
+    pub sessions_with_api_timing: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContextHealthSummary {
+    pub sessions_with_context_data: usize,
+    pub avg_peak_context_pct: Option<f64>,
+    pub p95_peak_context_pct: Option<f64>,
+    pub sessions_over_80_pct: usize,
+    pub total_compactions: i64,
+    pub compacted_sessions: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OutcomeSummary {
+    pub completed_sessions: usize,
+    pub aborted_sessions: usize,
+    pub error_sessions: usize,
+    pub unknown_sessions: usize,
+    pub abort_rate: f64,
+    pub total_aborted_turns: i64,
+    pub total_api_errors: i64,
+    pub aborted_session_tokens: i64,
+    pub total_lines_added: i64,
+    pub total_lines_removed: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoKpis {
     pub sessions_analyzed: usize,
@@ -63,6 +103,9 @@ pub struct RepoKpis {
     pub total_commands: usize,
     pub total_stdout_tokens: i64,
     pub total_effective_tokens: i64,
+    pub total_model_tokens: i64,
+    pub total_cache_write_tokens: i64,
+    pub total_thinking_tokens: i64,
     pub median_tokens_per_session: i64,
     pub p95_tokens_per_session: i64,
     pub cache_hit_rate: Option<f64>,
@@ -73,7 +116,11 @@ pub struct RepoKpis {
     pub escape_hatch_rebound_rate: f64,
     pub orientation_tokens: i64,
     pub total_cost_usd: Option<f64>,
+    pub estimated_cost_usd: f64,
     pub cost_sessions: usize,
+    pub latency: LatencyBreakdown,
+    pub context_health: ContextHealthSummary,
+    pub outcomes: OutcomeSummary,
     pub detected_config: Vec<String>,
 }
 
@@ -108,6 +155,8 @@ pub struct CommandStat {
     pub total_stdout_tokens: i64,
     pub effective_tokens: i64,
     pub p50_wait_s: f64,
+    pub p95_wait_s: Option<f64>,
+    pub p99_wait_s: Option<f64>,
     pub total_wait_s: f64,
     pub dominant_noise: Option<String>,
     pub by_harness: BTreeMap<String, usize>,
@@ -238,6 +287,25 @@ pub struct DiffBucket {
     pub avg_stdout_tokens_per_cmd: i64,
     pub error_rate: f64,
     pub rebound_rate: f64,
+    pub estimated_cost_usd: f64,
+    pub cache_hit_rate: Option<f64>,
+    pub avg_api_wait_s: Option<f64>,
+    pub abort_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HarnessDiffDelta {
+    pub agent_kind: String,
+    pub before_sessions: usize,
+    pub after_sessions: usize,
+    pub before_commands: usize,
+    pub after_commands: usize,
+    pub before_median_tokens: i64,
+    pub after_median_tokens: i64,
+    pub before_avg_stdout_tokens: i64,
+    pub after_avg_stdout_tokens: i64,
+    pub before_error_rate: f64,
+    pub after_error_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -260,10 +328,12 @@ pub struct DiffReport {
     pub repo_id: String,
     pub repo_name: String,
     pub since: String,
+    pub matched_window: bool,
     pub verdict: String,
     pub before: DiffBucket,
     pub after: DiffBucket,
     pub deltas: DiffDeltas,
+    pub by_harness: Vec<HarnessDiffDelta>,
     pub guardrails: Vec<String>,
     pub command_deltas: Vec<CommandDelta>,
 }
@@ -272,19 +342,87 @@ pub struct DiffReport {
 struct SessionRow {
     session_id: String,
     agent_kind: String,
+    model: Option<String>,
     workspace_id: Option<String>,
     repo_id: String,
     repo_name: String,
     cwd: Option<String>,
     started_at: i64,
+    ended_at: i64,
     turn_count: i64,
     input_tokens: i64,
+    cache_write_tokens: i64,
     output_tokens: i64,
     cached_tokens: i64,
+    thinking_tokens: i64,
     cost_usd: Option<f64>,
     total_tool_ms: i64,
+    tool_wall_ms: i64,
+    api_duration_ms: i64,
+    api_retry_ms: i64,
+    thinking_duration_ms: i64,
+    ttft_ms_sum: i64,
+    ttft_count: i64,
+    compaction_count: i64,
+    aborted_turns: i64,
+    api_errors: i64,
+    outcome: Option<String>,
+    lines_added: i64,
+    lines_removed: i64,
+    max_context_tokens: i64,
+    context_window: Option<i64>,
     is_subagent: bool,
     is_handoff: bool,
+}
+
+impl SessionRow {
+    fn total_model_tokens(&self) -> i64 {
+        self.input_tokens
+            + self.cache_write_tokens
+            + self.cached_tokens
+            + self.output_tokens
+            + self.thinking_tokens
+    }
+
+    fn uncached_billable_tokens(&self) -> i64 {
+        self.input_tokens + self.cache_write_tokens + self.output_tokens + self.thinking_tokens
+    }
+
+    fn effective_cost_usd(&self) -> f64 {
+        if let Some(c) = self.cost_usd
+            && c > 0.0
+        {
+            return c;
+        }
+        estimate_cost_usd(
+            self.model.as_deref(),
+            &self.agent_kind,
+            self.input_tokens,
+            self.cached_tokens,
+            self.cache_write_tokens,
+            self.output_tokens,
+            self.thinking_tokens,
+        )
+    }
+
+    fn wall_ms(&self) -> i64 {
+        if self.ended_at > self.started_at && self.started_at > 0 {
+            (self.ended_at - self.started_at).min(86_400_000)
+        } else {
+            0
+        }
+    }
+
+    fn peak_context_pct(&self) -> Option<f64> {
+        if self.max_context_tokens <= 0 {
+            return None;
+        }
+        let win = self
+            .context_window
+            .filter(|&w| w > 0)
+            .or_else(|| default_context_window(self.model.as_deref(), &self.agent_kind))?;
+        Some(((self.max_context_tokens as f64 / win as f64) * 100.0).min(150.0))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +446,8 @@ struct SpanRow {
     is_orientation: bool,
     piped_filter: Option<String>,
     state_dir_hint: Option<String>,
+    is_chained: bool,
+    source_kind: String,
     started_at: i64,
 }
 
@@ -348,6 +488,282 @@ fn round1(v: f64) -> f64 {
 
 fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
+}
+
+/// Cache-weighted downstream context impact of a tool output:
+/// first turn is uncached (1.0x), subsequent turns in the session are cached (~0.1x).
+pub(crate) fn effective_context_tokens(stdout_tokens: i64, turn_idx: i64, total_turns: i64) -> i64 {
+    let rem = (total_turns - turn_idx + 1).clamp(1, 25);
+    let mult = 1.0 + 0.1 * (rem - 1) as f64;
+    ((stdout_tokens as f64) * mult).round() as i64
+}
+
+const SESSION_SELECT_COLS: &str = "session_id, agent_kind, model, workspace_id, repo_id, COALESCE(repo_name, repo_id),
+                cwd, COALESCE(started_at, ended_at, 0), COALESCE(ended_at, started_at, 0),
+                turn_count, input_tokens, cache_write_tokens, output_tokens, cached_tokens, thinking_tokens,
+                cost_usd, total_tool_ms, tool_wall_ms, api_duration_ms, api_retry_ms, thinking_duration_ms,
+                ttft_ms_sum, ttft_count, compaction_count, aborted_turns, api_errors, outcome,
+                lines_added, lines_removed, max_context_tokens, context_window, is_subagent, is_handoff";
+
+fn map_session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        session_id: r.get(0)?,
+        agent_kind: r.get(1)?,
+        model: r.get(2)?,
+        workspace_id: r.get(3)?,
+        repo_id: r.get(4)?,
+        repo_name: r.get(5)?,
+        cwd: r.get(6)?,
+        started_at: r.get(7)?,
+        ended_at: r.get(8)?,
+        turn_count: r.get(9)?,
+        input_tokens: r.get(10)?,
+        cache_write_tokens: r.get(11)?,
+        output_tokens: r.get(12)?,
+        cached_tokens: r.get(13)?,
+        thinking_tokens: r.get(14)?,
+        cost_usd: r.get(15)?,
+        total_tool_ms: r.get(16)?,
+        tool_wall_ms: r.get(17)?,
+        api_duration_ms: r.get(18)?,
+        api_retry_ms: r.get(19)?,
+        thinking_duration_ms: r.get(20)?,
+        ttft_ms_sum: r.get(21)?,
+        ttft_count: r.get(22)?,
+        compaction_count: r.get(23)?,
+        aborted_turns: r.get(24)?,
+        api_errors: r.get(25)?,
+        outcome: r.get(26)?,
+        lines_added: r.get(27)?,
+        lines_removed: r.get(28)?,
+        max_context_tokens: r.get(29)?,
+        context_window: r.get(30)?,
+        is_subagent: r.get::<_, i64>(31)? != 0,
+        is_handoff: r.get::<_, i64>(32)? != 0,
+    })
+}
+
+const SPAN_SELECT_COLS: &str = "session_id, agent_kind, turn_idx, workspace_id, repo_id, COALESCE(repo_name, repo_id),
+                category, is_repo_cli, cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
+                stdout_tokens, stderr_preview, noise_kind, is_orientation, piped_filter, state_dir_hint,
+                is_chained, source_kind, started_at";
+
+fn map_span_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SpanRow> {
+    Ok(SpanRow {
+        session_id: r.get(0)?,
+        agent_kind: r.get(1)?,
+        turn_idx: r.get(2)?,
+        workspace_id: r.get(3)?,
+        repo_id: r.get(4)?,
+        repo_name: r.get(5)?,
+        category: r.get(6)?,
+        is_repo_cli: r.get::<_, i64>(7)? != 0,
+        cmd_bin: r.get(8)?,
+        cmd_template: r.get(9)?,
+        raw_redacted: r.get(10)?,
+        exit_code: r.get(11)?,
+        duration_ms: r.get(12)?,
+        stdout_tokens: r.get(13)?,
+        stderr_preview: r.get(14)?,
+        noise_kind: r.get(15)?,
+        is_orientation: r.get::<_, i64>(16)? != 0,
+        piped_filter: r.get(17)?,
+        state_dir_hint: r.get(18)?,
+        is_chained: r.get::<_, i64>(19)? != 0,
+        source_kind: r.get(20)?,
+        started_at: r.get(21)?,
+    })
+}
+
+/// Deduplicate `wrap` spans that overlap a transcript span for the same session + binary within ±2s.
+fn dedup_wrap_spans(spans: Vec<SpanRow>) -> Vec<SpanRow> {
+    if !spans.iter().any(|s| s.source_kind == "wrap") {
+        return spans;
+    }
+    let transcript_keys: Vec<(Option<&str>, &str, i64)> = spans
+        .iter()
+        .filter(|s| s.source_kind != "wrap")
+        .map(|s| (s.session_id.as_deref(), s.cmd_bin.as_str(), s.started_at))
+        .collect();
+    if transcript_keys.is_empty() {
+        return spans;
+    }
+    let mut keep = Vec::with_capacity(spans.len());
+    for (idx, sp) in spans.iter().enumerate() {
+        if sp.source_kind == "wrap" {
+            let dup = transcript_keys.iter().any(|(sid, bin, ts)| {
+                *bin == sp.cmd_bin.as_str()
+                    && (sp.started_at - *ts).abs() <= 2_000
+                    && (sid.is_none()
+                        || sp.session_id.is_none()
+                        || *sid == sp.session_id.as_deref())
+            });
+            if dup {
+                continue;
+            }
+        }
+        keep.push(idx);
+    }
+    let keep_set: HashSet<usize> = keep.into_iter().collect();
+    spans
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, sp)| {
+            if keep_set.contains(&i) {
+                Some(sp)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn summarize_latency(sessions: &[SessionRow]) -> LatencyBreakdown {
+    let mut wall_s_vec = Vec::new();
+    let mut api_s_vec = Vec::new();
+    let mut total_wall_ms: i64 = 0;
+    let mut total_api_ms: i64 = 0;
+    let mut total_retry_ms: i64 = 0;
+    let mut total_think_ms: i64 = 0;
+    let mut total_tool_serial_ms: i64 = 0;
+    let mut total_tool_wall_ms: i64 = 0;
+    let mut ttft_sum: i64 = 0;
+    let mut ttft_cnt: i64 = 0;
+    let mut sessions_with_api = 0usize;
+
+    for s in sessions {
+        let w = s.wall_ms();
+        if w > 0 {
+            total_wall_ms += w;
+            wall_s_vec.push(w as f64 / 1000.0);
+        }
+        if s.api_duration_ms > 0 {
+            sessions_with_api += 1;
+            total_api_ms += s.api_duration_ms;
+            api_s_vec.push(s.api_duration_ms as f64 / 1000.0);
+        }
+        total_retry_ms += s.api_retry_ms.max(0);
+        total_think_ms += s.thinking_duration_ms.max(0);
+        total_tool_serial_ms += s.total_tool_ms.max(0);
+        let tw = if s.tool_wall_ms > 0 {
+            s.tool_wall_ms
+        } else {
+            s.total_tool_ms.max(0)
+        };
+        total_tool_wall_ms += tw;
+        ttft_sum += s.ttft_ms_sum.max(0);
+        ttft_cnt += s.ttft_count.max(0);
+    }
+
+    let other_idle_ms = (total_wall_ms - total_api_ms - total_tool_wall_ms).max(0);
+    let parallelism = if total_tool_wall_ms > 0 && total_tool_serial_ms > 0 {
+        round1((total_tool_serial_ms as f64 / total_tool_wall_ms as f64).max(1.0))
+    } else {
+        1.0
+    };
+
+    LatencyBreakdown {
+        total_session_wall_s: round1(total_wall_ms as f64 / 1000.0),
+        median_session_wall_s: round1(percentile_f64(&wall_s_vec, 50.0)),
+        total_api_wait_s: round1(total_api_ms as f64 / 1000.0),
+        median_api_wait_s: round1(percentile_f64(&api_s_vec, 50.0)),
+        total_api_retry_s: round1(total_retry_ms as f64 / 1000.0),
+        total_thinking_s: round1(total_think_ms as f64 / 1000.0),
+        total_tool_serial_s: round1(total_tool_serial_ms as f64 / 1000.0),
+        total_tool_wall_s: round1(total_tool_wall_ms as f64 / 1000.0),
+        tool_parallelism_ratio: parallelism,
+        avg_ttft_ms: if ttft_cnt > 0 {
+            Some(ttft_sum / ttft_cnt)
+        } else {
+            None
+        },
+        other_idle_s: round1(other_idle_ms as f64 / 1000.0),
+        sessions_with_api_timing: sessions_with_api,
+    }
+}
+
+fn summarize_context_health(sessions: &[SessionRow]) -> ContextHealthSummary {
+    let mut pcts = Vec::new();
+    let mut over_80 = 0usize;
+    let mut total_compactions = 0i64;
+    let mut compacted_sessions = 0usize;
+    for s in sessions {
+        if let Some(pct) = s.peak_context_pct() {
+            pcts.push(pct);
+            if pct >= 80.0 {
+                over_80 += 1;
+            }
+        }
+        if s.compaction_count > 0 {
+            total_compactions += s.compaction_count;
+            compacted_sessions += 1;
+        }
+    }
+    let avg_pct = if pcts.is_empty() {
+        None
+    } else {
+        Some(round1(pcts.iter().sum::<f64>() / pcts.len() as f64))
+    };
+    let p95_pct = if pcts.len() >= 3 {
+        Some(round1(percentile_f64(&pcts, 95.0)))
+    } else {
+        None
+    };
+    ContextHealthSummary {
+        sessions_with_context_data: pcts.len(),
+        avg_peak_context_pct: avg_pct,
+        p95_peak_context_pct: p95_pct,
+        sessions_over_80_pct: over_80,
+        total_compactions,
+        compacted_sessions,
+    }
+}
+
+fn summarize_outcomes(sessions: &[SessionRow]) -> OutcomeSummary {
+    let mut completed = 0usize;
+    let mut aborted = 0usize;
+    let mut errored = 0usize;
+    let mut unknown = 0usize;
+    let mut aborted_turns = 0i64;
+    let mut api_errors = 0i64;
+    let mut aborted_tokens = 0i64;
+    let mut lines_added = 0i64;
+    let mut lines_removed = 0i64;
+    for s in sessions {
+        aborted_turns += s.aborted_turns.max(0);
+        api_errors += s.api_errors.max(0);
+        lines_added += s.lines_added.max(0);
+        lines_removed += s.lines_removed.max(0);
+        if s.outcome.as_deref() == Some("aborted") || s.aborted_turns > 0 {
+            aborted += 1;
+            aborted_tokens += s.total_model_tokens();
+        } else {
+            match s.outcome.as_deref() {
+                Some("error") => {
+                    errored += 1;
+                }
+                Some("completed") => {
+                    completed += 1;
+                }
+                _ => {
+                    unknown += 1;
+                }
+            }
+        }
+    }
+    let denom = sessions.len().max(1) as f64;
+    OutcomeSummary {
+        completed_sessions: completed,
+        aborted_sessions: aborted,
+        error_sessions: errored,
+        unknown_sessions: unknown,
+        abort_rate: round3(aborted as f64 / denom),
+        total_aborted_turns: aborted_turns,
+        total_api_errors: api_errors,
+        aborted_session_tokens: aborted_tokens,
+        total_lines_added: lines_added,
+        total_lines_removed: lines_removed,
+    }
 }
 
 fn mode_str(values: &[String]) -> Option<String> {
@@ -618,42 +1034,20 @@ pub fn list_repos(
     let since_ms = range.since_ms;
     let until_ms = range.upper_bound();
 
-    let mut s_stmt = conn.prepare(
-        "SELECT session_id, agent_kind, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                cwd, COALESCE(started_at, ended_at, 0), turn_count, input_tokens, output_tokens,
-                cached_tokens, cost_usd, total_tool_ms, is_subagent, is_handoff
+    let mut s_stmt = conn.prepare(&format!(
+        "SELECT {SESSION_SELECT_COLS}
          FROM sessions
          WHERE repo_id IS NOT NULL
            AND COALESCE(started_at, ended_at, 0) >= ?1
-           AND COALESCE(started_at, ended_at, 0) < ?2",
-    )?;
+           AND COALESCE(started_at, ended_at, 0) < ?2"
+    ))?;
     let sessions: Vec<SessionRow> = s_stmt
-        .query_map(params![since_ms, until_ms], |r| {
-            Ok(SessionRow {
-                session_id: r.get(0)?,
-                agent_kind: r.get(1)?,
-                workspace_id: r.get(2)?,
-                repo_id: r.get(3)?,
-                repo_name: r.get(4)?,
-                cwd: r.get(5)?,
-                started_at: r.get(6)?,
-                turn_count: r.get(7)?,
-                input_tokens: r.get(8)?,
-                output_tokens: r.get(9)?,
-                cached_tokens: r.get(10)?,
-                cost_usd: r.get(11)?,
-                total_tool_ms: r.get(12)?,
-                is_subagent: r.get::<_, i64>(13)? != 0,
-                is_handoff: r.get::<_, i64>(14)? != 0,
-            })
-        })?
+        .query_map(params![since_ms, until_ms], map_session_row)?
         .flatten()
         .collect();
 
-    let mut sp_stmt = conn.prepare(
-        "SELECT session_id, agent_kind, turn_idx, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                category, is_repo_cli, cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
-                stdout_tokens, stderr_preview, noise_kind, is_orientation, piped_filter, state_dir_hint, started_at
+    let mut sp_stmt = conn.prepare(&format!(
+        "SELECT {SPAN_SELECT_COLS}
          FROM command_spans
          WHERE repo_id IS NOT NULL
            AND started_at >= ?1 AND started_at < ?2
@@ -661,35 +1055,14 @@ pub fn list_repos(
                SELECT session_id FROM sessions
                WHERE COALESCE(started_at, ended_at, 0) >= ?1
                  AND COALESCE(started_at, ended_at, 0) < ?2
-           ))",
-    )?;
-    let spans: Vec<SpanRow> = sp_stmt
-        .query_map(params![since_ms, until_ms], |r| {
-            Ok(SpanRow {
-                session_id: r.get(0)?,
-                agent_kind: r.get(1)?,
-                turn_idx: r.get(2)?,
-                workspace_id: r.get(3)?,
-                repo_id: r.get(4)?,
-                repo_name: r.get(5)?,
-                category: r.get(6)?,
-                is_repo_cli: r.get::<_, i64>(7)? != 0,
-                cmd_bin: r.get(8)?,
-                cmd_template: r.get(9)?,
-                raw_redacted: r.get(10)?,
-                exit_code: r.get(11)?,
-                duration_ms: r.get(12)?,
-                stdout_tokens: r.get(13)?,
-                stderr_preview: r.get(14)?,
-                noise_kind: r.get(15)?,
-                is_orientation: r.get::<_, i64>(16)? != 0,
-                piped_filter: r.get(17)?,
-                state_dir_hint: r.get(18)?,
-                started_at: r.get(19)?,
-            })
-        })?
-        .flatten()
-        .collect();
+           ))"
+    ))?;
+    let spans: Vec<SpanRow> = dedup_wrap_spans(
+        sp_stmt
+            .query_map(params![since_ms, until_ms], map_span_row)?
+            .flatten()
+            .collect(),
+    );
 
     struct Acc {
         repo_id: String,
@@ -769,14 +1142,13 @@ pub fn list_repos(
             let sess_toks: Vec<i64> = r
                 .sessions
                 .values()
-                .map(|s| s.input_tokens + s.output_tokens)
+                .map(SessionRow::uncached_billable_tokens)
                 .filter(|&v| v > 0)
                 .collect();
             let waits: Vec<f64> = r
                 .sessions
                 .values()
                 .map(|s| s.total_tool_ms as f64 / 1000.0)
-                .filter(|&v| v > 0.0)
                 .collect();
             let total_stdout: i64 = r.spans.iter().map(|s| s.stdout_tokens).sum();
             let err_cnt = r
@@ -937,91 +1309,46 @@ pub fn analyze_repo(
     let since_ms = range.since_ms;
     let until_ms = range.upper_bound();
 
-    let mut s_stmt = conn.prepare(
-        "SELECT session_id, agent_kind, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                cwd, COALESCE(started_at, ended_at, 0), turn_count, input_tokens, output_tokens,
-                cached_tokens, cost_usd, total_tool_ms, is_subagent, is_handoff
+    let mut s_stmt = conn.prepare(&format!(
+        "SELECT {SESSION_SELECT_COLS}
          FROM sessions
          WHERE repo_id = ?1
            AND COALESCE(started_at, ended_at, 0) >= ?2
            AND COALESCE(started_at, ended_at, 0) < ?3
-         ORDER BY started_at ASC",
-    )?;
+         ORDER BY started_at ASC"
+    ))?;
     let sessions: Vec<SessionRow> = s_stmt
-        .query_map(params![repo_id, since_ms, until_ms], |r| {
-            Ok(SessionRow {
-                session_id: r.get(0)?,
-                agent_kind: r.get(1)?,
-                workspace_id: r.get(2)?,
-                repo_id: r.get(3)?,
-                repo_name: r.get(4)?,
-                cwd: r.get(5)?,
-                started_at: r.get(6)?,
-                turn_count: r.get(7)?,
-                input_tokens: r.get(8)?,
-                output_tokens: r.get(9)?,
-                cached_tokens: r.get(10)?,
-                cost_usd: r.get(11)?,
-                total_tool_ms: r.get(12)?,
-                is_subagent: r.get::<_, i64>(13)? != 0,
-                is_handoff: r.get::<_, i64>(14)? != 0,
-            })
-        })?
+        .query_map(params![repo_id, since_ms, until_ms], map_session_row)?
         .flatten()
         .collect();
 
-    let mut sp_stmt = conn.prepare(
-        "SELECT session_id, agent_kind, turn_idx, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                category, is_repo_cli, cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
-                stdout_tokens, stderr_preview, noise_kind, is_orientation, piped_filter, state_dir_hint, started_at
+    let mut sp_stmt = conn.prepare(&format!(
+        "SELECT {SPAN_SELECT_COLS}
          FROM command_spans
          WHERE repo_id = ?1
            AND started_at >= ?2 AND started_at < ?3
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))
-         ORDER BY session_id ASC, turn_idx ASC, seq_idx ASC, started_at ASC",
-    )?;
-    let spans: Vec<SpanRow> = sp_stmt
-        .query_map(params![repo_id, since_ms, until_ms], |r| {
-            Ok(SpanRow {
-                session_id: r.get(0)?,
-                agent_kind: r.get(1)?,
-                turn_idx: r.get(2)?,
-                workspace_id: r.get(3)?,
-                repo_id: r.get(4)?,
-                repo_name: r.get(5)?,
-                category: r.get(6)?,
-                is_repo_cli: r.get::<_, i64>(7)? != 0,
-                cmd_bin: r.get(8)?,
-                cmd_template: r.get(9)?,
-                raw_redacted: r.get(10)?,
-                exit_code: r.get(11)?,
-                duration_ms: r.get(12)?,
-                stdout_tokens: r.get(13)?,
-                stderr_preview: r.get(14)?,
-                noise_kind: r.get(15)?,
-                is_orientation: r.get::<_, i64>(16)? != 0,
-                piped_filter: r.get(17)?,
-                state_dir_hint: r.get(18)?,
-                started_at: r.get(19)?,
-            })
-        })?
-        .flatten()
-        .collect();
+         ORDER BY session_id ASC, turn_idx ASC, seq_idx ASC, started_at ASC"
+    ))?;
+    let spans: Vec<SpanRow> = dedup_wrap_spans(
+        sp_stmt
+            .query_map(params![repo_id, since_ms, until_ms], map_span_row)?
+            .flatten()
+            .collect(),
+    );
 
     let mut rd_stmt = conn.prepare(
-        "SELECT COALESCE(session_id, ''), turn_idx, target_name, is_doc, output_tokens
+        "SELECT COALESCE(session_id, ''), turn_idx, COALESCE(target_path, target_name), is_doc, output_tokens
          FROM file_reads
          WHERE repo_id = ?1
            AND started_at >= ?2 AND started_at < ?3
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))",
     )?;
@@ -1057,8 +1384,12 @@ pub fn analyze_repo(
     let mut worktrees = HashSet::new();
     let mut agents_set = HashSet::new();
     let mut total_in_toks: i64 = 0;
+    let mut total_cache_write_toks: i64 = 0;
     let mut total_cached_toks: i64 = 0;
+    let mut total_thinking_toks: i64 = 0;
+    let mut total_model_toks: i64 = 0;
     let mut sum_cost_usd: f64 = 0.0;
+    let mut est_cost_usd: f64 = 0.0;
     let mut cost_sessions: usize = 0;
     for s in &sessions {
         session_turn_totals.insert(s.session_id.clone(), s.turn_count.max(1));
@@ -1068,7 +1399,11 @@ pub fn analyze_repo(
         }
         agents_set.insert(s.agent_kind.clone());
         total_in_toks += s.input_tokens;
+        total_cache_write_toks += s.cache_write_tokens;
         total_cached_toks += s.cached_tokens;
+        total_thinking_toks += s.thinking_tokens;
+        total_model_toks += s.total_model_tokens();
+        est_cost_usd += s.effective_cost_usd();
         if let Some(c) = s.cost_usd
             && c > 0.0
         {
@@ -1095,19 +1430,17 @@ pub fn analyze_repo(
             .and_then(|sid| session_turn_totals.get(sid))
             .copied()
             .unwrap_or(sp.turn_idx.max(1));
-        let rem = (total_t - sp.turn_idx + 1).clamp(1, 25);
-        sp.stdout_tokens.saturating_mul(rem)
+        effective_context_tokens(sp.stdout_tokens, sp.turn_idx, total_t)
     };
 
     let sess_toks: Vec<i64> = sessions
         .iter()
-        .map(|s| s.input_tokens + s.output_tokens)
+        .map(SessionRow::uncached_billable_tokens)
         .filter(|&v| v > 0)
         .collect();
     let waits: Vec<f64> = sessions
         .iter()
         .map(|s| s.total_tool_ms as f64 / 1000.0)
-        .filter(|&v| v > 0.0)
         .collect();
     let total_stdout_tokens: i64 = spans.iter().map(|s| s.stdout_tokens).sum();
     let total_effective_tokens: i64 = spans.iter().map(&effective_toks_for).sum();
@@ -1118,10 +1451,9 @@ pub fn analyze_repo(
         .filter(|s| s.exit_code.is_some_and(|c| c != 0))
         .count();
 
-    let cache_hit_rate = if total_in_toks + total_cached_toks > 0 {
-        Some(round3(
-            total_cached_toks as f64 / (total_in_toks + total_cached_toks) as f64,
-        ))
+    let cache_denom = total_in_toks + total_cache_write_toks + total_cached_toks;
+    let cache_hit_rate = if cache_denom > 0 {
+        Some(round3(total_cached_toks as f64 / cache_denom as f64))
     } else {
         None
     };
@@ -1132,14 +1464,12 @@ pub fn analyze_repo(
         .collect();
     let cli_used = cli_or_build.iter().filter(|s| s.is_repo_cli).count();
 
-    // Group spans by session for sequential pattern mining
+    // Group spans by session for sequential pattern mining (exclude orphan NULL-session spans!)
     let mut spans_by_session: HashMap<String, Vec<&SpanRow>> = HashMap::new();
     for sp in &spans {
-        let key = sp
-            .session_id
-            .clone()
-            .unwrap_or_else(|| "orphan".to_string());
-        spans_by_session.entry(key).or_default().push(sp);
+        if let Some(sid) = &sp.session_id {
+            spans_by_session.entry(sid.clone()).or_default().push(sp);
+        }
     }
 
     let mut total_repo_cli_calls = 0usize;
@@ -1389,6 +1719,7 @@ pub fn analyze_repo(
         pipe_filters: Vec<String>,
         stdout_toks: Vec<i64>,
         durations_ms: Vec<i64>,
+        unchained_durations_ms: Vec<i64>,
         total_stdout_tokens: i64,
         total_effective_tokens: i64,
         total_duration_ms: i64,
@@ -1415,6 +1746,7 @@ pub fn analyze_repo(
                 pipe_filters: Vec::new(),
                 stdout_toks: Vec::new(),
                 durations_ms: Vec::new(),
+                unchained_durations_ms: Vec::new(),
                 total_stdout_tokens: 0,
                 total_effective_tokens: 0,
                 total_duration_ms: 0,
@@ -1453,6 +1785,9 @@ pub fn analyze_repo(
         g.stdout_toks.push(sp.stdout_tokens);
         if let Some(d) = sp.duration_ms {
             g.durations_ms.push(d);
+            if !sp.is_chained {
+                g.unchained_durations_ms.push(d);
+            }
             g.total_duration_ms += d;
         }
         g.total_stdout_tokens += sp.stdout_tokens;
@@ -1706,9 +2041,14 @@ pub fn analyze_repo(
         {
             continue;
         }
-        if g.total_duration_ms >= 20_000 && g.durations_ms.len() >= 2 {
-            let p50s = round1(percentile_i64(&g.durations_ms, 50.0) as f64 / 1000.0);
-            let p95s = round1(percentile_i64(&g.durations_ms, 95.0) as f64 / 1000.0);
+        let dur_samples = if g.unchained_durations_ms.len() >= 3 {
+            &g.unchained_durations_ms
+        } else {
+            &g.durations_ms
+        };
+        if g.total_duration_ms >= 20_000 && dur_samples.len() >= 3 {
+            let p50s = round1(percentile_i64(dur_samples, 50.0) as f64 / 1000.0);
+            let p95s = round1(percentile_i64(dur_samples, 95.0) as f64 / 1000.0);
             let total_s = round1(g.total_duration_ms as f64 / 1000.0);
             if p50s < 1.5 && total_s < 120.0 {
                 continue;
@@ -2135,8 +2475,7 @@ pub fn analyze_repo(
                AND started_at >= ?2 AND started_at < ?3
                AND session_id IN (
                    SELECT session_id FROM sessions
-                   WHERE repo_id = ?1
-                     AND COALESCE(started_at, ended_at, 0) >= ?2
+                   WHERE COALESCE(started_at, ended_at, 0) >= ?2
                      AND COALESCE(started_at, ended_at, 0) < ?3
                )",
         )?;
@@ -2391,14 +2730,11 @@ pub fn analyze_repo(
         if handoff_s.len() >= 3 && fresh_s.len() >= 3 {
             let h_avg = handoff_s
                 .iter()
-                .map(|s| s.input_tokens + s.cached_tokens + s.output_tokens)
+                .map(|s| s.total_model_tokens())
                 .sum::<i64>()
                 / handoff_s.len() as i64;
-            let f_avg = fresh_s
-                .iter()
-                .map(|s| s.input_tokens + s.cached_tokens + s.output_tokens)
-                .sum::<i64>()
-                / fresh_s.len() as i64;
+            let f_avg =
+                fresh_s.iter().map(|s| s.total_model_tokens()).sum::<i64>() / fresh_s.len() as i64;
             if f_avg > 0 && h_avg >= 500_000 && (h_avg as f64 / f_avg as f64) >= 2.0 {
                 let mult = round1(h_avg as f64 / f_avg as f64);
                 let mut h_by_ag: BTreeMap<String, usize> = BTreeMap::new();
@@ -2446,7 +2782,7 @@ pub fn analyze_repo(
         for s in &main_sess {
             let e = cache_by_ag.entry(s.agent_kind.clone()).or_insert((0, 0, 0));
             e.0 += 1;
-            e.1 += s.input_tokens;
+            e.1 += s.input_tokens + s.cache_write_tokens;
             e.2 += s.cached_tokens;
         }
         let best_rate = cache_by_ag
@@ -2525,7 +2861,8 @@ pub fn analyze_repo(
         let eligible: Vec<(&String, &HStat)> =
             hstats.iter().filter(|(_, s)| s.cmds >= 100).collect();
         if eligible.len() >= 2 {
-            let checks: [(&str, fn(&HStat) -> usize); 3] = [
+            type MetricCheck = (&'static str, fn(&HStat) -> usize);
+            let checks: [MetricCheck; 3] = [
                 ("CLI pipe-stripping", |s| s.cli_piped),
                 ("command error rate", |s| s.errs),
                 ("direct state-dir scraping", |s| s.state_reads),
@@ -2593,6 +2930,218 @@ pub fn analyze_repo(
         }
     }
 
+    let latency = summarize_latency(&sessions);
+    let context_health = summarize_context_health(&sessions);
+    let outcomes = summarize_outcomes(&sessions);
+
+    // P. File Edit Churn / Rework Hotspots (files edited repeatedly across sessions)
+    {
+        let mut ed_stmt = conn.prepare(
+            "SELECT session_id, agent_kind, target_path, is_error
+             FROM tool_calls
+             WHERE repo_id = ?1
+               AND is_edit = 1
+               AND target_path IS NOT NULL
+               AND started_at >= ?2 AND started_at < ?3
+               AND session_id IN (
+                   SELECT session_id FROM sessions
+                   WHERE COALESCE(started_at, ended_at, 0) >= ?2
+                     AND COALESCE(started_at, ended_at, 0) < ?3
+               )",
+        )?;
+        struct EditAcc {
+            edits: usize,
+            errors: usize,
+            sessions: HashSet<String>,
+            per_sess: HashMap<String, usize>,
+            by_harness: BTreeMap<String, usize>,
+        }
+        let mut by_path: HashMap<String, EditAcc> = HashMap::new();
+        let rows = ed_stmt.query_map(params![repo_id, since_ms, until_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (sid, ag, path, is_err) = row;
+            let e = by_path.entry(path).or_insert_with(|| EditAcc {
+                edits: 0,
+                errors: 0,
+                sessions: HashSet::new(),
+                per_sess: HashMap::new(),
+                by_harness: BTreeMap::new(),
+            });
+            e.edits += 1;
+            if is_err {
+                e.errors += 1;
+            }
+            e.sessions.insert(sid.clone());
+            *e.per_sess.entry(sid).or_insert(0) += 1;
+            *e.by_harness.entry(ag).or_insert(0) += 1;
+        }
+        let mut hot_edits: Vec<(String, EditAcc)> = by_path
+            .into_iter()
+            .filter(|(_, e)| {
+                let max_s = e.per_sess.values().copied().max().unwrap_or(0);
+                e.edits >= 6 && e.sessions.len() >= 2 && (max_s >= 3 || e.edits >= 10)
+            })
+            .collect();
+        hot_edits.sort_by_key(|(_, e)| std::cmp::Reverse(e.edits));
+        for (path, e) in hot_edits.into_iter().take(4) {
+            let max_in_sess = e.per_sess.values().copied().max().unwrap_or(1);
+            let mut ev = BTreeMap::new();
+            ev.insert("edits".into(), serde_json::json!(e.edits));
+            ev.insert("edit_errors".into(), serde_json::json!(e.errors));
+            ev.insert("sessions".into(), serde_json::json!(e.sessions.len()));
+            ev.insert(
+                "max_edits_in_session".into(),
+                serde_json::json!(max_in_sess),
+            );
+            let hs = format_harness_breakdown(&e.by_harness);
+            raw_opps.push(Opportunity {
+                id: String::new(),
+                scope: "repo".to_string(),
+                kind: "file_edit_churn".to_string(),
+                fix_target: path.clone(),
+                target: path.clone(),
+                score: (e.edits as i64) * 2600 + (e.errors as i64) * 3500,
+                impact_summary: format!(
+                    "edited {}x across {} sessions (max {}x/session, {} edit errors)",
+                    e.edits,
+                    e.sessions.len(),
+                    max_in_sess,
+                    e.errors
+                ),
+                by_harness: e.by_harness,
+                harness_summary: hs,
+                evidence: ev,
+                trace_proof: vec![format!(
+                    "`{path}` required up to {max_in_sess} edits in a single session ({} total across {} sessions)",
+                    e.edits,
+                    e.sessions.len()
+                )],
+                suggested_action: format!(
+                    "`{path}` sees heavy edit churn/rework — inspect whether it is a monolith, has fragile string-matching structure, or lacks modular boundaries/tests."
+                ),
+                acceptance_metric: format!("edits per session on `{path}` drop by >= 40%"),
+            });
+        }
+    }
+
+    // Q. Context Pressure & Compaction Overhead
+    if context_health.compacted_sessions >= 3
+        || (context_health.sessions_over_80_pct >= 3
+            && context_health.avg_peak_context_pct.unwrap_or(0.0) >= 75.0)
+    {
+        let mut by_h: BTreeMap<String, usize> = BTreeMap::new();
+        for s in &sessions {
+            if s.compaction_count > 0 || s.peak_context_pct().is_some_and(|p| p >= 80.0) {
+                *by_h.entry(s.agent_kind.clone()).or_insert(0) += 1;
+            }
+        }
+        let hs = format_harness_breakdown(&by_h);
+        let mut ev = BTreeMap::new();
+        ev.insert(
+            "total_compactions".into(),
+            serde_json::json!(context_health.total_compactions),
+        );
+        ev.insert(
+            "compacted_sessions".into(),
+            serde_json::json!(context_health.compacted_sessions),
+        );
+        ev.insert(
+            "sessions_over_80_pct".into(),
+            serde_json::json!(context_health.sessions_over_80_pct),
+        );
+        if let Some(avg_p) = context_health.avg_peak_context_pct {
+            ev.insert("avg_peak_context_pct".into(), serde_json::json!(avg_p));
+        }
+        raw_opps.push(Opportunity {
+            id: String::new(),
+            scope: "harness".to_string(),
+            kind: "context_pressure".to_string(),
+            fix_target: "Session scoping / context hygiene".to_string(),
+            target: "context window pressure & compactions".to_string(),
+            score: context_health.total_compactions * 6000
+                + (context_health.sessions_over_80_pct as i64) * 4500,
+            impact_summary: format!(
+                "{} compaction(s) across {} sessions ({} sessions reached >=80% context window{})",
+                context_health.total_compactions,
+                context_health.compacted_sessions,
+                context_health.sessions_over_80_pct,
+                context_health
+                    .avg_peak_context_pct
+                    .map(|p| format!(", avg peak {p:.0}%"))
+                    .unwrap_or_default()
+            ),
+            by_harness: by_h,
+            harness_summary: hs,
+            evidence: ev,
+            trace_proof: vec![format!(
+                "{} compacted sessions, {} sessions >=80% window out of {} analyzed",
+                context_health.compacted_sessions,
+                context_health.sessions_over_80_pct,
+                sessions.len()
+            )],
+            suggested_action: "Break long multi-task threads earlier, reduce verbose tool/command outputs, or delegate exploratory searches to subagents to avoid repeated context compaction.".to_string(),
+            acceptance_metric: "compacted_sessions rate < 10% and sessions >=80% window drop by >= 50%".to_string(),
+        });
+    }
+
+    // R. High Session Abort / Interrupt Rate
+    if outcomes.aborted_sessions >= 3 && outcomes.abort_rate >= 0.15 {
+        let mut by_h: BTreeMap<String, usize> = BTreeMap::new();
+        for s in &sessions {
+            if s.outcome.as_deref() == Some("aborted") || s.aborted_turns > 0 {
+                *by_h.entry(s.agent_kind.clone()).or_insert(0) += 1;
+            }
+        }
+        let hs = format_harness_breakdown(&by_h);
+        let mut ev = BTreeMap::new();
+        ev.insert(
+            "aborted_sessions".into(),
+            serde_json::json!(outcomes.aborted_sessions),
+        );
+        ev.insert("abort_rate".into(), serde_json::json!(outcomes.abort_rate));
+        ev.insert(
+            "total_aborted_turns".into(),
+            serde_json::json!(outcomes.total_aborted_turns),
+        );
+        ev.insert(
+            "aborted_session_tokens".into(),
+            serde_json::json!(outcomes.aborted_session_tokens),
+        );
+        raw_opps.push(Opportunity {
+            id: String::new(),
+            scope: "harness".to_string(),
+            kind: "session_abort_rate".to_string(),
+            fix_target: "Long-running tasks / harness responsiveness".to_string(),
+            target: "aborted / interrupted sessions".to_string(),
+            score: (outcomes.aborted_sessions as i64) * 7000
+                + (outcomes.total_aborted_turns * 2500),
+            impact_summary: format!(
+                "{}/{} sessions aborted ({:.0}%, {} interrupted turns, {} tokens in aborted sessions)",
+                outcomes.aborted_sessions,
+                sessions.len(),
+                outcomes.abort_rate * 100.0,
+                outcomes.total_aborted_turns,
+                format_compact(outcomes.aborted_session_tokens)
+            ),
+            by_harness: by_h,
+            harness_summary: hs,
+            evidence: ev,
+            trace_proof: vec![format!(
+                "{} sessions experienced user aborts/interrupts ({} total aborted turns)",
+                outcomes.aborted_sessions, outcomes.total_aborted_turns
+            )],
+            suggested_action: "Inspect slow or runaway loops causing user interrupts — tighten test scopes, command timeouts, and early-turn validation.".to_string(),
+            acceptance_metric: "session abort rate < 10%".to_string(),
+        });
+    }
+
     raw_opps.sort_by_key(|o| std::cmp::Reverse(o.score));
     let mut repo_opps: Vec<Opportunity> = Vec::new();
     let mut harness_opps: Vec<Opportunity> = Vec::new();
@@ -2626,6 +3175,11 @@ pub fn analyze_repo(
         .into_values()
         .map(|g| {
             let hs = format_harness_breakdown(&g.by_harness);
+            let dur_samples = if !g.unchained_durations_ms.is_empty() {
+                &g.unchained_durations_ms
+            } else {
+                &g.durations_ms
+            };
             CommandStat {
                 cmd_template: g.cmd_template,
                 category: g.category,
@@ -2638,7 +3192,17 @@ pub fn analyze_repo(
                 p50_stdout_tokens: percentile_i64(&g.stdout_toks, 50.0),
                 total_stdout_tokens: g.total_stdout_tokens,
                 effective_tokens: g.total_effective_tokens,
-                p50_wait_s: round1(percentile_i64(&g.durations_ms, 50.0) as f64 / 1000.0),
+                p50_wait_s: round1(percentile_i64(dur_samples, 50.0) as f64 / 1000.0),
+                p95_wait_s: if dur_samples.len() >= 5 {
+                    Some(round1(percentile_i64(dur_samples, 95.0) as f64 / 1000.0))
+                } else {
+                    None
+                },
+                p99_wait_s: if dur_samples.len() >= 10 {
+                    Some(round1(percentile_i64(dur_samples, 99.0) as f64 / 1000.0))
+                } else {
+                    None
+                },
                 total_wait_s: round1(g.total_duration_ms as f64 / 1000.0),
                 dominant_noise: mode_str(&g.noises),
                 by_harness: g.by_harness,
@@ -2665,6 +3229,9 @@ pub fn analyze_repo(
             total_commands: spans.len(),
             total_stdout_tokens,
             total_effective_tokens,
+            total_model_tokens: total_model_toks,
+            total_cache_write_tokens: total_cache_write_toks,
+            total_thinking_tokens: total_thinking_toks,
             median_tokens_per_session: percentile_i64(&sess_toks, 50.0),
             p95_tokens_per_session: percentile_i64(&sess_toks, 95.0),
             cache_hit_rate,
@@ -2691,7 +3258,11 @@ pub fn analyze_repo(
             } else {
                 None
             },
+            estimated_cost_usd: (est_cost_usd * 100.0).round() / 100.0,
             cost_sessions,
+            latency,
+            context_health,
+            outcomes,
             detected_config: repo_ctx.config_files,
         },
         opportunities,
@@ -2731,48 +3302,23 @@ pub fn inspect_finding(
         .unwrap_or_else(|| query.to_string());
     let target_lower = target_match.to_ascii_lowercase();
 
-    let mut stmt = conn.prepare(
-        "SELECT session_id, agent_kind, turn_idx, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                category, is_repo_cli, cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
-                stdout_tokens, stderr_preview, noise_kind, is_orientation, piped_filter, state_dir_hint, started_at
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SPAN_SELECT_COLS}
          FROM command_spans
          WHERE repo_id = ?1
            AND started_at >= ?2 AND started_at < ?3
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))
-         ORDER BY session_id ASC, turn_idx ASC, seq_idx ASC",
-    )?;
-    let spans: Vec<SpanRow> = stmt
-        .query_map(params![repo_id, since_ms, until_ms], |r| {
-            Ok(SpanRow {
-                session_id: r.get(0)?,
-                agent_kind: r.get(1)?,
-                turn_idx: r.get(2)?,
-                workspace_id: r.get(3)?,
-                repo_id: r.get(4)?,
-                repo_name: r.get(5)?,
-                category: r.get(6)?,
-                is_repo_cli: r.get::<_, i64>(7)? != 0,
-                cmd_bin: r.get(8)?,
-                cmd_template: r.get(9)?,
-                raw_redacted: r.get(10)?,
-                exit_code: r.get(11)?,
-                duration_ms: r.get(12)?,
-                stdout_tokens: r.get(13)?,
-                stderr_preview: r.get(14)?,
-                noise_kind: r.get(15)?,
-                is_orientation: r.get::<_, i64>(16)? != 0,
-                piped_filter: r.get(17)?,
-                state_dir_hint: r.get(18)?,
-                started_at: r.get(19)?,
-            })
-        })?
-        .flatten()
-        .collect();
+         ORDER BY session_id ASC, turn_idx ASC, seq_idx ASC"
+    ))?;
+    let spans: Vec<SpanRow> = dedup_wrap_spans(
+        stmt.query_map(params![repo_id, since_ms, until_ms], map_span_row)?
+            .flatten()
+            .collect(),
+    );
 
     let mut matched = Vec::new();
 
@@ -2847,16 +3393,76 @@ pub fn inspect_finding(
         });
     }
 
+    // Handle file_edit_churn directly from `tool_calls`
+    if let Some(o) = &opp
+        && o.kind == "file_edit_churn"
+    {
+        let mut ed_stmt = conn.prepare(
+            "SELECT session_id, agent_kind, turn_idx, started_at, tool_name, is_error,
+                    duration_ms, output_tokens, error_preview
+             FROM tool_calls
+             WHERE repo_id = ?1 AND is_edit = 1 AND target_path = ?2
+               AND started_at >= ?3 AND started_at < ?4
+             ORDER BY is_error DESC, started_at DESC",
+        )?;
+        let rows = ed_stmt.query_map(params![repo_id, o.target, since_ms, until_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)? != 0,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (sid, ag, turn, ts, name, is_err, dur, toks, err_prev) = row;
+            let dt = DateTime::from_timestamp_millis(ts)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            matched.push(TraceSample {
+                session_id: sid,
+                agent_kind: ag,
+                turn_idx: turn,
+                started_at: dt,
+                cmd_template: format!("edit:{}", o.target),
+                raw_redacted: format!("{name} {}", o.target),
+                exit_code: Some(if is_err { 1 } else { 0 }),
+                duration_ms: dur,
+                stdout_tokens: toks,
+                noise_kind: None,
+                stderr_preview: err_prev
+                    .as_deref()
+                    .map(clean_error_preview)
+                    .filter(|s| !s.is_empty()),
+                next_cmd: None,
+            });
+        }
+        let total = matched.len();
+        matched.truncate(samples);
+        return Ok(InspectResult {
+            repo_id: repo_id.to_string(),
+            repo_name: report.repo_name,
+            query: query.to_string(),
+            opportunity: opp,
+            total_matching_spans: total,
+            samples: matched,
+        });
+    }
+
     // Handle repeated_file_reread and truncated_output_reread directly from `file_reads`
     if let Some(o) = &opp
         && (o.kind == "repeated_file_reread" || o.kind == "truncated_output_reread")
     {
         let mut fr_stmt = conn.prepare(
             "SELECT fr.session_id, COALESCE(s.agent_kind, 'unknown'), fr.turn_idx, fr.started_at,
-                    fr.target_name, fr.output_tokens
+                    COALESCE(fr.target_path, fr.target_name), fr.output_tokens
              FROM file_reads fr
              LEFT JOIN sessions s ON s.session_id = fr.session_id
-             WHERE fr.repo_id = ?1 AND fr.target_name = ?2
+             WHERE fr.repo_id = ?1 AND (fr.target_path = ?2 OR fr.target_name = ?2)
                AND fr.started_at >= ?3 AND fr.started_at < ?4
              ORDER BY fr.output_tokens DESC",
         )?;
@@ -2902,71 +3508,96 @@ pub fn inspect_finding(
         });
     }
 
-    // Handle session-level findings (`context_handoff_bloat`, `low_cache_efficiency`) directly from `sessions`
+    // Handle session-level findings directly from `sessions`
     if let Some(o) = &opp
-        && (o.kind == "context_handoff_bloat" || o.kind == "low_cache_efficiency")
+        && matches!(
+            o.kind.as_str(),
+            "context_handoff_bloat"
+                | "low_cache_efficiency"
+                | "context_pressure"
+                | "session_abort_rate"
+        )
     {
         let target_agent = if o.kind == "low_cache_efficiency" {
             o.target.split_whitespace().next().map(str::to_string)
         } else {
             None
         };
-        let mut s_stmt = conn.prepare(
-            "SELECT session_id, agent_kind, turn_count, COALESCE(started_at, ended_at, 0),
-                    input_tokens, output_tokens, cached_tokens, total_tool_ms, is_handoff
+        let mut s_stmt = conn.prepare(&format!(
+            "SELECT {SESSION_SELECT_COLS}
              FROM sessions
              WHERE repo_id = ?1
-               AND is_subagent = 0
                AND COALESCE(started_at, ended_at, 0) >= ?2
                AND COALESCE(started_at, ended_at, 0) < ?3
-             ORDER BY (input_tokens + cached_tokens + output_tokens) DESC",
-        )?;
-        let rows = s_stmt.query_map(params![repo_id, since_ms, until_ms], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, i64>(8)? != 0,
-            ))
-        })?;
-        for row in rows.flatten() {
-            let (sid, ag, turns, ts, in_t, out_t, cac_t, tool_ms, is_h) = row;
-            if o.kind == "context_handoff_bloat" && !is_h {
-                continue;
-            }
-            if let Some(ref ta) = target_agent
-                && ag != *ta
+             ORDER BY (input_tokens + cache_write_tokens + cached_tokens + output_tokens + thinking_tokens) DESC"
+        ))?;
+        let rows: Vec<SessionRow> = s_stmt
+            .query_map(params![repo_id, since_ms, until_ms], map_session_row)?
+            .flatten()
+            .collect();
+        for s in rows {
+            if matches!(
+                o.kind.as_str(),
+                "context_handoff_bloat" | "low_cache_efficiency"
+            ) && s.is_subagent
             {
                 continue;
             }
-            let total_t = in_t + cac_t + out_t;
-            let cache_pct = if in_t + cac_t > 0 {
-                (cac_t as f64 / (in_t + cac_t) as f64) * 100.0
+            if o.kind == "context_handoff_bloat" && !s.is_handoff {
+                continue;
+            }
+            if o.kind == "context_pressure"
+                && s.compaction_count <= 0
+                && !s.peak_context_pct().is_some_and(|p| p >= 80.0)
+            {
+                continue;
+            }
+            if o.kind == "session_abort_rate"
+                && s.outcome.as_deref() != Some("aborted")
+                && s.aborted_turns <= 0
+            {
+                continue;
+            }
+            if let Some(ref ta) = target_agent
+                && s.agent_kind != *ta
+            {
+                continue;
+            }
+            let total_t = s.total_model_tokens();
+            let cache_denom = s.input_tokens + s.cache_write_tokens + s.cached_tokens;
+            let cache_pct = if cache_denom > 0 {
+                (s.cached_tokens as f64 / cache_denom as f64) * 100.0
             } else {
                 0.0
             };
-            let dt = DateTime::from_timestamp_millis(ts)
+            let dt = DateTime::from_timestamp_millis(s.started_at)
                 .map(|d| d.to_rfc3339())
                 .unwrap_or_default();
             matched.push(TraceSample {
-                session_id: sid.clone(),
-                agent_kind: ag,
-                turn_idx: turns,
+                session_id: s.session_id.clone(),
+                agent_kind: s.agent_kind.clone(),
+                turn_idx: s.turn_count,
                 started_at: dt,
                 cmd_template: o.kind.clone(),
                 raw_redacted: format!(
-                    "session `{sid}` ({turns} turns, {} total toks, {} uncached, cache {:.1}%)",
+                    "session `{}` ({} turns, {} total toks, cache {:.1}%, compactions={}, aborts={})",
+                    s.session_id,
+                    s.turn_count,
                     format_compact(total_t),
-                    format_compact(in_t),
-                    cache_pct
+                    cache_pct,
+                    s.compaction_count,
+                    s.aborted_turns
                 ),
-                exit_code: Some(0),
-                duration_ms: if tool_ms > 0 { Some(tool_ms) } else { None },
+                exit_code: Some(if s.outcome.as_deref() == Some("aborted") {
+                    1
+                } else {
+                    0
+                }),
+                duration_ms: if s.total_tool_ms > 0 {
+                    Some(s.total_tool_ms)
+                } else {
+                    None
+                },
                 stdout_tokens: total_t,
                 noise_kind: None,
                 stderr_preview: None,
@@ -3233,93 +3864,54 @@ pub fn diff_repo(
     since_ms: i64,
     since_label: &str,
 ) -> Result<DiffReport> {
-    let load_sessions = |before: bool| -> Result<Vec<SessionRow>> {
-        let sql = if before {
-            "SELECT session_id, agent_kind, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                    cwd, COALESCE(started_at, ended_at, 0), turn_count, input_tokens, output_tokens,
-                    cached_tokens, cost_usd, total_tool_ms, is_subagent, is_handoff
-             FROM sessions WHERE repo_id = ?1 AND COALESCE(started_at, ended_at, 0) < ?2"
-        } else {
-            "SELECT session_id, agent_kind, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                    cwd, COALESCE(started_at, ended_at, 0), turn_count, input_tokens, output_tokens,
-                    cached_tokens, cost_usd, total_tool_ms, is_subagent, is_handoff
-             FROM sessions WHERE repo_id = ?1 AND COALESCE(started_at, ended_at, 0) >= ?2"
-        };
-        let mut stmt = conn.prepare(sql)?;
+    let load_sessions_range = |lo: i64, hi: i64| -> Result<Vec<SessionRow>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_SELECT_COLS}
+             FROM sessions
+             WHERE repo_id = ?1
+               AND COALESCE(started_at, ended_at, 0) >= ?2
+               AND COALESCE(started_at, ended_at, 0) < ?3"
+        ))?;
         let rows = stmt
-            .query_map(params![repo_id, since_ms], |r| {
-                Ok(SessionRow {
-                    session_id: r.get(0)?,
-                    agent_kind: r.get(1)?,
-                    workspace_id: r.get(2)?,
-                    repo_id: r.get(3)?,
-                    repo_name: r.get(4)?,
-                    cwd: r.get(5)?,
-                    started_at: r.get(6)?,
-                    turn_count: r.get(7)?,
-                    input_tokens: r.get(8)?,
-                    output_tokens: r.get(9)?,
-                    cached_tokens: r.get(10)?,
-                    cost_usd: r.get(11)?,
-                    total_tool_ms: r.get(12)?,
-                    is_subagent: r.get::<_, i64>(13)? != 0,
-                    is_handoff: r.get::<_, i64>(14)? != 0,
-                })
-            })?
+            .query_map(params![repo_id, lo, hi], map_session_row)?
             .flatten()
             .collect();
         Ok(rows)
     };
 
-    let load_spans = |before: bool| -> Result<Vec<SpanRow>> {
-        let sql = if before {
-            "SELECT session_id, agent_kind, turn_idx, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                    category, is_repo_cli, cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
-                    stdout_tokens, stderr_preview, noise_kind, is_orientation, piped_filter, state_dir_hint, started_at
-             FROM command_spans WHERE repo_id = ?1 AND started_at < ?2
+    let load_spans_range = |lo: i64, hi: i64| -> Result<Vec<SpanRow>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SPAN_SELECT_COLS}
+             FROM command_spans
+             WHERE repo_id = ?1 AND started_at >= ?2 AND started_at < ?3
              ORDER BY session_id, turn_idx, seq_idx"
-        } else {
-            "SELECT session_id, agent_kind, turn_idx, workspace_id, repo_id, COALESCE(repo_name, repo_id),
-                    category, is_repo_cli, cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
-                    stdout_tokens, stderr_preview, noise_kind, is_orientation, piped_filter, state_dir_hint, started_at
-             FROM command_spans WHERE repo_id = ?1 AND started_at >= ?2
-             ORDER BY session_id, turn_idx, seq_idx"
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt
-            .query_map(params![repo_id, since_ms], |r| {
-                Ok(SpanRow {
-                    session_id: r.get(0)?,
-                    agent_kind: r.get(1)?,
-                    turn_idx: r.get(2)?,
-                    workspace_id: r.get(3)?,
-                    repo_id: r.get(4)?,
-                    repo_name: r.get(5)?,
-                    category: r.get(6)?,
-                    is_repo_cli: r.get::<_, i64>(7)? != 0,
-                    cmd_bin: r.get(8)?,
-                    cmd_template: r.get(9)?,
-                    raw_redacted: r.get(10)?,
-                    exit_code: r.get(11)?,
-                    duration_ms: r.get(12)?,
-                    stdout_tokens: r.get(13)?,
-                    stderr_preview: r.get(14)?,
-                    noise_kind: r.get(15)?,
-                    is_orientation: r.get::<_, i64>(16)? != 0,
-                    piped_filter: r.get(17)?,
-                    state_dir_hint: r.get(18)?,
-                    started_at: r.get(19)?,
-                })
-            })?
-            .flatten()
-            .collect();
+        ))?;
+        let rows = dedup_wrap_spans(
+            stmt.query_map(params![repo_id, lo, hi], map_span_row)?
+                .flatten()
+                .collect(),
+        );
         Ok(rows)
     };
 
-    let b_sess = load_sessions(true)?;
-    let a_sess = load_sessions(false)?;
-    let b_spans = load_spans(true)?;
-    let a_spans = load_spans(false)?;
+    let now_ms = Utc::now().timestamp_millis();
+    let after_span_ms = (now_ms - since_ms).max(86_400_000);
+    let matched_pre_lo = since_ms.saturating_sub(after_span_ms);
+
+    let a_sess = load_sessions_range(since_ms, i64::MAX)?;
+    let a_spans = load_spans_range(since_ms, i64::MAX)?;
+
+    let matched_b_sess = load_sessions_range(matched_pre_lo, since_ms)?;
+    let (b_sess, b_spans, matched_window) = if matched_b_sess.len() >= 3 {
+        let matched_b_spans = load_spans_range(matched_pre_lo, since_ms)?;
+        (matched_b_sess, matched_b_spans, true)
+    } else {
+        (
+            load_sessions_range(0, since_ms)?,
+            load_spans_range(0, since_ms)?,
+            false,
+        )
+    };
 
     let repo_name = a_sess
         .first()
@@ -3331,19 +3923,45 @@ pub fn diff_repo(
         |sess: &[SessionRow], sp: &[SpanRow]| -> (DiffBucket, HashMap<String, Vec<i64>>) {
             let toks: Vec<i64> = sess
                 .iter()
-                .map(|s| s.input_tokens + s.output_tokens)
+                .map(SessionRow::uncached_billable_tokens)
                 .filter(|&v| v > 0)
                 .collect();
             let waits: Vec<f64> = sess
                 .iter()
                 .map(|s| s.total_tool_ms as f64 / 1000.0)
-                .filter(|&v| v > 0.0)
                 .collect();
             let errs = sp
                 .iter()
                 .filter(|x| x.exit_code.is_some_and(|c| c != 0))
                 .count();
             let total_out: i64 = sp.iter().map(|x| x.stdout_tokens).sum();
+            let est_cost: f64 = sess.iter().map(SessionRow::effective_cost_usd).sum();
+            let sum_in: i64 = sess
+                .iter()
+                .map(|s| s.input_tokens + s.cache_write_tokens)
+                .sum();
+            let sum_cached: i64 = sess.iter().map(|s| s.cached_tokens).sum();
+            let cache_hit = if sum_in + sum_cached > 0 {
+                Some(round3(sum_cached as f64 / (sum_in + sum_cached) as f64))
+            } else {
+                None
+            };
+            let api_sessions: Vec<f64> = sess
+                .iter()
+                .filter(|s| s.api_duration_ms > 0)
+                .map(|s| s.api_duration_ms as f64 / 1000.0)
+                .collect();
+            let avg_api_wait = if api_sessions.is_empty() {
+                None
+            } else {
+                Some(round1(
+                    api_sessions.iter().sum::<f64>() / api_sessions.len() as f64,
+                ))
+            };
+            let aborted = sess
+                .iter()
+                .filter(|s| s.outcome.as_deref() == Some("aborted") || s.aborted_turns > 0)
+                .count();
 
             let mut cli_calls = 0usize;
             let mut rebounds = 0usize;
@@ -3353,7 +3971,7 @@ pub fn diff_repo(
                     .entry(sp[i].cmd_template.clone())
                     .or_default()
                     .push(sp[i].stdout_tokens);
-                if sp[i].is_repo_cli {
+                if sp[i].is_repo_cli && sp[i].session_id.is_some() {
                     cli_calls += 1;
                     if let Some(nx) = sp.get(i + 1)
                         && nx.session_id == sp[i].session_id
@@ -3388,12 +4006,77 @@ pub fn diff_repo(
                 } else {
                     0.0
                 },
+                estimated_cost_usd: (est_cost * 100.0).round() / 100.0,
+                cache_hit_rate: cache_hit,
+                avg_api_wait_s: avg_api_wait,
+                abort_rate: if sess.is_empty() {
+                    0.0
+                } else {
+                    round3(aborted as f64 / sess.len() as f64)
+                },
             };
             (bucket, per_cmd)
         };
 
     let (before, b_cmd) = summarize(&b_sess, &b_spans);
     let (after, a_cmd) = summarize(&a_sess, &a_spans);
+
+    // Per-harness stratified deltas so harness-mix shifts are transparent
+    let mut all_harnesses: HashSet<String> = HashSet::new();
+    for s in b_sess.iter().chain(a_sess.iter()) {
+        all_harnesses.insert(s.agent_kind.clone());
+    }
+    let mut harness_list: Vec<String> = all_harnesses.into_iter().collect();
+    harness_list.sort();
+    let mut by_harness = Vec::new();
+    let mut max_mix_shift_pp: f64 = 0.0;
+    let mut shift_desc = String::new();
+    for ag in harness_list {
+        let bs: Vec<SessionRow> = b_sess
+            .iter()
+            .filter(|s| s.agent_kind == ag)
+            .cloned()
+            .collect();
+        let as_: Vec<SessionRow> = a_sess
+            .iter()
+            .filter(|s| s.agent_kind == ag)
+            .cloned()
+            .collect();
+        let bsp: Vec<SpanRow> = b_spans
+            .iter()
+            .filter(|sp| sp.agent_kind.as_deref() == Some(ag.as_str()))
+            .cloned()
+            .collect();
+        let asp: Vec<SpanRow> = a_spans
+            .iter()
+            .filter(|sp| sp.agent_kind.as_deref() == Some(ag.as_str()))
+            .cloned()
+            .collect();
+        if before.commands >= 10 && after.commands >= 10 {
+            let b_share = (bsp.len() as f64 / before.commands as f64) * 100.0;
+            let a_share = (asp.len() as f64 / after.commands as f64) * 100.0;
+            let diff_pp = (a_share - b_share).abs();
+            if diff_pp > max_mix_shift_pp {
+                max_mix_shift_pp = diff_pp;
+                shift_desc = format!("{ag} command share {b_share:.0}% -> {a_share:.0}%");
+            }
+        }
+        let (bb, _) = summarize(&bs, &bsp);
+        let (ab, _) = summarize(&as_, &asp);
+        by_harness.push(HarnessDiffDelta {
+            agent_kind: ag,
+            before_sessions: bb.sessions,
+            after_sessions: ab.sessions,
+            before_commands: bb.commands,
+            after_commands: ab.commands,
+            before_median_tokens: bb.median_session_tokens,
+            after_median_tokens: ab.median_session_tokens,
+            before_avg_stdout_tokens: bb.avg_stdout_tokens_per_cmd,
+            after_avg_stdout_tokens: ab.avg_stdout_tokens_per_cmd,
+            before_error_rate: bb.error_rate,
+            after_error_rate: ab.error_rate,
+        });
+    }
 
     let pct_f = |a: f64, b: f64| -> Option<f64> {
         if a > 0.0 {
@@ -3429,7 +4112,9 @@ pub fn diff_repo(
     cmd_deltas.truncate(8);
 
     let mut guardrails = Vec::new();
+    let mut has_regression_warning = false;
     if after.rebound_rate > before.rebound_rate + 0.05 {
+        has_regression_warning = true;
         guardrails.push(format!(
             "WARNING: Escape-hatch rebound rate rose ({:.1}% -> {:.1}%) — check for over-truncated outputs.",
             before.rebound_rate * 100.0,
@@ -3437,16 +4122,34 @@ pub fn diff_repo(
         ));
     }
     if after.error_rate > before.error_rate + 0.05 {
+        has_regression_warning = true;
         guardrails.push(format!(
             "WARNING: Command error rate rose ({:.1}% -> {:.1}%).",
             before.error_rate * 100.0,
             after.error_rate * 100.0
         ));
     }
+    if max_mix_shift_pp >= 20.0 {
+        guardrails.push(format!(
+            "NOTE: Harness mix shifted ({shift_desc}) — check per-harness deltas below to avoid Simpson's paradox."
+        ));
+    }
+    if !matched_window && before.sessions > 0 {
+        guardrails.push(
+            "NOTE: Matched pre-window had <3 sessions; fell back to all historical sessions before the split."
+                .to_string(),
+        );
+    }
+    if before.sessions < 5 || after.sessions < 5 || before.commands < 15 || after.commands < 15 {
+        guardrails.push(format!(
+            "NOTE: Low sample size (before: {} sess/{} cmds, after: {} sess/{} cmds) — treat deltas as directional.",
+            before.sessions, before.commands, after.sessions, after.commands
+        ));
+    }
 
     let verdict = if before.commands < 3 || after.commands < 3 {
         "insufficient_data"
-    } else if !guardrails.is_empty() {
+    } else if has_regression_warning {
         "mixed_guardrail_warning"
     } else if after.avg_stdout_tokens_per_cmd < before.avg_stdout_tokens_per_cmd
         && after.median_tool_wait_s <= before.median_tool_wait_s
@@ -3464,6 +4167,7 @@ pub fn diff_repo(
         repo_id: repo_id.to_string(),
         repo_name,
         since: since_label.to_string(),
+        matched_window,
         verdict: verdict.to_string(),
         deltas: DiffDeltas {
             median_session_tokens_pct: pct_f(
@@ -3478,6 +4182,7 @@ pub fn diff_repo(
         },
         before,
         after,
+        by_harness,
         guardrails,
         command_deltas: cmd_deltas,
     })
@@ -3509,14 +4214,13 @@ pub fn query_commands(
 
     let mut sp_stmt = conn.prepare(
         "SELECT session_id, agent_kind, turn_idx, category, is_repo_cli, cmd_template, exit_code, duration_ms,
-                stdout_tokens, noise_kind, piped_filter
+                stdout_tokens, noise_kind, piped_filter, is_chained
          FROM command_spans
          WHERE repo_id = ?1
            AND started_at >= ?2 AND started_at < ?3
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))",
     )?;
@@ -3530,6 +4234,7 @@ pub fn query_commands(
         pipes: Vec<String>,
         toks: Vec<i64>,
         durs: Vec<i64>,
+        unchained_durs: Vec<i64>,
         sum_toks: i64,
         sum_eff: i64,
         sum_dur: i64,
@@ -3549,11 +4254,12 @@ pub fn query_commands(
             r.get::<_, i64>(8)?,
             r.get::<_, Option<String>>(9)?,
             r.get::<_, Option<String>>(10)?,
+            r.get::<_, i64>(11)? != 0,
         ))
     })?;
 
     for row in rows.flatten() {
-        let (sid, ag, turn_idx, cat, is_cli, tpl, ec, dur, toks, noise, pf) = row;
+        let (sid, ag, turn_idx, cat, is_cli, tpl, ec, dur, toks, noise, pf, is_chained) = row;
         if let Some(cf) = category_filter
             && !cat.eq_ignore_ascii_case(cf)
         {
@@ -3563,7 +4269,7 @@ pub fn query_commands(
             .as_deref()
             .map(|id| *sess_turns.entry(id.to_string()).or_insert(turn_idx.max(1)))
             .unwrap_or(turn_idx.max(1));
-        let rem = (total_t - turn_idx + 1).clamp(1, 25);
+        let eff = effective_context_tokens(toks, turn_idx, total_t);
         let e = by_tpl.entry(tpl).or_insert_with(|| Acc {
             category: cat,
             is_repo_cli: is_cli,
@@ -3574,6 +4280,7 @@ pub fn query_commands(
             pipes: Vec::new(),
             toks: Vec::new(),
             durs: Vec::new(),
+            unchained_durs: Vec::new(),
             sum_toks: 0,
             sum_eff: 0,
             sum_dur: 0,
@@ -3590,9 +4297,12 @@ pub fn query_commands(
         }
         e.toks.push(toks);
         e.sum_toks += toks;
-        e.sum_eff += toks.saturating_mul(rem);
+        e.sum_eff += eff;
         if let Some(d) = dur {
             e.durs.push(d);
+            if !is_chained {
+                e.unchained_durs.push(d);
+            }
             e.sum_dur += d;
         }
         if let Some(n) = noise {
@@ -3604,6 +4314,11 @@ pub fn query_commands(
         .into_iter()
         .map(|(tpl, g)| {
             let hs = format_harness_breakdown(&g.by_harness);
+            let dur_samples = if !g.unchained_durs.is_empty() {
+                &g.unchained_durs
+            } else {
+                &g.durs
+            };
             CommandStat {
                 cmd_template: tpl,
                 category: g.category,
@@ -3616,7 +4331,17 @@ pub fn query_commands(
                 p50_stdout_tokens: percentile_i64(&g.toks, 50.0),
                 total_stdout_tokens: g.sum_toks,
                 effective_tokens: g.sum_eff,
-                p50_wait_s: round1(percentile_i64(&g.durs, 50.0) as f64 / 1000.0),
+                p50_wait_s: round1(percentile_i64(dur_samples, 50.0) as f64 / 1000.0),
+                p95_wait_s: if dur_samples.len() >= 5 {
+                    Some(round1(percentile_i64(dur_samples, 95.0) as f64 / 1000.0))
+                } else {
+                    None
+                },
+                p99_wait_s: if dur_samples.len() >= 10 {
+                    Some(round1(percentile_i64(dur_samples, 99.0) as f64 / 1000.0))
+                } else {
+                    None
+                },
                 total_wait_s: round1(g.sum_dur as f64 / 1000.0),
                 dominant_noise: mode_str(&g.noises),
                 by_harness: g.by_harness,
@@ -3655,8 +4380,7 @@ pub fn query_errors(
          WHERE repo_id = ?1 AND started_at >= ?2 AND started_at < ?3
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))
          GROUP BY cmd_template",
@@ -3676,8 +4400,7 @@ pub fn query_errors(
            AND exit_code IS NOT NULL AND exit_code != 0
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))",
     )?;
@@ -3775,8 +4498,7 @@ pub fn query_bypasses(conn: &Connection, repo_id: &str, range: &TimeRange) -> Re
            AND started_at >= ?2 AND started_at < ?3
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))",
     )?;
@@ -3967,8 +4689,7 @@ pub fn query_bypasses(conn: &Connection, repo_id: &str, range: &TimeRange) -> Re
            AND is_repo_cli = 0
            AND (session_id IS NULL OR session_id IN (
                SELECT session_id FROM sessions
-               WHERE repo_id = ?1
-                 AND COALESCE(started_at, ended_at, 0) >= ?2
+               WHERE COALESCE(started_at, ended_at, 0) >= ?2
                  AND COALESCE(started_at, ended_at, 0) < ?3
            ))",
     )?;

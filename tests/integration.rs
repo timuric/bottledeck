@@ -125,7 +125,7 @@ fn end_to_end_ingest_analysis_diff_and_tui_render() {
         .join("\n");
 
     // 1. Synthetic Claude transcript with token bloat, flag thrash, and rebound
-    let claude_lines = vec![
+    let claude_lines = [
         serde_json::json!({
             "type": "assistant",
             "sessionId": "s-claude-1",
@@ -211,7 +211,7 @@ fn end_to_end_ingest_analysis_diff_and_tui_render() {
 
     // 2. Synthetic Codex transcript with repeated flag thrash + verbose tests + polling
     let t1 = now - 1_800_000;
-    let codex_lines = vec![
+    let codex_lines = [
         serde_json::json!({
             "type": "session_meta",
             "timestamp": chrono::DateTime::from_timestamp_millis(t1).unwrap().to_rfc3339(),
@@ -269,7 +269,7 @@ fn end_to_end_ingest_analysis_diff_and_tui_render() {
     .unwrap();
 
     // 3. Synthetic Antigravity transcript
-    let agy_lines = vec![
+    let agy_lines = [
         serde_json::json!({
             "step_index": 1,
             "type": "PLANNER_RESPONSE",
@@ -467,7 +467,7 @@ fn cross_session_originator_subagent_mcp_tools_and_truncation() {
     };
 
     // Claude main session (Context handoff) + separate subagent sharing parent sessionId
-    let claude_main = vec![
+    let claude_main = [
         serde_json::json!({
             "type": "user",
             "sessionId": "parent-1",
@@ -517,7 +517,7 @@ fn cross_session_originator_subagent_mcp_tools_and_truncation() {
     .unwrap();
 
     // Claude subagent file sharing parent `sessionId: "parent-1"` MUST NOT collide with parent!
-    let claude_sub = vec![serde_json::json!({
+    let claude_sub = [serde_json::json!({
         "type": "assistant",
         "sessionId": "parent-1",
         "entrypoint": "t3-code",
@@ -1289,4 +1289,652 @@ fn regression_fixes_tool_errors_codex_steps_kimi_pruning_rebounds_and_inspect() 
         )
         .unwrap();
     assert_eq!(remaining, 0);
+}
+
+#[test]
+fn shell_parser_loops_wrappers_exit_codes_and_parallel_intervals() {
+    use bottledeck::adapters::{SpanBuildArgs, build_command_spans, merge_intervals_ms};
+    use bottledeck::shell::extract_exit_code_from_text;
+    use bottledeck::workspace::WorkspaceResolver;
+
+    // 1. Loop body is preserved instead of dropped
+    let loop_segs = split_shell_commands("for f in a b; do cargo test --lib; done");
+    assert!(
+        loop_segs
+            .iter()
+            .filter_map(|s| parse_command_tokens(&s.tokens, &s.raw))
+            .any(|p| p.cmd_bin == "cargo" && p.cmd_template.starts_with("cargo test")),
+        "expected cargo test inside loop body, got: {loop_segs:?}"
+    );
+
+    // 2. `bash -c` + `timeout -s KILL 30` unwrapped and script basename preserved
+    let wrap_segs =
+        split_shell_commands("bash -c 'timeout -s KILL 30 python3 scripts/deploy.py --dry-run'");
+    assert_eq!(wrap_segs.len(), 1);
+    let parsed = parse_command_tokens(&wrap_segs[0].tokens, &wrap_segs[0].raw).unwrap();
+    assert_eq!(parsed.cmd_bin, "python3");
+    assert!(
+        parsed.cmd_template.contains("deploy.py"),
+        "expected script basename preserved, got: {}",
+        parsed.cmd_template
+    );
+
+    // 3. `make test || true` with overall exit 0 must NOT falsely infer exit_code=Some(0) on `make test`
+    let mut resolver = WorkspaceResolver::new(None);
+    let built = build_command_spans(
+        SpanBuildArgs {
+            command_line: "make test || true",
+            session_id: Some("s1".into()),
+            source_file: "test.jsonl",
+            source_kind: "claude",
+            agent_kind: "claude-code",
+            tool_call_id: None,
+            turn_idx: 1,
+            base_seq_idx: 0,
+            base_cwd: None,
+            exit_code: Some(0),
+            duration_ms: Some(1200),
+            is_explicit_duration: true,
+            interrupted: false,
+            stdout_text: "ok",
+            stderr_text: "",
+            started_at: 1_700_000_000_000,
+        },
+        &mut resolver,
+    );
+    let make_span = built.iter().find(|s| s.cmd_bin == "make").unwrap();
+    assert!(make_span.is_chained);
+    assert_eq!(
+        make_span.exit_code, None,
+        "LHS of `||` must not be inferred as exit 0"
+    );
+
+    // 4. Mid-log text containing "exit code 1" must NOT override structured head/tail "exited with code 0"
+    let passing_log = (0..30)
+        .map(|i| {
+            if i == 15 {
+                "test parser::handles_exit_code_1 ... ok\nexit code 1 test passed"
+            } else {
+                "test suite::case ... ok"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let wrapped_ok = format!("Command exited with code 0.\n{passing_log}");
+    assert_eq!(extract_exit_code_from_text(&wrapped_ok, false), 0);
+
+    // 5. Parallel tool wall-clock interval merging
+    let merged_ms = merge_intervals_ms(&[(1_000, 2_000), (1_200, 2_200), (3_000, 3_500)]);
+    assert_eq!(merged_ms, 1700);
+}
+
+#[test]
+fn advanced_telemetry_latency_tokens_trajectories_churn_and_diff() {
+    let tmp = TempDir::new().unwrap();
+    let repo_a = tmp.path().join("alpha-repo");
+    let repo_b = tmp.path().join("beta-repo");
+    fs::create_dir_all(repo_a.join("src")).unwrap();
+    fs::create_dir_all(repo_b.join("src")).unwrap();
+    fs::write(repo_a.join("src/engine.rs"), "pub fn run() {}\n").unwrap();
+    fs::write(repo_b.join("src/lib.rs"), "pub fn b() {}\n").unwrap();
+
+    for (dir, remote) in [
+        (&repo_a, "https://github.com/acme/alpha-repo.git"),
+        (&repo_b, "https://github.com/acme/beta-repo.git"),
+    ] {
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["remote", "add", "origin", remote])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+    }
+    let repo_a_str = repo_a.to_string_lossy().to_string();
+    let repo_b_str = repo_b.to_string_lossy().to_string();
+
+    let claude_root = tmp.path().join("claude");
+    let codex_root = tmp.path().join("codex");
+    let kimi_root = tmp.path().join("kimi");
+    fs::create_dir_all(claude_root.join("proj/subagents")).unwrap();
+    fs::create_dir_all(codex_root.join("2026")).unwrap();
+    fs::create_dir_all(kimi_root.join("wd/k_sess/agents/main")).unwrap();
+
+    let now = Utc::now().timestamp_millis();
+    let t0 = now - 3_600_000;
+    let iso = |ms: i64| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap()
+            .to_rfc3339()
+    };
+
+    // 1. Claude session 1: cache_write separation, thinking tokens, cost-state, compact_boundary,
+    // api_error, Edit -> fail -> Edit rework cycle, interrupted turn, cross-repo `cd` into beta-repo
+    let claude_s1 = [
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "turnOrigin": "user",
+            "timestamp": iso(t0),
+            "message": {"content": "Fix engine.rs"}
+        }),
+        serde_json::json!({
+            "type": "assistant",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "effort": "high",
+            "thinkingDurationMs": 2500,
+            "timestamp": iso(t0 + 3000),
+            "message": {
+                "id": "m1",
+                "model": "claude-opus-4-6",
+                "stop_reason": "tool_use",
+                "usage": {
+                    "input_tokens": 2000,
+                    "cache_creation_input_tokens": 8000,
+                    "cache_read_input_tokens": 40000,
+                    "output_tokens": 500,
+                    "output_tokens_details": {"thinking_tokens": 1200}
+                },
+                "content": [
+                    {"type": "tool_use", "id": "t_read", "name": "Read", "input": {"file_path": format!("{repo_a_str}/src/engine.rs")}},
+                    {"type": "tool_use", "id": "t_edit1", "name": "Edit", "input": {"file_path": format!("{repo_a_str}/src/engine.rs"), "old_string": "a", "new_string": "b"}}
+                ]
+            }
+        }),
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "timestamp": iso(t0 + 3500),
+            "toolUseResult": {"filePath": format!("{repo_a_str}/src/engine.rs"), "durationMs": 50},
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t_read", "content": "pub fn run() {}"}]}
+        }),
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "timestamp": iso(t0 + 4000),
+            "toolUseResult": {
+                "filePath": format!("{repo_a_str}/src/engine.rs"),
+                "durationMs": 60,
+                "structuredPatch": [{"lines": ["+added line", "-removed line"]}]
+            },
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t_edit1", "content": "ok"}]}
+        }),
+        serde_json::json!({
+            "type": "assistant",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "timestamp": iso(t0 + 5000),
+            "message": {
+                "id": "m2",
+                "model": "claude-opus-4-6",
+                "usage": {"input_tokens": 1000, "cache_creation_input_tokens": 2000, "cache_read_input_tokens": 47000, "output_tokens": 300},
+                "content": [{"type": "tool_use", "id": "t_test", "name": "Bash", "input": {"command": "cargo test"}}]
+            }
+        }),
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "timestamp": iso(t0 + 7000),
+            "toolUseResult": {"exitCode": 1, "durationMs": 2000, "stderr": "assertion failed"},
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t_test", "is_error": true, "content": "assertion failed"}]}
+        }),
+        serde_json::json!({
+            "type": "assistant",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "timestamp": iso(t0 + 8000),
+            "message": {
+                "id": "m3",
+                "model": "claude-opus-4-6",
+                "usage": {"input_tokens": 1000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 49000, "output_tokens": 200},
+                "content": [
+                    {"type": "tool_use", "id": "t_edit2", "name": "Edit", "input": {"file_path": format!("{repo_a_str}/src/engine.rs"), "old_string": "b", "new_string": "c"}},
+                    {"type": "tool_use", "id": "t_beta", "name": "Bash", "input": {"command": format!("cd {repo_b_str} && cargo check")}}
+                ]
+            }
+        }),
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "timestamp": iso(t0 + 8500),
+            "toolUseResult": {"filePath": format!("{repo_a_str}/src/engine.rs"), "durationMs": 40},
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t_edit2", "content": "ok"}]}
+        }),
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "cl-adv-1",
+            "cwd": repo_a_str,
+            "timestamp": iso(t0 + 9500),
+            "toolUseResult": {"exitCode": 0, "durationMs": 900, "interrupted": true, "stdout": "ok"},
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t_beta", "content": "ok"}]}
+        }),
+        serde_json::json!({"type": "system", "subtype": "compact_boundary", "sessionId": "cl-adv-1", "timestamp": iso(t0 + 10000)}),
+        serde_json::json!({"type": "system", "subtype": "api_error", "sessionId": "cl-adv-1", "timestamp": iso(t0 + 10500)}),
+        serde_json::json!({
+            "type": "cost-state",
+            "sessionId": "cl-adv-1",
+            "timestamp": iso(t0 + 12000),
+            "totalCostUSD": 0.42,
+            "totalAPIDuration": 9500,
+            "totalAPIDurationWithoutRetries": 8000,
+            "totalLinesAdded": 18,
+            "totalLinesRemoved": 5
+        }),
+    ];
+    fs::write(
+        claude_root.join("proj/cl-adv-1.jsonl"),
+        claude_s1
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    // Claude subagent linked to cl-adv-1
+    let claude_sub = [serde_json::json!({
+        "type": "assistant",
+        "sessionId": "cl-adv-1",
+        "isSidechain": true,
+        "cwd": repo_a_str,
+        "timestamp": iso(t0 + 6000),
+        "message": {
+            "id": "sub1",
+            "model": "claude-haiku-4-5",
+            "usage": {"input_tokens": 500, "cache_creation_input_tokens": 500, "cache_read_input_tokens": 9000, "output_tokens": 100},
+            "content": [{"type": "text", "text": "done"}]
+        }
+    })];
+    fs::write(
+        claude_root.join("proj/subagents/agent-sub1.jsonl"),
+        claude_sub
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    // 2. Claude session 2: repeats `read:*.rs -> edit:*.rs -> cargo test` trajectory + edits engine.rs
+    let claude_s2 = [
+        serde_json::json!({
+            "type": "assistant",
+            "sessionId": "cl-adv-2",
+            "cwd": repo_a_str,
+            "timestamp": iso(t0 + 20_000),
+            "message": {
+                "id": "m21",
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 1500, "cache_creation_input_tokens": 500, "cache_read_input_tokens": 18000, "output_tokens": 250},
+                "content": [
+                    {"type": "tool_use", "id": "s2_r", "name": "Read", "input": {"file_path": format!("{repo_a_str}/src/engine.rs")}},
+                    {"type": "tool_use", "id": "s2_e", "name": "Edit", "input": {"file_path": format!("{repo_a_str}/src/engine.rs"), "old_string": "c", "new_string": "d"}},
+                    {"type": "tool_use", "id": "s2_t", "name": "Bash", "input": {"command": "cargo test"}}
+                ]
+            }
+        }),
+        serde_json::json!({"type": "user", "sessionId": "cl-adv-2", "cwd": repo_a_str, "timestamp": iso(t0 + 20_500), "message": {"content": [{"type": "tool_result", "tool_use_id": "s2_r", "content": "ok"}]}}),
+        serde_json::json!({"type": "user", "sessionId": "cl-adv-2", "cwd": repo_a_str, "timestamp": iso(t0 + 21_000), "message": {"content": [{"type": "tool_result", "tool_use_id": "s2_e", "content": "ok"}]}}),
+        serde_json::json!({"type": "user", "sessionId": "cl-adv-2", "cwd": repo_a_str, "timestamp": iso(t0 + 22_500), "toolUseResult": {"exitCode": 0, "durationMs": 1400, "stdout": "ok"}, "message": {"content": [{"type": "tool_result", "tool_use_id": "s2_t", "content": "ok"}]}}),
+    ];
+    fs::write(
+        claude_root.join("proj/cl-adv-2.jsonl"),
+        claude_s2
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    // 3. Codex session with item_completed exact durations, task_complete TTFT, token_count llm_calls,
+    // reasoning_output_tokens, ContextCompaction, turn_aborted, FileChange edit
+    let codex_adv = [
+        serde_json::json!({
+            "type": "session_meta",
+            "timestamp": iso(t0 + 30_000),
+            "payload": {"id": "cx-adv-1", "cwd": repo_a_str, "originator": "codex-cli", "source": "cli", "git": {"branch": "feat/perf"}}
+        }),
+        serde_json::json!({
+            "type": "turn_context",
+            "timestamp": iso(t0 + 30_100),
+            "payload": {"cwd": repo_a_str, "model": "gpt-5-codex", "reasoning_effort": "high"}
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "timestamp": iso(t0 + 31_000),
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "model_context_window": 200_000,
+                    "total_token_usage": {
+                        "input_tokens": 180_000,
+                        "cached_input_tokens": 150_000,
+                        "output_tokens": 4_000,
+                        "reasoning_output_tokens": 1_500
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 170_000,
+                        "cached_input_tokens": 150_000,
+                        "output_tokens": 4_000,
+                        "reasoning_output_tokens": 1_500
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": iso(t0 + 31_200),
+            "payload": {"type": "function_call", "call_id": "cx_cmd1", "name": "exec_command", "arguments": "{\"cmd\":\"cargo test\"}"}
+        }),
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": iso(t0 + 34_000),
+            "payload": {"type": "function_call_output", "call_id": "cx_cmd1", "output": "Exit code: 0\nall passed"}
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "timestamp": iso(t0 + 34_050),
+            "payload": {
+                "type": "item_completed",
+                "item": {"id": "cx_cmd1", "type": "CommandExecution", "started_at_ms": t0 + 31_200, "completed_at_ms": t0 + 33_900}
+            }
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "timestamp": iso(t0 + 34_500),
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "id": "fc_item_1",
+                    "type": "FileChange",
+                    "changes": [{"path": format!("{repo_a_str}/src/engine.rs"), "diff": "+line1\n+line2\n-old1"}]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "timestamp": iso(t0 + 34_800),
+            "payload": {"type": "item_completed", "item": {"type": "ContextCompaction"}}
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "timestamp": iso(t0 + 35_000),
+            "payload": {"type": "task_complete", "duration_ms": 4200, "time_to_first_token_ms": 620}
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "timestamp": iso(t0 + 36_000),
+            "payload": {"type": "turn_aborted"}
+        }),
+    ];
+    fs::write(
+        codex_root.join("2026/cx-adv.jsonl"),
+        codex_adv
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    // 4. Kimi session with cache_write + Read tool recorded in BOTH tool_calls and file_reads
+    let kimi_state = kimi_root.join("wd/k_sess/state.json");
+    fs::write(
+        &kimi_state,
+        serde_json::json!({"id": "k_sess", "cwd": repo_a_str, "createdAt": t0 + 40_000})
+            .to_string(),
+    )
+    .unwrap();
+    let kimi_wire = [
+        serde_json::json!({"type": "llm.request", "model": "kimi-k2", "thinkingEffort": "medium", "time": t0 + 40_100}),
+        serde_json::json!({"type": "context.append_loop_event", "event": {"type": "step.begin", "turnId": "0", "step": 1}, "time": t0 + 40_200}),
+        serde_json::json!({"type": "context.append_loop_event", "event": {"type": "tool.call", "toolCallId": "kr1", "name": "Read", "args": {"file_path": format!("{repo_a_str}/src/engine.rs")}}, "time": t0 + 40_300}),
+        serde_json::json!({"type": "context.append_loop_event", "event": {"type": "tool.result", "toolCallId": "kr1", "result": {"output": "pub fn run() {}"}}, "time": t0 + 40_400}),
+        serde_json::json!({"type": "usage.record", "model": "kimi-k2", "usage": {"inputOther": 1000, "inputCacheCreation": 3000, "inputCacheRead": 16000, "output": 200}, "time": t0 + 40_800}),
+    ];
+    fs::write(
+        kimi_root.join("wd/k_sess/agents/main/wire.jsonl"),
+        kimi_wire
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    // 5. Wrap spans.jsonl containing an unprefixed duplicate of cl-adv-1's `cargo test`
+    let spans_path = tmp.path().join("spans.jsonl");
+    fs::write(
+        &spans_path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ts": t0 + 5050,
+                "cwd": repo_a_str,
+                "session_id": "cl-adv-1",
+                "agent_kind": "claude-code",
+                "cmd": "cargo test",
+                "exit_code": 1,
+                "duration_ms": 2010,
+                "stdout_bytes": 40
+            })
+        ),
+    )
+    .unwrap();
+
+    let mut conn = open_db(&tmp.path().join("ledger.db")).unwrap();
+    let roots = AdapterRoots {
+        claude: vec![claude_root],
+        codex: vec![codex_root],
+        antigravity: vec![],
+        kimi: vec![kimi_root],
+        spans: spans_path,
+    };
+    let stats = sync_all(&mut conn, &roots, false).unwrap();
+    assert!(
+        stats.llm_calls_inserted >= 4,
+        "expected llm_calls persisted"
+    );
+
+    // Verify Claude session columns
+    let (cw, think, api_ms, retry_ms, comp, aborts, api_errs, la, lr): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT cache_write_tokens, thinking_tokens, api_duration_ms, api_retry_ms,
+                    compaction_count, aborted_turns, api_errors, lines_added, lines_removed
+             FROM sessions WHERE session_id = 'claude:cl-adv-1'",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(cw, 10_000);
+    assert_eq!(think, 1_200);
+    assert_eq!(api_ms, 9_500);
+    assert_eq!(retry_ms, 1_500);
+    assert_eq!(comp, 1);
+    assert_eq!(aborts, 1);
+    assert_eq!(api_errs, 1);
+    assert_eq!(la, 18);
+    assert_eq!(lr, 5);
+
+    // Verify Codex exact item_completed duration (2700ms), TTFT (620ms), reasoning tokens (1500), context window
+    let (cx_dur, cx_ttft, cx_think, cx_win, cx_comp): (i64, i64, i64, Option<i64>, i64) = conn
+        .query_row(
+            "SELECT s.api_duration_ms, s.ttft_ms_sum, s.thinking_tokens, s.context_window, s.compaction_count
+             FROM sessions s WHERE s.session_id = 'codex:cx-adv-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(cx_dur, 4200);
+    assert_eq!(cx_ttft, 620);
+    assert_eq!(cx_think, 1500);
+    assert_eq!(cx_win, Some(200_000));
+    assert_eq!(cx_comp, 1);
+    let cx_span_dur: Option<i64> = conn
+        .query_row(
+            "SELECT duration_ms FROM command_spans WHERE session_id = 'codex:cx-adv-1' AND cmd_template = 'cargo test'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cx_span_dur, Some(2700));
+
+    // Verify Kimi Read recorded in BOTH file_reads and tool_calls, and cache_write_tokens=3000
+    let k_cw: i64 = conn
+        .query_row(
+            "SELECT cache_write_tokens FROM sessions WHERE session_id = 'kimi:k_sess'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(k_cw, 3000);
+    let k_tc_reads: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tool_calls WHERE session_id = 'kimi:k_sess' AND tool_name = 'Read'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(k_tc_reads, 1);
+
+    // Verify cross-repo `cd beta-repo && cargo check` span is retained when analyzing beta-repo!
+    let range_14d = TimeRange::from_window(Some(14 * 86_400_000), "14d");
+    let beta_rep = analyze_repo(&conn, "github.com/acme/beta-repo", &range_14d, 10).unwrap();
+    assert_eq!(
+        beta_rep.kpis.total_commands, 1,
+        "cross-repo cd span must not be dropped"
+    );
+
+    // Verify alpha-repo report & patterns: wrap span deduplicated, latency/cost/context/outcomes populated,
+    // subagent rollup linked, model breakdown present, unified tool trajectory & file edit churn detected
+    let alpha_rep = analyze_repo(&conn, "github.com/acme/alpha-repo", &range_14d, 10).unwrap();
+    assert!(alpha_rep.kpis.estimated_cost_usd > 0.0);
+    assert!(alpha_rep.kpis.latency.total_api_wait_s > 0.0);
+    assert_eq!(alpha_rep.kpis.latency.avg_ttft_ms, Some(620));
+    assert_eq!(alpha_rep.kpis.context_health.total_compactions, 2);
+    assert_eq!(alpha_rep.kpis.outcomes.aborted_sessions, 2);
+    // 3 transcript `cargo test` runs (wrap duplicate must be deduplicated!)
+    let cargo_test = alpha_rep
+        .top_commands
+        .iter()
+        .find(|c| c.cmd_template == "cargo test")
+        .unwrap();
+    assert_eq!(cargo_test.runs, 3);
+
+    let alpha_pat =
+        analyze_cross_session_patterns(&conn, "github.com/acme/alpha-repo", &range_14d).unwrap();
+    let sub = alpha_pat
+        .subagent_rollup
+        .as_ref()
+        .expect("expected subagent_rollup");
+    assert_eq!(sub.linked_subagents, 1);
+    assert_eq!(sub.parent_sessions_with_children, 1);
+    assert!(
+        alpha_pat
+            .model_breakdown
+            .iter()
+            .any(|m| m.model == "claude-opus-4-6" && m.est_cost_usd > 0.0)
+    );
+    assert!(
+        alpha_pat
+            .tool_trajectories
+            .iter()
+            .any(|t| t.sequence.contains("read:*.rs") && t.sequence.contains("edit:*.rs")),
+        "expected unified read->edit->test trajectory, got: {:?}",
+        alpha_pat.tool_trajectories
+    );
+    let churn = alpha_pat
+        .file_edit_churn
+        .iter()
+        .find(|f| f.target_path.ends_with("engine.rs"))
+        .expect("expected engine.rs in file_edit_churn");
+    assert!(churn.edits >= 4);
+    assert!(churn.rework_cycles >= 1);
+
+    // Verify diff_repo populates by_harness and new metrics
+    let diff = diff_repo(&conn, "github.com/acme/alpha-repo", t0 + 25_000, "split").unwrap();
+    assert!(!diff.by_harness.is_empty());
+    assert!(diff.before.estimated_cost_usd > 0.0);
+
+    // Verify opening a legacy pre-upgrade ledger DB migrates cleanly without index errors
+    let legacy_path = tmp.path().join("legacy.db");
+    {
+        let raw_conn = rusqlite::Connection::open(&legacy_path).unwrap();
+        raw_conn
+            .execute_batch(
+                "CREATE TABLE sessions (
+                   session_id TEXT PRIMARY KEY,
+                   agent_kind TEXT NOT NULL,
+                   source_file TEXT NOT NULL,
+                   repo_id TEXT,
+                   started_at INTEGER
+                 );
+                 CREATE TABLE command_spans (
+                   span_id TEXT PRIMARY KEY,
+                   session_id TEXT,
+                   source_file TEXT NOT NULL,
+                   repo_id TEXT,
+                   turn_idx INTEGER NOT NULL DEFAULT 0,
+                   seq_idx INTEGER NOT NULL DEFAULT 0,
+                   started_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE file_reads (
+                   read_id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL,
+                   source_file TEXT NOT NULL,
+                   repo_id TEXT,
+                   started_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE tool_calls (
+                   call_id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL,
+                   source_file TEXT NOT NULL,
+                   repo_id TEXT,
+                   turn_idx INTEGER NOT NULL DEFAULT 0,
+                   started_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+    }
+    let migrated = open_db(&legacy_path).unwrap();
+    let has_parent: i64 = migrated
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'parent_session_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_parent, 1);
 }

@@ -1,6 +1,6 @@
 use crate::analyze::{
     CommandStat, FleetReport, InspectResult, Opportunity, RepoReport, analyze_fleet, analyze_repo,
-    format_compact, inspect_finding,
+    format_compact, format_duration_human, inspect_finding,
 };
 use crate::config::{AdapterRoots, TimeRange, parse_window_ms};
 use crate::ingest::sync_all;
@@ -161,12 +161,13 @@ struct HarnessRowSummary {
     commands: usize,
     tool_calls: usize,
     median_total_tokens: i64,
-    avg_uncached_tokens: i64,
+    est_cost_usd: f64,
     weighted_cache_hit: Option<f64>,
     avg_output_kb: f64,
     truncated_outputs: usize,
     truncated_sessions_pct: f64,
     median_tool_wait_s: f64,
+    avg_api_wait_s: Option<f64>,
     error_rate: f64,
     rebound_rate: f64,
     top_friction_cmds: Vec<String>,
@@ -223,23 +224,20 @@ impl App {
         let fleet = analyze_fleet(conn, &range, false)?;
 
         let mut repo_state = TableState::default();
-        let selected_idx = if let Some(target_id) = initial_repo_id {
-            fleet
-                .repos
-                .iter()
-                .position(|r| r.repo_id == target_id)
-                .or_else(|| {
+        let selected_idx =
+            if let Some(target_id) = initial_repo_id {
+                fleet.repos.iter().position(|r| r.repo_id == target_id).or(
                     if fleet.repos.is_empty() {
                         None
                     } else {
                         Some(0)
-                    }
-                })
-        } else if fleet.repos.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+                    },
+                )
+            } else if fleet.repos.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
         repo_state.select(selected_idx);
 
         let selected_repo = selected_idx
@@ -369,12 +367,13 @@ impl App {
                         commands: h.commands,
                         tool_calls: h.tool_calls,
                         median_total_tokens: h.median_total_tokens,
-                        avg_uncached_tokens: h.avg_uncached_tokens,
+                        est_cost_usd: h.est_cost_usd,
                         weighted_cache_hit: h.weighted_cache_hit,
                         avg_output_kb: h.avg_output_kb,
                         truncated_outputs: h.truncated_outputs,
                         truncated_sessions_pct: h.truncated_sessions_pct,
-                        median_tool_wait_s: h.median_tool_wait_s,
+                        median_tool_wait_s: h.median_tool_wall_s,
+                        avg_api_wait_s: h.avg_api_wait_s,
                         error_rate: h.error_rate,
                         rebound_rate: h.rebound_rate,
                         top_friction_cmds: h.top_friction_cmds.clone(),
@@ -437,17 +436,28 @@ impl App {
                     .sum::<f64>()
                     / ref_sess as f64)
                     .round() as i64;
-                let avg_uncached_tokens = (ref_slice
-                    .iter()
-                    .map(|h| h.avg_uncached_tokens as f64 * h.sessions as f64)
-                    .sum::<f64>()
-                    / ref_sess as f64)
-                    .round() as i64;
                 let median_tool_wait_s = ref_slice
                     .iter()
-                    .map(|h| h.median_tool_wait_s * h.sessions as f64)
+                    .map(|h| h.median_tool_wall_s * h.sessions as f64)
                     .sum::<f64>()
                     / ref_sess as f64;
+                let est_cost_usd: f64 = list.iter().map(|h| h.est_cost_usd).sum();
+                let api_pairs: Vec<(f64, usize)> = ref_slice
+                    .iter()
+                    .filter_map(|h| h.avg_api_wait_s.map(|v| (v, h.sessions)))
+                    .collect();
+                let avg_api_wait_s = if api_pairs.is_empty() {
+                    None
+                } else {
+                    let tot_s: usize = api_pairs.iter().map(|(_, s)| *s).sum::<usize>().max(1);
+                    Some(
+                        ((api_pairs.iter().map(|(v, s)| *v * (*s as f64)).sum::<f64>()
+                            / tot_s as f64)
+                            * 10.0)
+                            .round()
+                            / 10.0,
+                    )
+                };
                 let cache_pairs: Vec<(f64, usize)> = ref_slice
                     .iter()
                     .filter_map(|h| h.weighted_cache_hit.map(|r| (r, h.sessions)))
@@ -490,12 +500,13 @@ impl App {
                     commands,
                     tool_calls,
                     median_total_tokens,
-                    avg_uncached_tokens,
+                    est_cost_usd: (est_cost_usd * 100.0).round() / 100.0,
                     weighted_cache_hit,
                     avg_output_kb: (weighted_out_kb * 10.0).round() / 10.0,
                     truncated_outputs,
                     truncated_sessions_pct: (trunc_sess_pct * 10.0).round() / 10.0,
                     median_tool_wait_s: (median_tool_wait_s * 10.0).round() / 10.0,
+                    avg_api_wait_s,
                     error_rate: weighted_err,
                     rebound_rate: weighted_rebound,
                     top_friction_cmds: friction,
@@ -558,10 +569,10 @@ impl App {
             }
         }
 
-        // 3. Failing MCP tools for this harness not already surfaced as an Opportunity
+        // 3. Failing MCP tools for this harness (skip single-occurrence blips) not already surfaced
         if let Some(pat) = &self.selected_patterns {
             for t in &pat.top_mcp_errors {
-                if t.error_count == 0 && t.truncated_count < 8 {
+                if t.error_count < 2 && t.truncated_count < 8 {
                     continue;
                 }
                 if !agent_kind.is_empty() && !t.by_harness.contains_key(agent_kind) {
@@ -655,12 +666,10 @@ impl App {
 
         let idx = keep_repo_id
             .and_then(|id| self.fleet.repos.iter().position(|r| r.repo_id == id))
-            .or_else(|| {
-                if self.fleet.repos.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                }
+            .or(if self.fleet.repos.is_empty() {
+                None
+            } else {
+                Some(0)
             });
         self.repo_state.select(idx);
         self.reload_selected_repo(conn)?;
@@ -1077,17 +1086,7 @@ pub fn run_tui(
 // ---------------------------------------------------------------------------
 
 pub fn format_duration(secs: f64) -> String {
-    if secs < 0.05 {
-        "0s".to_string()
-    } else if secs < 1.0 {
-        format!("{:.0}ms", secs * 1000.0)
-    } else if secs < 60.0 {
-        format!("{secs:.1}s")
-    } else if secs < 3600.0 {
-        format!("{:.1}m", secs / 60.0)
-    } else {
-        format!("{:.1}h", secs / 3600.0)
-    }
+    format_duration_human(secs)
 }
 
 fn format_int(n: usize) -> String {
@@ -1194,93 +1193,29 @@ fn harness_bar_lines(counts: &BTreeMap<String, usize>, bar_width: usize) -> Vec<
         .collect()
 }
 
-fn human_problem(kind: &str) -> (&'static str, Color, &'static str) {
+fn human_problem(kind: &str) -> (&'static str, Color) {
     match kind {
-        "broken_task_error_rate" => (
-            "High fail rate",
-            Color::Red,
-            "Command fails frequently and forces retries.",
-        ),
-        "lossy_task_rebound" => (
-            "Shell fallback",
-            Color::Red,
-            "CLI output is missing info, forcing raw shell follow-ups.",
-        ),
-        "flag_thrash" => (
-            "Flag guessing",
-            Color::Red,
-            "Agent repeatedly tries invalid CLI flags or arguments.",
-        ),
-        "tool_friction" => (
-            "Tool errors",
-            Color::Red,
-            "Non-shell or MCP tool calls fail or return truncated output.",
-        ),
-        "polling_tax" => (
-            "Polling loop",
-            Color::Yellow,
-            "Repeated status checks in a loop instead of blocking/waiting.",
-        ),
-        "slow_task_latency" => (
-            "Slow wait",
-            Color::Yellow,
-            "High cumulative wall-clock wait time across sessions.",
-        ),
-        "state_dir_bypass" => (
-            "State scraping",
-            Color::Yellow,
-            "Reads internal state files directly instead of using a CLI.",
-        ),
-        "output_filtering_tax" => (
-            "Noisy output",
-            Color::Yellow,
-            "Agents pipe output through grep/tail/sed to strip clutter.",
-        ),
-        "noisy_task_output" => (
-            "Verbose output",
-            Color::Yellow,
-            "Runs dump oversized stdout payloads into model context.",
-        ),
-        "repeated_file_reread" => (
-            "File re-reads",
-            Color::Yellow,
-            "Same file is re-read repeatedly across sessions.",
-        ),
-        "context_handoff_bloat" => (
-            "Handoff bloat",
-            Color::Yellow,
-            "Continued/handoff threads burn much more context than fresh ones.",
-        ),
-        "low_cache_efficiency" => (
-            "Low cache hit",
-            Color::Yellow,
-            "Prompt cache hit rate is low, multiplying uncached token cost.",
-        ),
-        "orientation_tax" => (
-            "Startup reads",
-            Color::Cyan,
-            "Heavy directory/doc discovery in turns 1–3 of sessions.",
-        ),
-        "cli_help_tax" => (
-            "Repeated --help",
-            Color::Cyan,
-            "Agents keep calling --help to rediscover CLI syntax.",
-        ),
-        "missing_composite_task" => (
-            "Manual workflow",
-            Color::Cyan,
-            "Multi-step command chain repeated manually across sessions.",
-        ),
-        "harness_divergence" => (
-            "Harness gap",
-            Color::Cyan,
-            "One agent harness hits this friction far more often than others.",
-        ),
-        _ => (
-            "Friction signal",
-            Color::Cyan,
-            "Recurring friction hotspot detected across sessions.",
-        ),
+        "broken_task_error_rate" => ("High fail rate", Color::Red),
+        "lossy_task_rebound" => ("Shell fallback", Color::Red),
+        "flag_thrash" => ("Flag guessing", Color::Red),
+        "tool_friction" => ("Tool errors", Color::Red),
+        "polling_tax" => ("Polling loop", Color::Yellow),
+        "slow_task_latency" => ("Slow wait", Color::Yellow),
+        "state_dir_bypass" => ("State scraping", Color::Yellow),
+        "output_filtering_tax" => ("Noisy output", Color::Yellow),
+        "noisy_task_output" => ("Verbose output", Color::Yellow),
+        "repeated_file_reread" => ("File re-reads", Color::Yellow),
+        "truncated_output_reread" => ("Spill re-reads", Color::Yellow),
+        "file_edit_churn" => ("Edit churn", Color::Yellow),
+        "context_handoff_bloat" => ("Handoff bloat", Color::Yellow),
+        "context_pressure" => ("Context pressure", Color::Yellow),
+        "session_abort_rate" => ("High aborts", Color::Red),
+        "low_cache_efficiency" => ("Low cache hit", Color::Yellow),
+        "orientation_tax" => ("Startup reads", Color::Cyan),
+        "cli_help_tax" => ("Repeated --help", Color::Cyan),
+        "missing_composite_task" => ("Manual workflow", Color::Cyan),
+        "harness_divergence" => ("Harness gap", Color::Cyan),
+        _ => ("Friction signal", Color::Cyan),
     }
 }
 
@@ -1357,54 +1292,61 @@ fn dominant_harness_label(counts: &BTreeMap<String, usize>) -> String {
     }
 }
 
-/// Plain-English headline for any repo or harness issue (never raw telemetry kind + truncated target).
+/// Concise, plain-English headline that keeps the distinguishing target visible in narrow lists.
 fn insight_headline(o: &Opportunity) -> String {
     match o.kind.as_str() {
         "polling_tax" => match o.target.as_str() {
-            "codex-wait" => "Codex PTY polling loop (codex-wait)".to_string(),
+            "codex-wait" => "Codex PTY polling (codex-wait)".to_string(),
             "codex-wait --spin" => "Codex tight-spin wait loop".to_string(),
-            "codex-write-stdin" => "Codex interactive stdin polling".to_string(),
-            t => format!("Polling loop on `{t}`"),
+            "codex-write-stdin" => "Codex stdin polling loop".to_string(),
+            t => format!("Polling: {t}"),
         },
         "slow_task_latency" => match o.target.as_str() {
-            "codex-wait" => "Long Codex PTY waits (codex-wait)".to_string(),
-            "codex-write-stdin" => "Slow Codex interactive stdin waits".to_string(),
-            t => format!("Slow command: `{t}`"),
+            "codex-wait" => "Slow Codex PTY waits".to_string(),
+            "codex-write-stdin" => "Slow Codex stdin waits".to_string(),
+            t => format!("Slow: {t}"),
         },
-        "lossy_task_rebound" => format!("Shell fallbacks after `{}`", o.target),
-        "state_dir_bypass" => format!("Scraping `{}` files directly", o.target),
-        "output_filtering_tax" => "Agents piping CLI output to tail/grep/sed".to_string(),
-        "noisy_task_output" => format!("Oversized stdout from `{}`", o.target),
-        "cli_help_tax" => "Repeated `--help` flag lookups".to_string(),
-        "orientation_tax" => "Heavy startup discovery (turns 1–3)".to_string(),
-        "broken_task_error_rate" => format!("High failure rate on `{}`", o.target),
+        "lossy_task_rebound" => format!("Fallbacks: {}", o.target),
+        "state_dir_bypass" => {
+            let short_dir = o.target.strip_prefix("~/.local/").unwrap_or(&o.target);
+            format!("Scrape: {short_dir}")
+        }
+        "output_filtering_tax" => "CLI output piped to tail/grep/sed".to_string(),
+        "noisy_task_output" => format!("Verbose: {}", o.target),
+        "cli_help_tax" => "Repeated --help lookups".to_string(),
+        "orientation_tax" => "Heavy startup reads (turns 1–3)".to_string(),
+        "broken_task_error_rate" => format!("Failing: {}", o.target),
         "flag_thrash" => {
             if let Some((from, to)) = o.target.split_once(" -> ") {
-                format!("Retry thrash: `{from}` → `{to}`")
+                format!("Retry: {from} → {to}")
             } else {
-                format!("Repeated retry failures on `{}`", o.target)
+                format!("Retries: {}", o.target)
             }
         }
         "tool_friction" => {
             let errs = ev_u64(o, "errors").unwrap_or(0);
             let tool = clean_tool_label(&o.target);
             if errs >= 3 {
-                format!("Tool error: {tool}")
+                tool
             } else {
                 format!("Truncated: {tool}")
             }
         }
-        "repeated_file_reread" => format!("Repeatedly re-reading `{}`", o.target),
+        "repeated_file_reread" => format!("Re-reads: {}", o.target),
+        "truncated_output_reread" => format!("Spill reads: {}", o.target),
+        "file_edit_churn" => format!("Edit churn: {}", o.target),
+        "context_pressure" => "Context window pressure & compactions".to_string(),
+        "session_abort_rate" => "High aborted / interrupted session rate".to_string(),
         "context_handoff_bloat" => {
             let m = ev_f64(o, "multiplier").unwrap_or(0.0);
-            format!("Resumed threads burn {m:.1}× more tokens")
+            format!("Resumed threads burn {m:.1}× tokens")
         }
         "low_cache_efficiency" => {
             let ag = o
                 .target
                 .strip_suffix(" cache hit rate")
                 .unwrap_or(&o.target);
-            format!("Low prompt cache hit on {}", short_harness(ag))
+            format!("Low cache hit: {}", short_harness(ag))
         }
         "harness_divergence" => {
             if let (Some(metric), Some(top), Some(low)) = (
@@ -1413,7 +1355,7 @@ fn insight_headline(o: &Opportunity) -> String {
                 ev_str(o, "low_harness"),
             ) {
                 format!(
-                    "{} hits {metric} far more than {}",
+                    "{} > {} on {metric}",
                     short_harness(top),
                     short_harness(low)
                 )
@@ -1421,12 +1363,12 @@ fn insight_headline(o: &Opportunity) -> String {
                 format!("Harness gap: {}", o.target)
             }
         }
-        "missing_composite_task" => format!("Repeated workflow: {}", o.target),
+        "missing_composite_task" => format!("Loop: {}", o.target),
         _ => o.target.clone(),
     }
 }
 
-/// Dynamic, plain-English 2–3 sentence explanation of WHAT is happening and WHY it hurts.
+/// Concise, data-backed plain-English explanation of what is actually happening.
 fn insight_story(o: &Opportunity) -> Vec<String> {
     let who = dominant_harness_label(&o.by_harness);
     match o.kind.as_str() {
@@ -1436,60 +1378,36 @@ fn insight_story(o: &Opportunity) -> Vec<String> {
             let avg = ev_f64(o, "avg_calls_per_session").unwrap_or(0.0);
             let max_c = ev_u64(o, "max_calls_in_one_session").unwrap_or(0);
             let wait = ev_f64(o, "total_wait_s").unwrap_or(0.0);
-            if o.target.starts_with("codex-wait") {
-                vec![
-                    format!(
-                        "Codex is polling a background/PTY command in a loop ({avg:.1}×/session, up to {max_c}× in one session) instead of letting the command block until completion."
-                    ),
-                    format!(
-                        "Burned {} total wait across {} polling calls in {sess} sessions — each poll adds an extra model turn and re-sends context.",
-                        format_duration(wait),
-                        format_int(calls)
-                    ),
-                ]
-            } else if o.target == "codex-write-stdin" {
-                vec![
-                    format!(
-                        "Codex is sending repeated `write_stdin` polls to an interactive shell session ({avg:.1}×/session, max {max_c}×) to check if a running command finished."
-                    ),
-                    format!(
-                        "Spent {} across {} calls in {sess} sessions — usually triggered by long-running commands that don't finish within a single exec timeout.",
-                        format_duration(wait),
-                        format_int(calls)
-                    ),
-                ]
-            } else {
-                vec![
-                    format!(
-                        "Agents call `{}` repeatedly in a loop ({avg:.1}×/session avg, worst session: {max_c}×) across {sess} sessions ({who}).",
-                        o.target
-                    ),
-                    format!(
-                        "Spent {} across {} calls waiting on status checks instead of blocking once or receiving a completion signal.",
-                        format_duration(wait),
-                        format_int(calls)
-                    ),
-                ]
-            }
+            let subject = match o.target.as_str() {
+                "codex-wait" | "codex-wait --spin" => {
+                    "Codex is polling a background PTY command in a loop instead of blocking"
+                        .to_string()
+                }
+                "codex-write-stdin" => {
+                    "Codex is polling an interactive shell via `write_stdin` to check completion"
+                        .to_string()
+                }
+                t => format!("Agents poll `{t}` in a loop ({who}) instead of waiting once"),
+            };
+            vec![format!(
+                "{subject} — {avg:.1}×/session (max {max_c}×), burning {} across {} calls in {sess} sessions.",
+                format_duration(wait),
+                format_int(calls)
+            )]
         }
         "slow_task_latency" => {
             let runs = ev_u64(o, "runs").unwrap_or(0) as usize;
             let wait = ev_f64(o, "total_wait_s").unwrap_or(0.0);
             let p50 = ev_f64(o, "p50_wait_s").unwrap_or(0.0);
             let p95 = ev_f64(o, "p95_wait_s").unwrap_or(0.0);
-            vec![
-                format!(
-                    "`{}` blocked agents for {} total across {} runs ({who}).",
-                    o.target,
-                    format_duration(wait),
-                    format_int(runs)
-                ),
-                format!(
-                    "Typical run takes {} (slowest 5% take {}+) — long waits trigger polling loops, timeouts, and retries.",
-                    format_duration(p50),
-                    format_duration(p95)
-                ),
-            ]
+            vec![format!(
+                "`{}` blocked agents for {} across {} runs ({who}) — typical run takes {}, slowest 5% take {}+.",
+                o.target,
+                format_duration(wait),
+                format_int(runs),
+                format_duration(p50),
+                format_duration(p95)
+            )]
         }
         "lossy_task_rebound" => {
             let count = ev_u64(o, "rebound_count").unwrap_or(0) as usize;
@@ -1497,22 +1415,17 @@ fn insight_story(o: &Opportunity) -> Vec<String> {
             let rate = ev_f64(o, "rebound_rate").unwrap_or(0.0) * 100.0;
             let sess = ev_u64(o, "sessions").unwrap_or(0);
             let follows = ev_str_list(o, "top_fallback_cmds");
-            let follow_txt = if follows.is_empty() {
+            let via = if follows.is_empty() {
                 "raw shell commands".to_string()
             } else {
                 follows.into_iter().take(2).collect::<Vec<_>>().join(", ")
             };
-            vec![
-                format!(
-                    "{rate:.0}% of `{}` runs ({}/{}) across {sess} sessions are immediately followed by shell exploration ({follow_txt}).",
-                    o.target,
-                    format_int(count),
-                    format_int(runs)
-                ),
-                format!(
-                    "Happens in {who} — either the CLI output omits a detail agents need next, or it truncates key pointers."
-                ),
-            ]
+            vec![format!(
+                "{rate:.0}% of `{}` runs ({}/{}) across {sess} sessions ({who}) are immediately followed by {via}.",
+                o.target,
+                format_int(count),
+                format_int(runs)
+            )]
         }
         "state_dir_bypass" => {
             let reads = ev_u64(o, "direct_reads").unwrap_or(0) as usize;
@@ -1524,68 +1437,49 @@ fn insight_story(o: &Opportunity) -> Vec<String> {
             } else {
                 cmds.into_iter().take(2).collect::<Vec<_>>().join(", ")
             };
-            vec![
-                format!(
-                    "Instead of using a repo CLI, agents read raw internal files under `{}` {} times across {sess} sessions ({who}).",
-                    o.target,
-                    format_int(reads)
-                ),
-                format!(
-                    "Done via {via} ({} stdout tokens) — a clear signal that an inspection or log-tail subcommand is missing or hard to find.",
-                    format_compact(toks)
-                ),
-            ]
+            vec![format!(
+                "Agents read raw state files under `{}` {} times across {sess} sessions ({who}) via {via} ({} stdout tokens) instead of a repo CLI.",
+                o.target,
+                format_int(reads),
+                format_compact(toks)
+            )]
         }
         "output_filtering_tax" => {
             let n = ev_u64(o, "total_piped_cli_calls").unwrap_or(0) as usize;
-            vec![
-                format!(
-                    "Agents manually piped repo CLI output through tail/grep/sed {} times ({who}) to cut through noise.",
-                    format_int(n)
-                ),
-                "Pipe-stripping wastes turns, hides exit codes (without pipefail), and shows the CLI's default output is too verbose or unformatted.".to_string(),
-            ]
+            vec![format!(
+                "Agents piped repo CLI stdout through tail/grep/sed {} times ({who}) to strip noise or bound output.",
+                format_int(n)
+            )]
         }
         "noisy_task_output" => {
             let runs = ev_u64(o, "runs").unwrap_or(0) as usize;
             let p50 = ev_u64(o, "p50_stdout_tokens").unwrap_or(0) as i64;
             let eff = ev_u64(o, "effective_context_tokens").unwrap_or(0) as i64;
             let noise = ev_str(o, "dominant_noise").unwrap_or("verbose_stdout");
-            vec![
-                format!(
-                    "`{}` dumps ~{} tokens/run (p50) of `{noise}` across {} runs ({who}).",
-                    o.target,
-                    format_compact(p50),
-                    format_int(runs)
-                ),
-                format!(
-                    "Because every subsequent turn re-reads that stdout in context, it accounts for ~{} effective context tokens.",
-                    format_compact(eff)
-                ),
-            ]
+            vec![format!(
+                "`{}` emits ~{} tokens/run (p50, `{noise}`) across {} runs ({who}) — ~{} effective context tokens after downstream turn replay.",
+                o.target,
+                format_compact(p50),
+                format_int(runs),
+                format_compact(eff)
+            )]
         }
         "broken_task_error_rate" => {
             let errs = ev_u64(o, "errors").unwrap_or(0);
             let runs = ev_u64(o, "runs").unwrap_or(0);
             let rate = ev_f64(o, "error_rate").unwrap_or(0.0) * 100.0;
-            vec![
-                format!(
-                    "Repo task `{}` exited nonzero on {errs} of {runs} runs ({rate:.0}% failure rate, {who}).",
-                    o.target
-                ),
-                "High failure rates force blind retries, shell workarounds, and extra turns debugging tooling instead of product code.".to_string(),
-            ]
+            vec![format!(
+                "Repo task `{}` failed on {errs} of {runs} runs ({rate:.0}% error rate, {who}).",
+                o.target
+            )]
         }
         "flag_thrash" => {
             let occ = ev_u64(o, "occurrences").unwrap_or(0);
             let sess = ev_u64(o, "sessions").unwrap_or(0);
-            vec![
-                format!(
-                    "Agents failed and retried `{}` {occ} times across {sess} sessions ({who}) before getting a successful exit.",
-                    o.target
-                ),
-                "Usually caused by unintuitive CLI flags, missing prerequisite checks, or vague error messages.".to_string(),
-            ]
+            vec![format!(
+                "Agents failed and retried `{}` {occ} times across {sess} sessions ({who}) before getting exit 0.",
+                o.target
+            )]
         }
         "tool_friction" => {
             let calls = ev_u64(o, "calls").unwrap_or(0);
@@ -1596,21 +1490,13 @@ fn insight_story(o: &Opportunity) -> Vec<String> {
             let avg_kb = ev_f64(o, "avg_output_kb").unwrap_or(0.0);
             let tool = clean_tool_label(&o.target);
             if errs >= 3 {
-                vec![
-                    format!(
-                        "Tool `{tool}` failed on {errs} of {calls} calls ({err_rate:.0}% error rate) across {sess} sessions ({who})."
-                    ),
-                    format!(
-                        "Average payload is {avg_kb:.1} KB ({trunc} truncated) — failed tool calls stall the agent loop and often trigger shell fallbacks."
-                    ),
-                ]
+                vec![format!(
+                    "Tool `{tool}` failed on {errs}/{calls} calls ({err_rate:.0}% error rate, {trunc} truncated, avg {avg_kb:.1} KB) across {sess} sessions ({who})."
+                )]
             } else {
-                vec![
-                    format!(
-                        "Tool `{tool}` returned truncated output on {trunc} of {calls} calls (avg {avg_kb:.1} KB) across {sess} sessions ({who})."
-                    ),
-                    "Oversized tool payloads lose critical details at the cut-off and force repeated follow-up calls.".to_string(),
-                ]
+                vec![format!(
+                    "Tool `{tool}` had {trunc}/{calls} outputs truncated (avg {avg_kb:.1} KB) across {sess} sessions ({who})."
+                )]
             }
         }
         "context_handoff_bloat" => {
@@ -1619,26 +1505,20 @@ fn insight_story(o: &Opportunity) -> Vec<String> {
             let h_tok = ev_u64(o, "handoff_avg_tokens").unwrap_or(0) as i64;
             let f_tok = ev_u64(o, "fresh_avg_tokens").unwrap_or(0) as i64;
             let mult = ev_f64(o, "multiplier").unwrap_or(0.0);
-            vec![
-                format!(
-                    "{hs} continued/handoff threads averaged {} tokens vs {} for {fs} fresh sessions ({mult:.1}× heavier, {who}).",
-                    format_compact(h_tok),
-                    format_compact(f_tok)
-                ),
-                "Carrying a huge compacted thread history into new tasks multiplies token burn on every single turn.".to_string(),
-            ]
+            vec![format!(
+                "{hs} resumed/handoff threads averaged {} tokens vs {} for {fs} fresh threads ({mult:.1}× heavier, {who}).",
+                format_compact(h_tok),
+                format_compact(f_tok)
+            )]
         }
         "low_cache_efficiency" => {
             let sess = ev_u64(o, "sessions").unwrap_or(0);
             let rate = ev_f64(o, "weighted_cache_hit").unwrap_or(0.0) * 100.0;
             let uncached = ev_u64(o, "uncached_input_tokens").unwrap_or(0) as i64;
-            vec![
-                format!(
-                    "Prompt cache hit rate is only {rate:.1}% across {sess} main sessions ({who}), leaving {} input tokens uncached.",
-                    format_compact(uncached)
-                ),
-                "Dynamic prompt prefixes, tool-list churn, or long pauses past cache TTL break prefix reuse and inflate cost/latency.".to_string(),
-            ]
+            vec![format!(
+                "Weighted prompt cache hit is {rate:.1}% across {sess} main sessions ({who}), leaving {} input tokens uncached.",
+                format_compact(uncached)
+            )]
         }
         "harness_divergence" => {
             let metric = ev_str(o, "metric").unwrap_or("this behavior");
@@ -1651,61 +1531,44 @@ fn insight_story(o: &Opportunity) -> Vec<String> {
             let tr = ev_f64(o, "top_rate").unwrap_or(0.0);
             let lr = ev_f64(o, "low_rate").unwrap_or(0.0);
             let cnt = ev_u64(o, "top_count").unwrap_or(0);
-            vec![
-                format!(
-                    "`{top}` triggers {metric} at {tr:.1}/1k commands ({cnt}×) vs {lr:.1}/1k in `{low}` on the exact same repository."
-                ),
-                format!(
-                    "Because `{low}` avoids this on the same codebase, the cause is almost certainly `{top}`'s harness config, instructions, or output/shell behavior."
-                ),
-            ]
+            vec![format!(
+                "`{top}` triggers {metric} at {tr:.1}/1k commands ({cnt}×) vs {lr:.1}/1k in `{low}` on the same repo — pointing to `{top}`'s harness config or prompt/output rules."
+            )]
         }
         "orientation_tax" => {
             let cmds = ev_u64(o, "early_commands").unwrap_or(0);
             let docs = ev_u64(o, "early_doc_reads").unwrap_or(0);
-            vec![
-                format!(
-                    "Agents spend turns 1–3 running {cmds} discovery commands and {docs} doc reads ({who}) just to orient themselves."
-                ),
-                "Missing project map, buried entrypoints, or scattered docs force every new session to pay the same ramp-up tax.".to_string(),
-            ]
+            vec![format!(
+                "Sessions spend turns 1–3 running {cmds} discovery commands and {docs} doc reads ({who}) to locate files and commands."
+            )]
         }
         "cli_help_tax" => {
             let calls = ev_u64(o, "help_calls").unwrap_or(0);
             let broken = ev_u64(o, "broken_help_calls").unwrap_or(0);
-            vec![
-                format!(
-                    "Agents invoked `--help` {calls} times ({broken} exited nonzero, {who}) trying to figure out repo CLI syntax."
-                ),
-                "Documenting the 5–10 most common invocations (and fixing broken `--help` exits) removes these discovery turns.".to_string(),
-            ]
+            vec![format!(
+                "Agents ran `--help` {calls} times ({broken} nonzero exits, {who}) rediscovering repo CLI syntax."
+            )]
         }
         "repeated_file_reread" => {
             let reads = ev_u64(o, "reads").unwrap_or(0);
             let sess = ev_u64(o, "sessions").unwrap_or(0);
             let max_r = ev_u64(o, "max_reads_in_session").unwrap_or(0);
             let toks = ev_u64(o, "total_tokens").unwrap_or(0) as i64;
-            vec![
-                format!(
-                    "`{}` was read {reads} times across {sess} sessions (up to {max_r}× in one session, {} tokens, {who}).",
-                    o.target,
-                    format_compact(toks)
-                ),
-                "Large monolith files or unindexed docs get re-read over and over whenever context trims or agents double-check symbols.".to_string(),
-            ]
+            vec![format!(
+                "`{}` was read {reads} times across {sess} sessions (up to {max_r}×/session, {} tokens, {who}).",
+                o.target,
+                format_compact(toks)
+            )]
         }
         "missing_composite_task" => {
             let occ = ev_u64(o, "occurrences").unwrap_or(0);
             let sess = ev_u64(o, "sessions").unwrap_or(0);
             let wait = ev_f64(o, "combined_wait_s").unwrap_or(0.0);
-            vec![
-                format!(
-                    "Agents manually chain `{}` {occ} times across {sess} sessions ({} total wait, {who}).",
-                    o.target,
-                    format_duration(wait)
-                ),
-                "Each manual hand-off costs an extra model round-trip; a single composite task or richer first step eliminates the hop.".to_string(),
-            ]
+            vec![format!(
+                "Agents manually chain `{}` {occ} times across {sess} sessions ({} total wait, {who}).",
+                o.target,
+                format_duration(wait)
+            )]
         }
         _ => vec![o.impact_summary.clone()],
     }
@@ -1815,6 +1678,18 @@ fn compact_opp_metric(o: &Opportunity) -> String {
         "repeated_file_reread" => {
             let n = ev_u64(o, "reads").unwrap_or(0);
             format!("{} re-reads", format_int(n as usize))
+        }
+        "file_edit_churn" => {
+            let n = ev_u64(o, "edits").unwrap_or(0);
+            format!("{} edits", format_int(n as usize))
+        }
+        "context_pressure" => {
+            let c = ev_u64(o, "total_compactions").unwrap_or(0);
+            format!("{c} compactions")
+        }
+        "session_abort_rate" => {
+            let r = ev_f64(o, "abort_rate").unwrap_or(0.0) * 100.0;
+            format!("{r:.0}% aborted")
         }
         "context_handoff_bloat" => {
             let m = ev_f64(o, "multiplier").unwrap_or(0.0);
@@ -2120,7 +1995,7 @@ fn render_opportunity_diagnosis(
     focused: bool,
 ) {
     let o = &item.primary;
-    let (_, sev_col, _) = human_problem(&o.kind);
+    let (_, sev_col) = human_problem(&o.kind);
     let headline = insight_headline(o);
     let (scope_badge, scope_col) = if o.scope == "harness" {
         ("AGENT RUNTIME", Color::LightBlue)
@@ -2160,7 +2035,7 @@ fn render_opportunity_diagnosis(
             .related
             .iter()
             .map(|r| {
-                let (rl, _, _) = human_problem(&r.kind);
+                let (rl, _) = human_problem(&r.kind);
                 let m = compact_opp_metric(r);
                 format!("{rl} ({m})")
             })
@@ -2289,10 +2164,12 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         ])
         .split(rows[0]);
 
-    let repo_cnt = repo.opportunities.len();
-    let harn_cnt = repo.harness_overhead.len();
-    let top_issue_hint = app
-        .visible_insights()
+    let merged = app.visible_insights();
+    let repo_refs: Vec<&Opportunity> = repo.opportunities.iter().collect();
+    let harn_refs: Vec<&Opportunity> = repo.harness_overhead.iter().collect();
+    let repo_cnt = merge_opportunities(&repo_refs).len();
+    let harn_cnt = merge_opportunities(&harn_refs).len();
+    let top_issue_hint = merged
         .first()
         .map(|m| format!("Top: {}", primary_metric_for(m)))
         .unwrap_or_else(|| "No major bottlenecks".into());
@@ -2320,27 +2197,45 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
     ])
     .block(rounded_block(" Bottlenecks Found ", false));
 
+    let wait_sub = if k.latency.total_api_wait_s > 0.0 {
+        format!(
+            "API {} · med {}/sess",
+            format_duration(k.latency.total_api_wait_s),
+            format_duration(k.median_tool_wait_s)
+        )
+    } else {
+        format!("{} median / session", format_duration(k.median_tool_wait_s))
+    };
     let card2 = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                format_duration(k.total_tool_wait_s),
+                format_duration(k.latency.total_tool_wall_s),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" total wait", Style::default().fg(Color::Gray)),
+            Span::styled(
+                if k.latency.tool_parallelism_ratio > 1.05 {
+                    format!(" tool wall ({:.1}×)", k.latency.tool_parallelism_ratio)
+                } else {
+                    " tool wait".to_string()
+                },
+                Style::default().fg(Color::Gray),
+            ),
         ]),
-        Line::from(Span::styled(
-            format!("{} median / session", format_duration(k.median_tool_wait_s)),
-            Style::default().fg(Color::Gray),
-        )),
+        Line::from(Span::styled(wait_sub, Style::default().fg(Color::Gray))),
     ])
     .block(rounded_block(" Time Waiting ", false));
 
     let cache_str = k
         .cache_hit_rate
         .map(|v| format!("{:.0}% cache", v * 100.0))
-        .unwrap_or_else(|| "no cache data".into());
+        .unwrap_or_else(|| "no cache".into());
+    let cost_str = if k.estimated_cost_usd > 0.0 {
+        format!("~${:.2} est", k.estimated_cost_usd)
+    } else {
+        format!("{} stdout", format_compact(k.total_stdout_tokens))
+    };
     let card3 = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -2352,14 +2247,11 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(" med uncached", Style::default().fg(Color::Gray)),
         ]),
         Line::from(Span::styled(
-            format!(
-                "{cache_str} · {} stdout",
-                format_compact(k.total_stdout_tokens)
-            ),
+            format!("{cache_str} · {cost_str}"),
             Style::default().fg(Color::Gray),
         )),
     ])
-    .block(rounded_block(" Context & Cache ", false));
+    .block(rounded_block(" Context & Cost ", false));
 
     let err_col = if k.command_error_rate >= 0.10 {
         Color::Red
@@ -2400,7 +2292,6 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(card4, cards[3]);
 
     // 2. Master-Detail Layout (Side-by-Side on wide terminals, Stacked on narrow)
-    let merged = app.visible_insights();
     let side_by_side = rows[1].width >= 104;
     let panes = if side_by_side {
         Layout::default()
@@ -2472,7 +2363,7 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             .iter()
             .map(|item| {
                 let o = &item.primary;
-                let (_, sev_col, _) = human_problem(&o.kind);
+                let (_, sev_col) = human_problem(&o.kind);
                 let (tag, tag_col) = if o.scope == "harness" {
                     ("HARN", Color::LightBlue)
                 } else {
@@ -3259,6 +3150,12 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
     };
 
     let harness_rows = app.visible_harness_rows();
+    let mut issues_by_ag: HashMap<String, Vec<HarnessIssueItem>> = HashMap::new();
+    for hr in &harness_rows {
+        issues_by_ag
+            .entry(hr.agent_kind.clone())
+            .or_insert_with(|| app.issues_for_harness(&hr.agent_kind));
+    }
     let table_h = (harness_rows.len() as u16 + 4).clamp(6, (area.height / 3).max(6));
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -3272,7 +3169,10 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
     // 1. Auto-Synthesized Key Harness Takeaways
     let mut takeaway_lines: Vec<Line<'static>> = Vec::new();
     for hr in harness_rows.iter().take(2) {
-        let issues = app.issues_for_harness(&hr.agent_kind);
+        let issues = issues_by_ag
+            .get(&hr.agent_kind)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let short = short_harness(&hr.agent_kind);
         let hcol = harness_color(short);
         let cache_txt = hr
@@ -3362,7 +3262,7 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|h| {
             let short = short_harness(&h.agent_kind);
             let hcol = harness_color(short);
-            let issue_cnt = app.issues_for_harness(&h.agent_kind).len();
+            let issue_cnt = issues_by_ag.get(&h.agent_kind).map_or(0, Vec::len);
             let cache_cell = match h.weighted_cache_hit {
                 Some(r) => {
                     let ccol = if r >= 0.85 {
@@ -3489,7 +3389,10 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         .and_then(|i| harness_rows.get(i));
     let selected_ag = sel_h.map(|h| h.agent_kind.as_str()).unwrap_or("");
     let short_ag = short_harness(selected_ag);
-    let issues = app.issues_for_harness(selected_ag);
+    let issues = issues_by_ag
+        .get(selected_ag)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
 
     let iss_title = Line::from(vec![
         Span::styled(
@@ -3552,7 +3455,7 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             .iter()
             .map(|item| match item {
                 HarnessIssueItem::Opp(m) => {
-                    let (_, sev_col, _) = human_problem(&m.primary.kind);
+                    let (_, sev_col) = human_problem(&m.primary.kind);
                     let (tag, tag_col) = if m.primary.scope == "harness" {
                         ("HARN", Color::LightBlue)
                     } else {
@@ -3570,29 +3473,29 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
                         Cell::from(Line::from(primary_metric_for(m)).right_aligned()),
                     ])
                 }
-                HarnessIssueItem::McpTool(t) => Row::new(vec![
-                    Cell::from(Line::from(vec![
-                        Span::styled("● ", Style::default().fg(Color::Red)),
-                        Span::styled(
-                            "MCP ",
-                            Style::default()
-                                .fg(Color::LightMagenta)
-                                .add_modifier(Modifier::BOLD),
+                HarnessIssueItem::McpTool(t) => {
+                    let err_unit = if t.error_count == 1 { "err" } else { "errs" };
+                    Row::new(vec![
+                        Cell::from(Line::from(vec![
+                            Span::styled("● ", Style::default().fg(Color::Red)),
+                            Span::styled(
+                                "MCP ",
+                                Style::default()
+                                    .fg(Color::LightMagenta)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ])),
+                        Cell::from(truncate_ellipsis(&clean_tool_label(&t.tool_name), iss_w)),
+                        Cell::from(
+                            Line::from(format!(
+                                "{} {err_unit} ({:.0}%)",
+                                t.error_count,
+                                t.error_rate * 100.0
+                            ))
+                            .right_aligned(),
                         ),
-                    ])),
-                    Cell::from(truncate_ellipsis(
-                        &format!("Tool error: {}", clean_tool_label(&t.tool_name)),
-                        iss_w,
-                    )),
-                    Cell::from(
-                        Line::from(format!(
-                            "{} errs ({:.0}%)",
-                            t.error_count,
-                            t.error_rate * 100.0
-                        ))
-                        .right_aligned(),
-                    ),
-                ]),
+                    ])
+                }
             })
             .collect();
 
@@ -3643,8 +3546,11 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
                     format_int(h.tool_calls)
                 )));
                 profile_lines.push(Line::from(format!(
-                    "Avg uncached: {} · Fallback rate: {:.0}% · Avg output: {:.1} KB · Truncated: {} ({:.0}% sess)",
-                    format_compact(h.avg_uncached_tokens),
+                    "Est cost: ~${:.2}{} · Fallback rate: {:.0}% · Avg output: {:.1} KB · Truncated: {} ({:.0}% sess)",
+                    h.est_cost_usd,
+                    h.avg_api_wait_s
+                        .map(|v| format!(" · Avg API: {v:.1}s"))
+                        .unwrap_or_default(),
                     h.rebound_rate * 100.0,
                     h.avg_output_kb,
                     h.truncated_outputs,
@@ -4192,7 +4098,7 @@ fn draw_inspect_modal(frame: &mut Frame, area: Rect, res: &InspectResult, scroll
 
     let mut lines = Vec::new();
     if let Some(opp) = &res.opportunity {
-        let (_, sev_col, _) = human_problem(&opp.kind);
+        let (_, sev_col) = human_problem(&opp.kind);
         let headline = insight_headline(opp);
         let badge = if opp.scope == "harness" {
             "AGENT RUNTIME"
