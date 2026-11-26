@@ -1,12 +1,13 @@
 use crate::adapters::{
     ParsedFile, SpanBuildArgs, build_command_spans, clamp_tool_duration, detect_handoff_text,
-    detect_tool_error, detect_truncation, dominant_span_repo, extract_tool_error_preview,
-    flatten_content, make_id, normalize_tool_name, to_epoch_ms, walk_files,
+    detect_tool_error, detect_truncation, dominant_span_repo, extract_shell_file_read_paths,
+    extract_tool_error_preview, flatten_content, is_doc_path, make_id, normalize_tool_name,
+    to_epoch_ms, walk_files,
 };
 use crate::config::estimate_tokens_str;
-use crate::db::{SessionRecord, ToolCallRecord};
+use crate::db::{FileReadRecord, SessionRecord, ToolCallRecord};
 use crate::shell::{extract_duration_ms_from_text, extract_exit_code_from_text};
-use crate::workspace::{WorkspaceResolver, is_neutral_home_dir};
+use crate::workspace::{WorkspaceResolver, is_ephemeral_or_neutral_path, is_neutral_home_dir};
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
@@ -190,6 +191,7 @@ fn extract_codex_commands(
 
 struct PendingCall {
     cmds: Vec<String>,
+    extra_tools: Vec<String>,
     turn_idx: i64,
     ts: i64,
     cwd: Option<String>,
@@ -202,19 +204,65 @@ struct PendingToolCall {
     cwd: Option<String>,
 }
 
-/// Extract non-shell `tools.<name>(` helper invocations from Codex JS exec blocks.
-fn extract_js_tool_name(js: &str) -> Option<String> {
-    let idx = js.find("tools.")?;
-    let after = &js[idx + 6..];
-    let name: String = after
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    if name.is_empty() || matches!(name.as_str(), "exec_command" | "write_stdin") {
-        None
-    } else {
-        Some(name)
+/// Extract all distinct non-shell `tools.<name>(` helper invocations from Codex JS exec blocks.
+fn extract_all_js_tool_names(js: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(pos) = js[search_from..].find("tools.") {
+        let abs = search_from + pos + 6;
+        search_from = abs;
+        let name: String = js[abs..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if !name.is_empty()
+            && !matches!(name.as_str(), "exec_command" | "write_stdin")
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
     }
+    out
+}
+
+/// Extract per-command Codex chunk JSON objects (`{"chunk_id":...,"exit_code":...,"output":...}`)
+/// from an `exec` output string so shell spans do not inherit unrelated sibling MCP tool outputs.
+fn extract_codex_exec_chunks(text: &str) -> Vec<(String, Option<i64>, Option<i64>)> {
+    let mut chunks = Vec::new();
+    let mut push_from_val = |v: &Value| {
+        let obj = v.get("value").filter(|x| x.is_object()).unwrap_or(v);
+        if obj.get("chunk_id").is_some()
+            || (obj.get("exit_code").is_some() && obj.get("output").is_some())
+        {
+            let out = obj
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let ec = obj.get("exit_code").and_then(Value::as_i64);
+            let dur = obj
+                .get("wall_time_seconds")
+                .and_then(Value::as_f64)
+                .map(|s| (s * 1000.0).round() as i64);
+            chunks.push((out, ec, dur));
+        }
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if !(t.starts_with('{') || t.starts_with('[')) {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(t) {
+            if let Some(arr) = val.as_array() {
+                for item in arr {
+                    push_from_val(item);
+                }
+            } else {
+                push_from_val(&val);
+            }
+        }
+    }
+    chunks
 }
 
 pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Result<ParsedFile> {
@@ -231,6 +279,8 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     let mut started_at: Option<i64> = None;
     let mut ended_at: Option<i64> = None;
     let mut turn_count: i64 = 0;
+    let mut step_turn_idx: i64 = 0;
+    let mut saw_tool_output_since_step = false;
     let mut is_subagent = false;
     let mut originator: Option<String> = None;
     let mut subagent_kind: Option<String> = None;
@@ -248,6 +298,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     let mut pending: HashMap<String, PendingCall> = HashMap::new();
     let mut pending_tools: HashMap<String, PendingToolCall> = HashMap::new();
     let mut spans = Vec::new();
+    let mut file_reads = Vec::new();
     let mut tool_calls = Vec::new();
     let mut seq_idx: i64 = 0;
     let mut line_count: i64 = 0;
@@ -320,6 +371,8 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             }
             "turn_context" => {
                 turn_count += 1;
+                step_turn_idx += 1;
+                saw_tool_output_since_step = false;
                 if let Some(c) = payload.get("cwd").and_then(Value::as_str) {
                     cwd = Some(c.to_string());
                 }
@@ -328,6 +381,9 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                 {
                     model = Some(m.to_string());
                 }
+            }
+            "compacted" => {
+                is_handoff = true;
             }
             "token_usage_record" => {
                 // OpenAI/Codex `input_tokens` ALREADY includes `cached_input_tokens`; store uncached input in `input_tokens`
@@ -400,6 +456,9 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             }
             "response_item" => {
                 let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
+                if ptype == "compaction" {
+                    is_handoff = true;
+                }
                 if !first_user_seen
                     && ptype == "message"
                     && payload.get("role").and_then(Value::as_str) == Some("user")
@@ -413,6 +472,11 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                     }
                 }
                 if matches!(ptype, "function_call" | "custom_tool_call") {
+                    if step_turn_idx == 0 || saw_tool_output_since_step {
+                        step_turn_idx += 1;
+                        saw_tool_output_since_step = false;
+                    }
+                    let cur_turn = step_turn_idx.max(1);
                     if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
                         let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
                         let cmds = extract_codex_commands(
@@ -420,6 +484,16 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                             payload.get("arguments"),
                             payload.get("input"),
                         );
+                        let extra_tools = if name.eq_ignore_ascii_case("exec") {
+                            payload
+                                .get("input")
+                                .or_else(|| payload.get("arguments"))
+                                .and_then(Value::as_str)
+                                .map(extract_all_js_tool_names)
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         let call_ts = ts
                             .or(started_at)
                             .unwrap_or_else(|| Utc::now().timestamp_millis());
@@ -428,18 +502,17 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                                 call_id.to_string(),
                                 PendingCall {
                                     cmds,
-                                    turn_idx: turn_count.max(1),
+                                    extra_tools,
+                                    turn_idx: cur_turn,
                                     ts: call_ts,
                                     cwd: cwd.clone(),
                                 },
                             );
                         } else if !name.is_empty() {
                             let resolved_tool = if name.eq_ignore_ascii_case("exec") {
-                                payload
-                                    .get("input")
-                                    .or_else(|| payload.get("arguments"))
-                                    .and_then(Value::as_str)
-                                    .and_then(extract_js_tool_name)
+                                extra_tools
+                                    .into_iter()
+                                    .next()
                                     .unwrap_or_else(|| "codex:exec_js".to_string())
                             } else {
                                 name.to_string()
@@ -448,7 +521,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                                 call_id.to_string(),
                                 PendingToolCall {
                                     tool_name: resolved_tool,
-                                    turn_idx: turn_count.max(1),
+                                    turn_idx: cur_turn,
                                     ts: call_ts,
                                     cwd: cwd.clone(),
                                 },
@@ -458,34 +531,147 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                 } else if matches!(ptype, "function_call_output" | "custom_tool_call_output")
                     && let Some(call_id) = payload.get("call_id").and_then(Value::as_str)
                 {
+                    saw_tool_output_since_step = true;
                     if let Some(call) = pending.remove(call_id) {
                         let out_text = flatten_content(payload.get("output"));
-                        let exit_code = extract_exit_code_from_text(&out_text, false);
-                        let duration_ms = extract_duration_ms_from_text(&out_text)
-                            .or_else(|| ts.and_then(|t| clamp_tool_duration(Some(t - call.ts))));
                         let full_sid = format!("codex:{session_id}");
-                        let combined_cmd = call.cmds.join(" && ");
-                        let built = build_command_spans(
-                            SpanBuildArgs {
-                                command_line: &combined_cmd,
-                                session_id: Some(full_sid),
-                                source_file: &source_file,
-                                source_kind: "transcript",
-                                agent_kind: "codex",
-                                tool_call_id: Some(call_id.to_string()),
-                                turn_idx: call.turn_idx,
-                                base_seq_idx: seq_idx,
-                                base_cwd: call.cwd.as_deref().or(cwd.as_deref()),
-                                exit_code: Some(exit_code),
-                                duration_ms,
-                                stdout_text: &out_text,
-                                stderr_text: if exit_code != 0 { &out_text } else { "" },
-                                started_at: call.ts,
-                            },
-                            resolver,
-                        );
-                        seq_idx += built.len() as i64;
-                        spans.extend(built);
+                        let call_cwd = call.cwd.as_deref().or(cwd.as_deref());
+
+                        // Record any sibling non-shell tools called in the same Codex JS `exec` block
+                        if !call.extra_tools.is_empty() {
+                            let ws = call_cwd.and_then(|c| resolver.resolve(c));
+                            for (et_idx, et_name) in call.extra_tools.iter().enumerate() {
+                                let (norm_name, is_mcp) = normalize_tool_name(et_name);
+                                tool_calls.push(ToolCallRecord {
+                                    call_id: make_id(
+                                        "tc",
+                                        &[&source_file, call_id, &et_idx.to_string(), &norm_name],
+                                    ),
+                                    session_id: full_sid.clone(),
+                                    source_file: source_file.clone(),
+                                    agent_kind: "codex".to_string(),
+                                    repo_id: ws.as_ref().map(|w| w.repo_id.clone()),
+                                    repo_name: ws.as_ref().map(|w| w.repo_name.clone()),
+                                    turn_idx: call.turn_idx,
+                                    tool_name: norm_name,
+                                    is_mcp,
+                                    is_error: false,
+                                    duration_ms: None,
+                                    output_bytes: 0,
+                                    output_tokens: 0,
+                                    is_truncated: false,
+                                    error_preview: None,
+                                    started_at: call.ts,
+                                });
+                            }
+                        }
+
+                        // When Codex JS `exec` returns structured per-command chunks, attribute each chunk
+                        // to its own command so sibling MCP/JSON payloads do not contaminate shell spans.
+                        let chunks = extract_codex_exec_chunks(&out_text);
+                        let mut newly_built = Vec::new();
+                        if !chunks.is_empty() && chunks.len() == call.cmds.len() {
+                            for (c_idx, (cmd_str, (ch_out, ch_ec, ch_dur))) in
+                                call.cmds.iter().zip(chunks.into_iter()).enumerate()
+                            {
+                                let ec = ch_ec
+                                    .unwrap_or_else(|| extract_exit_code_from_text(&ch_out, false));
+                                let built = build_command_spans(
+                                    SpanBuildArgs {
+                                        command_line: cmd_str,
+                                        session_id: Some(full_sid.clone()),
+                                        source_file: &source_file,
+                                        source_kind: "transcript",
+                                        agent_kind: "codex",
+                                        tool_call_id: Some(format!("{call_id}:{c_idx}")),
+                                        turn_idx: call.turn_idx,
+                                        base_seq_idx: seq_idx,
+                                        base_cwd: call_cwd,
+                                        exit_code: Some(ec),
+                                        duration_ms: ch_dur,
+                                        stdout_text: &ch_out,
+                                        stderr_text: if ec != 0 { &ch_out } else { "" },
+                                        started_at: call.ts,
+                                    },
+                                    resolver,
+                                );
+                                seq_idx += built.len() as i64;
+                                newly_built.extend(built);
+                            }
+                        } else {
+                            let (effective_out, effective_ec, effective_dur) = if chunks.len() == 1
+                                && !call.extra_tools.is_empty()
+                            {
+                                let (co, cec, cdur) = chunks.into_iter().next().unwrap();
+                                let ec =
+                                    cec.unwrap_or_else(|| extract_exit_code_from_text(&co, false));
+                                (co, ec, cdur)
+                            } else {
+                                let ec = extract_exit_code_from_text(&out_text, false);
+                                let dur = extract_duration_ms_from_text(&out_text).or_else(|| {
+                                    ts.and_then(|t| clamp_tool_duration(Some(t - call.ts)))
+                                });
+                                (out_text, ec, dur)
+                            };
+                            let combined_cmd = call.cmds.join(" && ");
+                            let built = build_command_spans(
+                                SpanBuildArgs {
+                                    command_line: &combined_cmd,
+                                    session_id: Some(full_sid.clone()),
+                                    source_file: &source_file,
+                                    source_kind: "transcript",
+                                    agent_kind: "codex",
+                                    tool_call_id: Some(call_id.to_string()),
+                                    turn_idx: call.turn_idx,
+                                    base_seq_idx: seq_idx,
+                                    base_cwd: call_cwd,
+                                    exit_code: Some(effective_ec),
+                                    duration_ms: effective_dur,
+                                    stdout_text: &effective_out,
+                                    stderr_text: if effective_ec != 0 {
+                                        &effective_out
+                                    } else {
+                                        ""
+                                    },
+                                    started_at: call.ts,
+                                },
+                                resolver,
+                            );
+                            seq_idx += built.len() as i64;
+                            newly_built.extend(built);
+                        }
+
+                        // Populate `file_reads` from Codex shell file-reading commands (`sed`, `cat`, `head`, `tail`, `nl`)
+                        for sp in &newly_built {
+                            let paths =
+                                extract_shell_file_read_paths(&sp.raw_redacted, &sp.cmd_bin);
+                            if !paths.is_empty() {
+                                let per_tok = sp.stdout_tokens / (paths.len() as i64).max(1);
+                                for (p_idx, target) in paths.iter().enumerate() {
+                                    let target_name = Path::new(target)
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or(target.as_str())
+                                        .to_string();
+                                    file_reads.push(FileReadRecord {
+                                        read_id: make_id(
+                                            "rd",
+                                            &[&source_file, &sp.span_id, &p_idx.to_string()],
+                                        ),
+                                        session_id: full_sid.clone(),
+                                        source_file: source_file.clone(),
+                                        repo_id: sp.repo_id.clone(),
+                                        repo_name: sp.repo_name.clone(),
+                                        turn_idx: sp.turn_idx,
+                                        target_name,
+                                        is_doc: is_doc_path(target),
+                                        output_tokens: per_tok,
+                                        started_at: sp.started_at,
+                                    });
+                                }
+                            }
+                        }
+                        spans.extend(newly_built);
                     } else if let Some(tcall) = pending_tools.remove(call_id) {
                         let out_text = flatten_content(payload.get("output"));
                         let is_error = detect_tool_error(&out_text, false);
@@ -559,7 +745,9 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     let mut final_repo = ws
         .as_ref()
         .map(|w| (w.repo_id.clone(), w.repo_name.clone()));
-    if cwd.as_deref().is_some_and(is_neutral_home_dir)
+    if cwd
+        .as_deref()
+        .is_some_and(|c| is_neutral_home_dir(c) || is_ephemeral_or_neutral_path(c))
         && let Some(dom) = dominant_span_repo(&spans)
     {
         final_repo = Some(dom);
@@ -580,7 +768,11 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     } else {
         sum_cached
     };
-    let total_tool_ms = spans.iter().filter_map(|s| s.duration_ms).sum();
+    let total_tool_ms: i64 = spans.iter().filter_map(|s| s.duration_ms).sum::<i64>()
+        + tool_calls.iter().filter_map(|t| t.duration_ms).sum::<i64>();
+    let normalized_turns = step_turn_idx
+        .max(turn_count)
+        .max(if spans.is_empty() { 0 } else { 1 });
 
     let session = SessionRecord {
         session_id: full_sid,
@@ -600,7 +792,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
         git_branch: None,
         started_at,
         ended_at,
-        turn_count: turn_count.max(if spans.is_empty() { 0 } else { 1 }),
+        turn_count: normalized_turns,
         input_tokens,
         output_tokens,
         cached_tokens,
@@ -616,7 +808,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     Ok(ParsedFile {
         sessions: vec![session],
         spans,
-        file_reads: Vec::new(),
+        file_reads,
         tool_calls,
         line_count,
     })

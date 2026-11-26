@@ -1,6 +1,6 @@
 use crate::analyze::{
     BypassReport, CommandStat, DiffReport, ErrorCluster, FleetReport, InspectResult, Opportunity,
-    RepoReport, format_compact,
+    RepoReport, format_compact, format_duration_human,
 };
 use crate::patterns::CrossSessionPatternsReport;
 use serde_json::Value;
@@ -449,6 +449,12 @@ pub fn format_diagnosis_prompt(
             h.token_multiplier
         ));
     }
+    if let Some(cost) = k.total_cost_usd {
+        lines.push(format!(
+            "- **Reported API cost:** ${cost:.2} across {} session(s) with cost telemetry",
+            k.cost_sessions
+        ));
+    }
     if let Some(notice) = &patterns.branch_behind_notice {
         lines.push(format!("- **Repo Ref Notice:** {notice}"));
     }
@@ -613,6 +619,12 @@ pub fn format_repo_report(report: &RepoReport, format: &str) -> String {
             ),
             format!("  orientation_tokens: {}", k.orientation_tokens),
             format!(
+                "  reported_cost_usd: {}",
+                k.total_cost_usd
+                    .map(|c| format!("{c:.2}"))
+                    .unwrap_or_else(|| "null".to_string())
+            ),
+            format!(
                 "  detected_config: [{}]",
                 k.detected_config
                     .iter()
@@ -665,8 +677,12 @@ pub fn format_repo_report(report: &RepoReport, format: &str) -> String {
                 .unwrap_or_else(|| "n/a".to_string())
         ),
         format!(
-            "- **Tool wait:** p50 **{:.1}s**/session ({:.1}s total)",
-            k.median_tool_wait_s, k.total_tool_wait_s
+            "- **Tool wait:** p50 **{}**/session ({} total){}",
+            format_duration_human(k.median_tool_wait_s),
+            format_duration_human(k.total_tool_wait_s),
+            k.total_cost_usd
+                .map(|c| format!(" | **Reported cost:** ${c:.2} ({} sess)", k.cost_sessions))
+                .unwrap_or_default()
         ),
         format!(
             "- **Repo CLI adoption:** {} | **Escape-hatch rebound:** {:.1}% | **Orientation tax:** {} tokens",

@@ -31,6 +31,48 @@ fn parse_mise_tasks(content: &str) -> Vec<String> {
     set.into_iter().collect()
 }
 
+fn parse_package_json_scripts(content: &str) -> Vec<String> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    let Some(obj) = val.get("scripts").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    obj.keys()
+        .filter(|k| !k.starts_with("pre") && !k.starts_with("post"))
+        .cloned()
+        .collect()
+}
+
+fn parse_makefile_targets(content: &str) -> Vec<String> {
+    static MAKE_RE: OnceLock<Regex> = OnceLock::new();
+    let re =
+        MAKE_RE.get_or_init(|| Regex::new(r"(?m)^([a-zA-Z0-9][a-zA-Z0-9:_-]*):(?:\s|$)").unwrap());
+    let mut set = BTreeSet::new();
+    for caps in re.captures_iter(content) {
+        let t = &caps[1];
+        if !matches!(t, "default" | "all" | "FORCE") && !t.starts_with('.') {
+            set.insert(t.to_string());
+        }
+    }
+    set.into_iter().collect()
+}
+
+fn parse_justfile_recipes(content: &str) -> Vec<String> {
+    static JUST_RE: OnceLock<Regex> = OnceLock::new();
+    let re = JUST_RE.get_or_init(|| {
+        Regex::new(r"(?m)^([a-zA-Z][a-zA-Z0-9_-]*)(?:\s+[^:=\n]+)?:\s*(?:#.*)?$").unwrap()
+    });
+    let mut set = BTreeSet::new();
+    for caps in re.captures_iter(content) {
+        let t = &caps[1];
+        if !matches!(t, "set" | "alias" | "export" | "import" | "mod" | "default") {
+            set.insert(t.to_string());
+        }
+    }
+    set.into_iter().collect()
+}
+
 fn parse_doc_mentioned_tools(content: &str) -> Vec<String> {
     // Generic extraction of backticked snake_case tool names (e.g. `foo_bar`, `mcp_tool_name`)
     // mentioned in AGENTS.md / CLAUDE.md
@@ -147,12 +189,24 @@ impl RepoContext {
             config_files.push("scripts/".to_string());
         }
 
-        let mut defined_tasks = Vec::new();
+        let mut task_set = BTreeSet::new();
         for fname in ["mise.toml", ".mise.toml"] {
             if let Ok(text) = fs::read_to_string(dir.join(fname)) {
-                defined_tasks.extend(parse_mise_tasks(&text));
+                task_set.extend(parse_mise_tasks(&text));
             }
         }
+        if task_set.is_empty() {
+            if let Ok(text) = fs::read_to_string(dir.join("justfile")) {
+                task_set.extend(parse_justfile_recipes(&text));
+            }
+            if let Ok(text) = fs::read_to_string(dir.join("Makefile")) {
+                task_set.extend(parse_makefile_targets(&text));
+            }
+            if let Ok(text) = fs::read_to_string(dir.join("package.json")) {
+                task_set.extend(parse_package_json_scripts(&text));
+            }
+        }
+        let defined_tasks: Vec<String> = task_set.into_iter().collect();
         let mut mentioned_tools = Vec::new();
         for doc_name in ["AGENTS.md", "CLAUDE.md"] {
             if let Ok(text) = fs::read_to_string(dir.join(doc_name)) {

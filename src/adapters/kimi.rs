@@ -6,7 +6,7 @@ use crate::adapters::{
 use crate::config::estimate_tokens_str;
 use crate::db::{FileReadRecord, SessionRecord, ToolCallRecord};
 use crate::shell::extract_exit_code_from_text;
-use crate::workspace::{WorkspaceResolver, is_neutral_home_dir};
+use crate::workspace::{WorkspaceResolver, is_ephemeral_or_neutral_path, is_neutral_home_dir};
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
@@ -99,6 +99,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     let mut se_in: i64 = 0;
     let mut se_out: i64 = 0;
     let mut se_cached: i64 = 0;
+    let mut tc_fallback_in: i64 = 0;
     let mut total_tool_ms: i64 = 0;
     let mut first_prompt_seen = false;
     let mut pending: HashMap<String, PendingCall> = HashMap::new();
@@ -134,6 +135,71 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                     if detect_handoff_text(&txt) {
                         is_handoff = true;
                     }
+                }
+            }
+            "token_counting.turn_recorded" => {
+                if let Some(t) = obj.get("tokens").and_then(Value::as_i64)
+                    && t > 0
+                {
+                    tc_fallback_in += t;
+                }
+            }
+            "turn.ended" => {
+                if obj.get("reason").and_then(Value::as_str) == Some("failed") {
+                    let dur = obj
+                        .get("durationMs")
+                        .and_then(Value::as_i64)
+                        .and_then(|d| clamp_tool_duration(Some(d)));
+                    if let Some(d) = dur {
+                        total_tool_ms += d;
+                    }
+                    let err_obj = obj.get("error");
+                    let code = err_obj
+                        .and_then(|e| e.get("code"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("turn_failed");
+                    let status = err_obj
+                        .and_then(|e| e.get("details"))
+                        .and_then(|d| d.get("statusCode"))
+                        .and_then(Value::as_i64);
+                    let msg = err_obj
+                        .and_then(|e| e.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let preview = match (status, msg.trim().is_empty()) {
+                        (Some(sc), true) => format!("{code} (HTTP {sc})"),
+                        (Some(sc), false) => format!("{code} (HTTP {sc}): {}", msg.trim()),
+                        (None, true) => code.to_string(),
+                        (None, false) => format!("{code}: {}", msg.trim()),
+                    };
+                    let turn_id_str = obj
+                        .get("turnId")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| seen_turns.len().to_string());
+                    let event_ts = ts
+                        .or(started_at)
+                        .unwrap_or_else(|| Utc::now().timestamp_millis());
+                    tool_calls.push(ToolCallRecord {
+                        call_id: make_id(
+                            "kimi-api",
+                            &[&session_id, &turn_id_str, &line_count.to_string()],
+                        ),
+                        session_id: session_id.clone(),
+                        agent_kind: "kimi".to_string(),
+                        source_file: source_file.clone(),
+                        repo_id: ws.as_ref().map(|w| w.repo_id.clone()),
+                        repo_name: ws.as_ref().map(|w| w.repo_name.clone()),
+                        turn_idx: seen_turns.len().max(1) as i64,
+                        tool_name: "kimi:api_error".to_string(),
+                        is_mcp: false,
+                        is_error: true,
+                        duration_ms: dur,
+                        output_bytes: preview.len() as i64,
+                        output_tokens: estimate_tokens_str(&preview),
+                        is_truncated: false,
+                        error_preview: Some(preview.chars().take(240).collect()),
+                        started_at: event_ts,
+                    });
                 }
             }
             "usage.record" => {
@@ -347,11 +413,14 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
         }
     }
 
-    // Re-attribute neutral-home sessions to dominant concrete span repo if possible
+    // Re-attribute neutral-home or ephemeral-workspace sessions to dominant concrete span repo if possible
     let final_ws_id = ws.as_ref().map(|w| w.workspace_id.clone());
     let mut final_repo_id = ws.as_ref().map(|w| w.repo_id.clone());
     let mut final_repo_name = ws.as_ref().map(|w| w.repo_name.clone());
-    if (final_repo_id.is_none() || cwd.as_deref().is_some_and(is_neutral_home_dir))
+    if (final_repo_id.is_none()
+        || cwd
+            .as_deref()
+            .is_some_and(|c| is_neutral_home_dir(c) || is_ephemeral_or_neutral_path(c)))
         && let Some((r_id, r_name)) = dominant_span_repo(&spans)
     {
         final_repo_id = Some(r_id);
@@ -360,8 +429,10 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
 
     let (input_tokens, output_tokens, cached_tokens) = if has_usage_records {
         (ur_in, ur_out, ur_cached)
-    } else {
+    } else if se_in > 0 || se_out > 0 || se_cached > 0 {
         (se_in, se_out, se_cached)
+    } else {
+        (tc_fallback_in, 0, 0)
     };
     let turn_count = if !seen_turns.is_empty() {
         seen_turns.len() as i64

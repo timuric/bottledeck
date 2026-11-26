@@ -117,6 +117,7 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
     ];
 
     let mut stats = SyncStats::default();
+    let mut discovered_paths: HashSet<String> = HashSet::new();
 
     for (adapter, files) in sources {
         let adapter_name = adapter.name().to_string();
@@ -125,6 +126,8 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
 
         for file_path in files {
             stats.files_scanned += 1;
+            let path_str = file_path.to_string_lossy().to_string();
+            discovered_paths.insert(path_str.clone());
             let Ok(meta) = fs::metadata(&file_path) else {
                 continue;
             };
@@ -135,7 +138,6 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let path_str = file_path.to_string_lossy().to_string();
 
             let prev: Option<(i64, i64)> = conn
                 .query_row(
@@ -160,6 +162,21 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
                 Ok(parsed) => {
                     let tx = conn.transaction()?;
                     delete_records_for_source(&tx, &path_str)?;
+                    // When upgrading from compact `transcript.jsonl` to `transcript_full.jsonl`,
+                    // purge any previously ingested records from the sibling compact file.
+                    if file_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|n| n == "transcript_full.jsonl")
+                    {
+                        let sibling = file_path.with_file_name("transcript.jsonl");
+                        let sibling_str = sibling.to_string_lossy().to_string();
+                        delete_records_for_source(&tx, &sibling_str)?;
+                        tx.execute(
+                            "DELETE FROM ingest_files WHERE file_path = ?1",
+                            params![sibling_str],
+                        )?;
+                    }
                     for s in &parsed.sessions {
                         upsert_session(&tx, s)?;
                         stats.sessions_upserted += 1;
@@ -210,8 +227,50 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
         }
     }
 
+    prune_deleted_sources(conn, &discovered_paths)?;
     reconcile_workspaces_and_sessions(conn)?;
     Ok(stats)
+}
+
+/// Remove ledger records for transcript files that were deleted from disk or superseded
+/// (for example compact `transcript.jsonl` replaced by sibling `transcript_full.jsonl`).
+fn prune_deleted_sources(conn: &mut Connection, discovered: &HashSet<String>) -> Result<()> {
+    let existing: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT file_path FROM ingest_files")?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .flatten()
+            .collect()
+    };
+    let stale: Vec<String> = existing
+        .into_iter()
+        .filter(|fp| {
+            if discovered.contains(fp) {
+                return false;
+            }
+            let p = Path::new(fp);
+            if !p.exists() {
+                return true;
+            }
+            // Superseded compact Antigravity log when full log is now discovered
+            if fp.ends_with("/transcript.jsonl") {
+                let full = fp.replace("/transcript.jsonl", "/transcript_full.jsonl");
+                if discovered.contains(&full) {
+                    return true;
+                }
+            }
+            false
+        })
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    for fp in &stale {
+        delete_records_for_source(&tx, fp)?;
+        tx.execute("DELETE FROM ingest_files WHERE file_path = ?1", params![fp])?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// General post-sync reconciliation:
@@ -220,7 +279,7 @@ pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Res
 /// 2. Re-attribute sessions whose initial `cwd` was a neutral directory (`~`, `~/.t3`, `~/code`)
 ///    when their command spans predominantly target a single canonical repository.
 fn reconcile_workspaces_and_sessions(conn: &mut Connection) -> Result<()> {
-    use crate::workspace::is_neutral_home_dir;
+    use crate::workspace::{is_ephemeral_or_neutral_path, is_neutral_home_dir};
     use std::collections::HashMap;
 
     // 1. Collect all canonical repos from real git checkouts in `workspaces`
@@ -268,6 +327,8 @@ fn reconcile_workspaces_and_sessions(conn: &mut Connection) -> Result<()> {
             let lower_name = old_name.to_ascii_lowercase();
             for (short, (canon_id, canon_name)) in &canonical_by_short {
                 let matches_worktree = lower_path.contains(&format!("/worktrees/{short}/"))
+                    || lower_path.contains(&format!("/{short}-"))
+                    || lower_path.contains(&format!("/{short}_"))
                     || lower_name == *short
                     || lower_name.starts_with(&format!("{short}-"))
                     || lower_name.starts_with(&format!("{short}_"));
@@ -314,7 +375,12 @@ fn reconcile_workspaces_and_sessions(conn: &mut Connection) -> Result<()> {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
         })?;
         for row in rows.flatten() {
-            if row.1.as_deref().is_some_and(is_neutral_home_dir) {
+            if row.1.is_none()
+                || row
+                    .1
+                    .as_deref()
+                    .is_some_and(|c| is_neutral_home_dir(c) || is_ephemeral_or_neutral_path(c))
+            {
                 neutral_sessions.push(row);
             }
         }

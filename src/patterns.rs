@@ -1,6 +1,7 @@
-use crate::analyze::{format_compact, format_harness_breakdown};
+use crate::analyze::{format_compact, format_harness_breakdown, is_normal_vcs_workflow_cmd};
 use crate::config::TimeRange;
 use crate::repo_context::RepoContext;
+use crate::shell::clean_error_preview;
 use anyhow::Result;
 use regex::Regex;
 use rusqlite::{Connection, params};
@@ -341,6 +342,23 @@ fn trunc(s: &str, max: usize) -> String {
     } else {
         format!("{}...", s.chars().take(max).collect::<String>())
     }
+}
+
+fn is_harness_pty_cmd(tpl: &str) -> bool {
+    tpl == "codex-wait" || tpl == "codex-wait --spin" || tpl == "codex-write-stdin"
+}
+
+fn is_noisy_drift_family(fam: &str) -> bool {
+    let trimmed = fam.trim();
+    trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.starts_with('$')
+        || trimmed.starts_with("null")
+        || trimmed.starts_with("./python")
+        || trimmed == "main"
+        || trimmed == "ios"
+        || trimmed == "src"
+        || trimmed.starts_with("chk ")
 }
 
 fn is_generic_read_or_script(tpl: &str, cat: &str) -> bool {
@@ -869,8 +887,10 @@ pub fn analyze_cross_session_patterns(
                 if let Some(nx) = g_spans.get(i + 1)
                     && nx.session_id == sp.session_id
                     && !nx.is_repo_cli
+                    && !is_normal_vcs_workflow_cmd(&nx.cmd_template)
                     && (nx.category == "exploration" || nx.category == "vcs_ci")
                     && nx.turn_idx - sp.turn_idx <= 1
+                    && nx.started_at.saturating_sub(sp.started_at) <= 60_000
                 {
                     rebounds += 1;
                 }
@@ -1136,7 +1156,7 @@ pub fn analyze_cross_session_patterns(
 
     let mut temporal_drift = Vec::new();
     for (fam, (early, recent)) in drift_map {
-        if early.runs + recent.runs < 12 {
+        if early.runs + recent.runs < 12 || is_noisy_drift_family(&fam) {
             continue;
         }
         let mut total_by_harness = early.by_harness.clone();
@@ -1178,14 +1198,20 @@ pub fn analyze_cross_session_patterns(
         let err_down = early.runs >= 5 && recent.runs >= 5 && e_err > r_err + 0.04;
 
         let (status, summary) = if surging {
-            (
-                "surging",
+            let desc = if early.runs == 0 {
+                format!(
+                    "new in recent half ({} runs, {r_per_1k:.1}/1k; err {:.0}%)",
+                    recent.runs,
+                    r_err * 100.0
+                )
+            } else {
                 format!(
                     "{e_per_1k:.1} -> {r_per_1k:.1}/1k cmds ({ratio:.1}x; err {:.0}%->{:.0}%)",
                     e_err * 100.0,
                     r_err * 100.0
-                ),
-            )
+                )
+            };
+            ("surging", desc)
         } else if err_up || tok_up {
             let mut parts = Vec::new();
             if err_up {
@@ -1288,6 +1314,11 @@ pub fn analyze_cross_session_patterns(
         let Some(cls) = classify_cold_error(sp) else {
             continue;
         };
+        let cleaned_stderr = sp
+            .stderr_preview
+            .as_deref()
+            .map(clean_error_preview)
+            .unwrap_or_default();
         let e = cold_map.entry(cls).or_insert_with(|| ColdAcc {
             early_fails: 0,
             total_fails: 0,
@@ -1295,8 +1326,12 @@ pub fn analyze_cross_session_patterns(
             worktrees: HashSet::new(),
             early_by_harness: BTreeMap::new(),
             sample_cmd: trunc(&sp.raw_redacted, 95),
-            sample_stderr: trunc(sp.stderr_preview.as_deref().unwrap_or(""), 150),
+            sample_stderr: trunc(&cleaned_stderr, 150),
         });
+        if e.sample_stderr.is_empty() && !cleaned_stderr.is_empty() {
+            e.sample_cmd = trunc(&sp.raw_redacted, 95);
+            e.sample_stderr = trunc(&cleaned_stderr, 150);
+        }
         e.total_fails += 1;
         if sp.turn_idx <= 3 {
             e.early_fails += 1;
@@ -1524,10 +1559,7 @@ pub fn analyze_cross_session_patterns(
         }
     }
     for sp in &spans {
-        if matches!(
-            sp.cmd_bin.as_str(),
-            "cat" | "sed" | "head" | "tail" | "rg" | "grep"
-        ) {
+        if matches!(sp.cmd_bin.as_str(), "cat" | "sed" | "head" | "tail") {
             let lower = sp.raw_redacted.to_ascii_lowercase();
             let doc_hit = if lower.contains("readme") {
                 Some("README.md")
@@ -1574,10 +1606,12 @@ pub fn analyze_cross_session_patterns(
         if let Some(dreads) = doc_reads_by_sess.get(&sp.session_id) {
             let mut matched_files: HashSet<&str> = HashSet::new();
             for (dturn, dts, dfname) in dreads {
-                let in_window = (*dturn == sp.turn_idx
+                // Require both turn proximity (0..=2 turns) AND wall-clock proximity (<= 120s)
+                // so unrelated doc edits hours later are never blamed on earlier CLI runs.
+                let in_window = *dturn >= sp.turn_idx
+                    && *dturn <= sp.turn_idx + 2
                     && *dts > sp.started_at
-                    && *dts <= sp.started_at + 120_000)
-                    || (*dturn > sp.turn_idx && *dturn <= sp.turn_idx + 2 && *dts > sp.started_at);
+                    && *dts <= sp.started_at + 120_000;
                 if in_window {
                     matched_files.insert(dfname.as_str());
                 }
@@ -1660,8 +1694,11 @@ pub fn analyze_cross_session_patterns(
     for sp in &spans {
         if sp.is_repo_cli {
             let fam = semantic_family(sp);
-            if let Some(t) = fam.strip_prefix("mise:") {
-                *task_call_counts.entry(t.to_string()).or_insert(0) += 1;
+            for prefix in ["mise:", "make:", "just:", "npm:", "pnpm:", "yarn:", "bun:"] {
+                if let Some(t) = fam.strip_prefix(prefix) {
+                    *task_call_counts.entry(t.to_string()).or_insert(0) += 1;
+                    break;
+                }
             }
         }
     }
@@ -1669,23 +1706,35 @@ pub fn analyze_cross_session_patterns(
         .iter()
         .filter(|s| s.cmd_template.starts_with("git diff"))
         .count();
+    let mut low_use_tasks: Vec<UnderusedSurface> = Vec::new();
+    let mut zero_use_tasks: Vec<UnderusedSurface> = Vec::new();
     for task in &repo_ctx.defined_tasks {
         let cnt = *task_call_counts.get(task).unwrap_or(&0);
-        if (1..=5).contains(&cnt) {
+        if cnt <= 5 {
             let note = if task.contains("change") && raw_git_diff_runs >= 20 {
                 format!("Only {cnt} run(s) vs {raw_git_diff_runs} raw `git diff` calls")
+            } else if cnt == 0 {
+                "Defined task with 0 runs observed in window".to_string()
             } else {
                 format!("Defined task with only {cnt} run(s) in window")
             };
-            underused_surfaces.push(UnderusedSurface {
+            let item = UnderusedSurface {
                 surface_kind: "repo_task".to_string(),
                 name: task.clone(),
                 observed_calls: cnt,
                 note,
-            });
+            };
+            if cnt == 0 {
+                zero_use_tasks.push(item);
+            } else {
+                low_use_tasks.push(item);
+            }
         }
     }
-    underused_surfaces.truncate(15);
+    // Keep low-use tasks (1-5 runs) alongside 0-call tasks so neither crowds out the other
+    underused_surfaces.extend(low_use_tasks);
+    underused_surfaces.extend(zero_use_tasks);
+    underused_surfaces.truncate(20);
 
     Ok(CrossSessionPatternsReport {
         repo_id: repo_id.to_string(),
@@ -1837,7 +1886,11 @@ fn mine_sequences_from_spans(
         .into_values()
         .filter(|a| {
             let distinct: HashSet<&str> = a.steps.iter().map(String::as_str).collect();
-            a.sessions.len() >= min_sessions && a.occurrences >= 2 && distinct.len() >= 2
+            let all_pty = a.steps.iter().all(|s| is_harness_pty_cmd(s));
+            a.sessions.len() >= min_sessions
+                && a.occurrences >= 2
+                && distinct.len() >= 2
+                && !all_pty
         })
         .map(|a| {
             let mut ags: Vec<String> = a.agents.into_iter().collect();
@@ -2190,8 +2243,13 @@ pub fn query_tools(
         a.sessions.insert(sid);
         if is_err {
             a.errs += 1;
-            if a.sample_err.is_none() {
-                a.sample_err = err_prev;
+            if a.sample_err.is_none()
+                && let Some(raw_err) = err_prev.as_deref()
+            {
+                let cleaned = clean_error_preview(raw_err);
+                if !cleaned.is_empty() {
+                    a.sample_err = Some(cleaned);
+                }
             }
         }
         if is_trunc {

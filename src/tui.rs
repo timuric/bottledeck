@@ -4,8 +4,11 @@ use crate::analyze::{
 };
 use crate::config::{AdapterRoots, TimeRange, parse_window_ms};
 use crate::ingest::sync_all;
-use crate::patterns::{CrossSessionPatternsReport, analyze_cross_session_patterns};
+use crate::patterns::{
+    CrossSessionPatternsReport, HarnessBreakdown, ToolStat, analyze_cross_session_patterns,
+};
 use crate::report::{format_diagnosis_prompt, format_repo_report};
+use crate::shell::clean_error_preview;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -70,25 +73,25 @@ impl DetailTab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeFilter {
-    Repo,
     All,
+    Repo,
     Harness,
 }
 
 impl ScopeFilter {
     fn next(self) -> Self {
         match self {
-            Self::Repo => Self::All,
-            Self::All => Self::Harness,
-            Self::Harness => Self::Repo,
+            Self::All => Self::Repo,
+            Self::Repo => Self::Harness,
+            Self::Harness => Self::All,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Self::Repo => "Repo fixes",
-            Self::All => "All signals",
-            Self::Harness => "Harness overhead",
+            Self::All => "All issues",
+            Self::Repo => "Repo harness",
+            Self::Harness => "Agent runtime",
         }
     }
 }
@@ -150,6 +153,31 @@ struct MergedInsight {
     related: Vec<Opportunity>,
 }
 
+#[derive(Debug, Clone)]
+struct HarnessRowSummary {
+    agent_kind: String,
+    label: String,
+    sessions: usize,
+    commands: usize,
+    tool_calls: usize,
+    median_total_tokens: i64,
+    avg_uncached_tokens: i64,
+    weighted_cache_hit: Option<f64>,
+    avg_output_kb: f64,
+    truncated_outputs: usize,
+    truncated_sessions_pct: f64,
+    median_tool_wait_s: f64,
+    error_rate: f64,
+    rebound_rate: f64,
+    top_friction_cmds: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum HarnessIssueItem {
+    Opp(MergedInsight),
+    McpTool(ToolStat),
+}
+
 pub struct App {
     pub window_idx: usize,
     pub focus: Focus,
@@ -159,6 +187,8 @@ pub struct App {
     pub patterns_view: PatternsView,
     pub commands_view: CommandsView,
     pub brief_mode: BriefMode,
+    pub harness_show_strata: bool,
+    pub harness_focus_issues: bool,
     pub show_help: bool,
     pub fleet: FleetReport,
     pub repo_state: TableState,
@@ -167,6 +197,7 @@ pub struct App {
     pub opp_state: TableState,
     pub pattern_state: TableState,
     pub harness_state: TableState,
+    pub harness_issue_state: TableState,
     pub cmd_state: TableState,
     pub brief_scroll: u16,
     pub cached_brief: String,
@@ -228,10 +259,12 @@ impl App {
             focus: Focus::Main,
             sidebar_open: false,
             tab: DetailTab::Insights,
-            scope_filter: ScopeFilter::Repo,
+            scope_filter: ScopeFilter::All,
             patterns_view: PatternsView::Workflows,
             commands_view: CommandsView::Tokens,
             brief_mode: BriefMode::Prompt,
+            harness_show_strata: false,
+            harness_focus_issues: false,
             show_help: false,
             fleet,
             repo_state,
@@ -240,6 +273,7 @@ impl App {
             opp_state: TableState::default(),
             pattern_state: TableState::default(),
             harness_state: TableState::default(),
+            harness_issue_state: TableState::default(),
             cmd_state: TableState::default(),
             brief_scroll: 0,
             cached_brief: String::new(),
@@ -260,18 +294,19 @@ impl App {
 
     fn reset_tab_selections(&mut self) {
         self.brief_scroll = 0;
+        self.harness_focus_issues = false;
         let insights_len = self.visible_insights().len();
         self.opp_state
             .select(if insights_len > 0 { Some(0) } else { None });
         let pat_len = self.visible_pattern_count();
         self.pattern_state
             .select(if pat_len > 0 { Some(0) } else { None });
-        let h_len = self
-            .selected_patterns
-            .as_ref()
-            .map_or(0, |p| p.harness_comparison.len());
+        let h_len = self.visible_harness_rows().len();
         self.harness_state
             .select(if h_len > 0 { Some(0) } else { None });
+        let hi_len = self.selected_harness_issues().len();
+        self.harness_issue_state
+            .select(if hi_len > 0 { Some(0) } else { None });
         let c_len = self.visible_command_count();
         self.cmd_state
             .select(if c_len > 0 { Some(0) } else { None });
@@ -293,7 +328,7 @@ impl App {
         let Some(repo) = &self.selected_repo else {
             return Vec::new();
         };
-        let raw: Vec<&Opportunity> = match self.scope_filter {
+        let mut raw: Vec<&Opportunity> = match self.scope_filter {
             ScopeFilter::Repo => repo.opportunities.iter().collect(),
             ScopeFilter::Harness => repo.harness_overhead.iter().collect(),
             ScopeFilter::All => repo
@@ -302,7 +337,259 @@ impl App {
                 .chain(repo.harness_overhead.iter())
                 .collect(),
         };
+        if self.scope_filter == ScopeFilter::All {
+            raw.sort_by_key(|o| std::cmp::Reverse(o.score));
+        }
         merge_opportunities(&raw)
+    }
+
+    fn visible_harness_rows(&self) -> Vec<HarnessRowSummary> {
+        let Some(pat) = &self.selected_patterns else {
+            return Vec::new();
+        };
+        if self.harness_show_strata {
+            return pat
+                .harness_comparison
+                .iter()
+                .map(|h| {
+                    let short = short_harness(&h.agent_kind);
+                    let label = if h.originator != "default" && !h.originator.is_empty() {
+                        format!(
+                            "{short} ({} · {})",
+                            h.role,
+                            truncate_ellipsis(&h.originator, 12)
+                        )
+                    } else {
+                        format!("{short} ({})", h.role)
+                    };
+                    HarnessRowSummary {
+                        agent_kind: h.agent_kind.clone(),
+                        label,
+                        sessions: h.sessions,
+                        commands: h.commands,
+                        tool_calls: h.tool_calls,
+                        median_total_tokens: h.median_total_tokens,
+                        avg_uncached_tokens: h.avg_uncached_tokens,
+                        weighted_cache_hit: h.weighted_cache_hit,
+                        avg_output_kb: h.avg_output_kb,
+                        truncated_outputs: h.truncated_outputs,
+                        truncated_sessions_pct: h.truncated_sessions_pct,
+                        median_tool_wait_s: h.median_tool_wait_s,
+                        error_rate: h.error_rate,
+                        rebound_rate: h.rebound_rate,
+                        top_friction_cmds: h.top_friction_cmds.clone(),
+                    }
+                })
+                .collect();
+        }
+
+        // Grouped view: 1 clean summary row per agent harness (codex, claude, antigravity, kimi)
+        let mut by_ag: BTreeMap<String, Vec<&HarnessBreakdown>> = BTreeMap::new();
+        for h in &pat.harness_comparison {
+            by_ag.entry(h.agent_kind.clone()).or_default().push(h);
+        }
+        let mut rows: Vec<HarnessRowSummary> = by_ag
+            .into_iter()
+            .map(|(ag, list)| {
+                let sessions: usize = list.iter().map(|h| h.sessions).sum();
+                let commands: usize = list.iter().map(|h| h.commands).sum();
+                let tool_calls: usize = list.iter().map(|h| h.tool_calls).sum();
+                let total_ops = (commands + tool_calls).max(1) as f64;
+                let weighted_err = list
+                    .iter()
+                    .map(|h| h.error_rate * (h.commands + h.tool_calls) as f64)
+                    .sum::<f64>()
+                    / total_ops;
+                let weighted_rebound = if commands > 0 {
+                    list.iter()
+                        .map(|h| h.rebound_rate * h.commands as f64)
+                        .sum::<f64>()
+                        / commands as f64
+                } else {
+                    0.0
+                };
+                let weighted_out_kb = list
+                    .iter()
+                    .map(|h| h.avg_output_kb * (h.commands + h.tool_calls) as f64)
+                    .sum::<f64>()
+                    / total_ops;
+                let truncated_outputs: usize = list.iter().map(|h| h.truncated_outputs).sum();
+                let trunc_sess_pct = if sessions > 0 {
+                    list.iter()
+                        .map(|h| h.truncated_sessions_pct * h.sessions as f64)
+                        .sum::<f64>()
+                        / sessions as f64
+                } else {
+                    0.0
+                };
+                // Prefer main sessions for median tokens / wait / cache when present
+                let main_only: Vec<&&HarnessBreakdown> =
+                    list.iter().filter(|h| h.role == "main").collect();
+                let ref_slice: Vec<&HarnessBreakdown> = if !main_only.is_empty() {
+                    main_only.into_iter().copied().collect()
+                } else {
+                    list.clone()
+                };
+                let ref_sess = ref_slice.iter().map(|h| h.sessions).sum::<usize>().max(1);
+                let median_total_tokens = (ref_slice
+                    .iter()
+                    .map(|h| h.median_total_tokens as f64 * h.sessions as f64)
+                    .sum::<f64>()
+                    / ref_sess as f64)
+                    .round() as i64;
+                let avg_uncached_tokens = (ref_slice
+                    .iter()
+                    .map(|h| h.avg_uncached_tokens as f64 * h.sessions as f64)
+                    .sum::<f64>()
+                    / ref_sess as f64)
+                    .round() as i64;
+                let median_tool_wait_s = ref_slice
+                    .iter()
+                    .map(|h| h.median_tool_wait_s * h.sessions as f64)
+                    .sum::<f64>()
+                    / ref_sess as f64;
+                let cache_pairs: Vec<(f64, usize)> = ref_slice
+                    .iter()
+                    .filter_map(|h| h.weighted_cache_hit.map(|r| (r, h.sessions)))
+                    .collect();
+                let weighted_cache_hit = if cache_pairs.is_empty() {
+                    None
+                } else {
+                    let tot_s: usize = cache_pairs.iter().map(|(_, s)| *s).sum::<usize>().max(1);
+                    Some(
+                        cache_pairs
+                            .iter()
+                            .map(|(r, s)| *r * (*s as f64))
+                            .sum::<f64>()
+                            / tot_s as f64,
+                    )
+                };
+                let mut friction = Vec::new();
+                for h in &ref_slice {
+                    for c in &h.top_friction_cmds {
+                        if !friction.contains(c) && friction.len() < 5 {
+                            friction.push(c.clone());
+                        }
+                    }
+                }
+                let sub_cnt: usize = list
+                    .iter()
+                    .filter(|h| h.role != "main")
+                    .map(|h| h.sessions)
+                    .sum();
+                let short = short_harness(&ag);
+                let label = if sub_cnt > 0 {
+                    format!("{short} ({} + {} sub)", sessions - sub_cnt, sub_cnt)
+                } else {
+                    short.to_string()
+                };
+                HarnessRowSummary {
+                    agent_kind: ag,
+                    label,
+                    sessions,
+                    commands,
+                    tool_calls,
+                    median_total_tokens,
+                    avg_uncached_tokens,
+                    weighted_cache_hit,
+                    avg_output_kb: (weighted_out_kb * 10.0).round() / 10.0,
+                    truncated_outputs,
+                    truncated_sessions_pct: (trunc_sess_pct * 10.0).round() / 10.0,
+                    median_tool_wait_s: (median_tool_wait_s * 10.0).round() / 10.0,
+                    error_rate: weighted_err,
+                    rebound_rate: weighted_rebound,
+                    top_friction_cmds: friction,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            (b.commands + b.tool_calls)
+                .cmp(&(a.commands + a.tool_calls))
+                .then_with(|| b.sessions.cmp(&a.sessions))
+        });
+        rows
+    }
+
+    fn issues_for_harness(&self, agent_kind: &str) -> Vec<HarnessIssueItem> {
+        let mut out: Vec<HarnessIssueItem> = Vec::new();
+        let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if let Some(repo) = &self.selected_repo {
+            // 1. All harness/runtime issues caused by this harness
+            let h_opps: Vec<&Opportunity> = repo
+                .harness_overhead
+                .iter()
+                .filter(|o| {
+                    if agent_kind.is_empty() {
+                        return true;
+                    }
+                    // For harness_divergence, only attribute to the lagging `top_harness`, not the low baseline
+                    if o.kind == "harness_divergence"
+                        && let Some(top) = ev_str(o, "top_harness")
+                    {
+                        return top == agent_kind;
+                    }
+                    o.by_harness.contains_key(agent_kind)
+                })
+                .collect();
+            for m in merge_opportunities(&h_opps) {
+                seen_targets.insert(m.primary.target.clone());
+                out.push(HarnessIssueItem::Opp(m));
+            }
+
+            // 2. Repo issues where this harness is a major driver (>= 35% of occurrences)
+            let r_opps: Vec<&Opportunity> = repo
+                .opportunities
+                .iter()
+                .filter(|o| {
+                    if agent_kind.is_empty() {
+                        return true;
+                    }
+                    let total: usize = o.by_harness.values().sum();
+                    let mine = o.by_harness.get(agent_kind).copied().unwrap_or(0);
+                    total > 0 && (mine as f64 / total as f64) >= 0.35
+                })
+                .collect();
+            for m in merge_opportunities(&r_opps) {
+                if !seen_targets.contains(&m.primary.target) {
+                    seen_targets.insert(m.primary.target.clone());
+                    out.push(HarnessIssueItem::Opp(m));
+                }
+            }
+        }
+
+        // 3. Failing MCP tools for this harness not already surfaced as an Opportunity
+        if let Some(pat) = &self.selected_patterns {
+            for t in &pat.top_mcp_errors {
+                if t.error_count == 0 && t.truncated_count < 8 {
+                    continue;
+                }
+                if !agent_kind.is_empty() && !t.by_harness.contains_key(agent_kind) {
+                    continue;
+                }
+                if seen_targets.contains(&t.tool_name) {
+                    continue;
+                }
+                seen_targets.insert(t.tool_name.clone());
+                out.push(HarnessIssueItem::McpTool(t.clone()));
+            }
+        }
+
+        out
+    }
+
+    fn selected_harness_agent(&self) -> String {
+        let rows = self.visible_harness_rows();
+        self.harness_state
+            .selected()
+            .and_then(|i| rows.get(i))
+            .map(|r| r.agent_kind.clone())
+            .unwrap_or_default()
+    }
+
+    fn selected_harness_issues(&self) -> Vec<HarnessIssueItem> {
+        let ag = self.selected_harness_agent();
+        self.issues_for_harness(&ag)
     }
 
     fn visible_pattern_count(&self) -> usize {
@@ -517,10 +804,43 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 if self.sidebar_open {
                     self.focus = Focus::Drawer;
+                } else if self.tab == DetailTab::Harnesses {
+                    self.harness_focus_issues = false;
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.focus = Focus::Main;
+                if self.focus == Focus::Drawer {
+                    self.focus = Focus::Main;
+                } else if self.tab == DetailTab::Harnesses {
+                    self.harness_focus_issues = true;
+                    let len = self.selected_harness_issues().len();
+                    if len > 0 && self.harness_issue_state.selected().is_none() {
+                        self.harness_issue_state.select(Some(0));
+                    }
+                }
+            }
+            KeyCode::Char(' ') if self.tab == DetailTab::Harnesses && self.focus == Focus::Main => {
+                self.harness_focus_issues = !self.harness_focus_issues;
+                if self.harness_focus_issues {
+                    let len = self.selected_harness_issues().len();
+                    if len > 0 && self.harness_issue_state.selected().is_none() {
+                        self.harness_issue_state.select(Some(0));
+                    }
+                }
+            }
+            KeyCode::Char('d') if self.tab == DetailTab::Harnesses => {
+                self.harness_show_strata = !self.harness_show_strata;
+                let h_len = self.visible_harness_rows().len();
+                self.harness_state
+                    .select(if h_len > 0 { Some(0) } else { None });
+                let hi_len = self.selected_harness_issues().len();
+                self.harness_issue_state
+                    .select(if hi_len > 0 { Some(0) } else { None });
+                self.status_msg = if self.harness_show_strata {
+                    "Harnesses: Detailed strata (originator/role)".into()
+                } else {
+                    "Harnesses: Grouped by agent".into()
+                };
             }
             KeyCode::Down | KeyCode::Char('j') => self.navigate(conn, 1)?,
             KeyCode::Up | KeyCode::Char('k') => self.navigate(conn, -1)?,
@@ -564,6 +884,43 @@ impl App {
                         let range = TimeRange::from_window(parse_window_ms(win_label)?, win_label);
                         let res =
                             inspect_finding(conn, &repo.repo_id, &item.primary.id, &range, 6)?;
+                        self.modal = Some(res);
+                        self.modal_scroll = 0;
+                    }
+                } else if self.tab == DetailTab::Harnesses
+                    && let Some(repo) = &self.selected_repo
+                {
+                    if !self.harness_focus_issues {
+                        self.harness_focus_issues = true;
+                        let len = self.selected_harness_issues().len();
+                        if len > 0 && self.harness_issue_state.selected().is_none() {
+                            self.harness_issue_state.select(Some(0));
+                        }
+                    } else if let Some(idx) = self.harness_issue_state.selected() {
+                        let issues = self.selected_harness_issues();
+                        if let Some(issue) = issues.get(idx) {
+                            let win_label = self.window_label();
+                            let range =
+                                TimeRange::from_window(parse_window_ms(win_label)?, win_label);
+                            let q = match issue {
+                                HarnessIssueItem::Opp(m) => m.primary.id.clone(),
+                                HarnessIssueItem::McpTool(t) => t.tool_name.clone(),
+                            };
+                            let res = inspect_finding(conn, &repo.repo_id, &q, &range, 6)?;
+                            self.modal = Some(res);
+                            self.modal_scroll = 0;
+                        }
+                    }
+                } else if self.tab == DetailTab::Commands
+                    && self.commands_view != CommandsView::Mcp
+                    && let Some(repo) = &self.selected_repo
+                    && let Some(idx) = self.cmd_state.selected()
+                {
+                    let cmds = self.sorted_commands();
+                    if let Some(c) = cmds.get(idx) {
+                        let win_label = self.window_label();
+                        let range = TimeRange::from_window(parse_window_ms(win_label)?, win_label);
+                        let res = inspect_finding(conn, &repo.repo_id, &c.cmd_template, &range, 6)?;
                         self.modal = Some(res);
                         self.modal_scroll = 0;
                     }
@@ -632,11 +989,19 @@ impl App {
                 Self::move_table(&mut self.pattern_state, len, delta);
             }
             DetailTab::Harnesses => {
-                let len = self
-                    .selected_patterns
-                    .as_ref()
-                    .map_or(0, |p| p.harness_comparison.len());
-                Self::move_table(&mut self.harness_state, len, delta);
+                if self.harness_focus_issues {
+                    let len = self.selected_harness_issues().len();
+                    Self::move_table(&mut self.harness_issue_state, len, delta);
+                } else {
+                    let prev = self.harness_state.selected();
+                    let len = self.visible_harness_rows().len();
+                    Self::move_table(&mut self.harness_state, len, delta);
+                    if self.harness_state.selected() != prev {
+                        let hi_len = self.selected_harness_issues().len();
+                        self.harness_issue_state
+                            .select(if hi_len > 0 { Some(0) } else { None });
+                    }
+                }
             }
             DetailTab::Commands => {
                 let len = self.visible_command_count();
@@ -948,6 +1313,437 @@ fn ev_f64(o: &Opportunity, key: &str) -> Option<f64> {
     o.evidence.get(key).and_then(|v| v.as_f64())
 }
 
+fn ev_str<'a>(o: &'a Opportunity, key: &str) -> Option<&'a str> {
+    o.evidence.get(key).and_then(|v| v.as_str())
+}
+
+fn ev_str_list(o: &Opportunity, key: &str) -> Vec<String> {
+    o.evidence
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn clean_tool_label(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("mcp:")
+        && let Some((srv, tool)) = rest.split_once(':')
+    {
+        return format!("{srv}/{tool}");
+    }
+    name.to_string()
+}
+
+fn dominant_harness_label(counts: &BTreeMap<String, usize>) -> String {
+    let total: usize = counts.values().sum();
+    if total == 0 {
+        return "multiple harnesses".to_string();
+    }
+    let mut items: Vec<(&String, usize)> = counts.iter().map(|(k, &v)| (k, v)).collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let top = short_harness(items[0].0);
+    let pct = ((items[0].1 as f64 / total as f64) * 100.0).round() as usize;
+    if items.len() == 1 || pct >= 95 {
+        format!("{top} only")
+    } else if pct >= 65 {
+        format!("mostly {top} ({pct}%)")
+    } else {
+        let second = short_harness(items[1].0);
+        format!("{top} ({pct}%) and {second}")
+    }
+}
+
+/// Plain-English headline for any repo or harness issue (never raw telemetry kind + truncated target).
+fn insight_headline(o: &Opportunity) -> String {
+    match o.kind.as_str() {
+        "polling_tax" => match o.target.as_str() {
+            "codex-wait" => "Codex PTY polling loop (codex-wait)".to_string(),
+            "codex-wait --spin" => "Codex tight-spin wait loop".to_string(),
+            "codex-write-stdin" => "Codex interactive stdin polling".to_string(),
+            t => format!("Polling loop on `{t}`"),
+        },
+        "slow_task_latency" => match o.target.as_str() {
+            "codex-wait" => "Long Codex PTY waits (codex-wait)".to_string(),
+            "codex-write-stdin" => "Slow Codex interactive stdin waits".to_string(),
+            t => format!("Slow command: `{t}`"),
+        },
+        "lossy_task_rebound" => format!("Shell fallbacks after `{}`", o.target),
+        "state_dir_bypass" => format!("Scraping `{}` files directly", o.target),
+        "output_filtering_tax" => "Agents piping CLI output to tail/grep/sed".to_string(),
+        "noisy_task_output" => format!("Oversized stdout from `{}`", o.target),
+        "cli_help_tax" => "Repeated `--help` flag lookups".to_string(),
+        "orientation_tax" => "Heavy startup discovery (turns 1–3)".to_string(),
+        "broken_task_error_rate" => format!("High failure rate on `{}`", o.target),
+        "flag_thrash" => {
+            if let Some((from, to)) = o.target.split_once(" -> ") {
+                format!("Retry thrash: `{from}` → `{to}`")
+            } else {
+                format!("Repeated retry failures on `{}`", o.target)
+            }
+        }
+        "tool_friction" => {
+            let errs = ev_u64(o, "errors").unwrap_or(0);
+            let tool = clean_tool_label(&o.target);
+            if errs >= 3 {
+                format!("Tool error: {tool}")
+            } else {
+                format!("Truncated: {tool}")
+            }
+        }
+        "repeated_file_reread" => format!("Repeatedly re-reading `{}`", o.target),
+        "context_handoff_bloat" => {
+            let m = ev_f64(o, "multiplier").unwrap_or(0.0);
+            format!("Resumed threads burn {m:.1}× more tokens")
+        }
+        "low_cache_efficiency" => {
+            let ag = o
+                .target
+                .strip_suffix(" cache hit rate")
+                .unwrap_or(&o.target);
+            format!("Low prompt cache hit on {}", short_harness(ag))
+        }
+        "harness_divergence" => {
+            if let (Some(metric), Some(top), Some(low)) = (
+                ev_str(o, "metric"),
+                ev_str(o, "top_harness"),
+                ev_str(o, "low_harness"),
+            ) {
+                format!(
+                    "{} hits {metric} far more than {}",
+                    short_harness(top),
+                    short_harness(low)
+                )
+            } else {
+                format!("Harness gap: {}", o.target)
+            }
+        }
+        "missing_composite_task" => format!("Repeated workflow: {}", o.target),
+        _ => o.target.clone(),
+    }
+}
+
+/// Dynamic, plain-English 2–3 sentence explanation of WHAT is happening and WHY it hurts.
+fn insight_story(o: &Opportunity) -> Vec<String> {
+    let who = dominant_harness_label(&o.by_harness);
+    match o.kind.as_str() {
+        "polling_tax" => {
+            let calls = ev_u64(o, "total_calls").unwrap_or(0) as usize;
+            let sess = ev_u64(o, "sessions").unwrap_or(0);
+            let avg = ev_f64(o, "avg_calls_per_session").unwrap_or(0.0);
+            let max_c = ev_u64(o, "max_calls_in_one_session").unwrap_or(0);
+            let wait = ev_f64(o, "total_wait_s").unwrap_or(0.0);
+            if o.target.starts_with("codex-wait") {
+                vec![
+                    format!(
+                        "Codex is polling a background/PTY command in a loop ({avg:.1}×/session, up to {max_c}× in one session) instead of letting the command block until completion."
+                    ),
+                    format!(
+                        "Burned {} total wait across {} polling calls in {sess} sessions — each poll adds an extra model turn and re-sends context.",
+                        format_duration(wait),
+                        format_int(calls)
+                    ),
+                ]
+            } else if o.target == "codex-write-stdin" {
+                vec![
+                    format!(
+                        "Codex is sending repeated `write_stdin` polls to an interactive shell session ({avg:.1}×/session, max {max_c}×) to check if a running command finished."
+                    ),
+                    format!(
+                        "Spent {} across {} calls in {sess} sessions — usually triggered by long-running commands that don't finish within a single exec timeout.",
+                        format_duration(wait),
+                        format_int(calls)
+                    ),
+                ]
+            } else {
+                vec![
+                    format!(
+                        "Agents call `{}` repeatedly in a loop ({avg:.1}×/session avg, worst session: {max_c}×) across {sess} sessions ({who}).",
+                        o.target
+                    ),
+                    format!(
+                        "Spent {} across {} calls waiting on status checks instead of blocking once or receiving a completion signal.",
+                        format_duration(wait),
+                        format_int(calls)
+                    ),
+                ]
+            }
+        }
+        "slow_task_latency" => {
+            let runs = ev_u64(o, "runs").unwrap_or(0) as usize;
+            let wait = ev_f64(o, "total_wait_s").unwrap_or(0.0);
+            let p50 = ev_f64(o, "p50_wait_s").unwrap_or(0.0);
+            let p95 = ev_f64(o, "p95_wait_s").unwrap_or(0.0);
+            vec![
+                format!(
+                    "`{}` blocked agents for {} total across {} runs ({who}).",
+                    o.target,
+                    format_duration(wait),
+                    format_int(runs)
+                ),
+                format!(
+                    "Typical run takes {} (slowest 5% take {}+) — long waits trigger polling loops, timeouts, and retries.",
+                    format_duration(p50),
+                    format_duration(p95)
+                ),
+            ]
+        }
+        "lossy_task_rebound" => {
+            let count = ev_u64(o, "rebound_count").unwrap_or(0) as usize;
+            let runs = ev_u64(o, "total_runs").unwrap_or(0) as usize;
+            let rate = ev_f64(o, "rebound_rate").unwrap_or(0.0) * 100.0;
+            let sess = ev_u64(o, "sessions").unwrap_or(0);
+            let follows = ev_str_list(o, "top_fallback_cmds");
+            let follow_txt = if follows.is_empty() {
+                "raw shell commands".to_string()
+            } else {
+                follows.into_iter().take(2).collect::<Vec<_>>().join(", ")
+            };
+            vec![
+                format!(
+                    "{rate:.0}% of `{}` runs ({}/{}) across {sess} sessions are immediately followed by shell exploration ({follow_txt}).",
+                    o.target,
+                    format_int(count),
+                    format_int(runs)
+                ),
+                format!(
+                    "Happens in {who} — either the CLI output omits a detail agents need next, or it truncates key pointers."
+                ),
+            ]
+        }
+        "state_dir_bypass" => {
+            let reads = ev_u64(o, "direct_reads").unwrap_or(0) as usize;
+            let sess = ev_u64(o, "sessions").unwrap_or(0);
+            let toks = ev_u64(o, "stdout_tokens").unwrap_or(0) as i64;
+            let cmds = ev_str_list(o, "top_raw_cmds");
+            let via = if cmds.is_empty() {
+                "cat/tail/ls".to_string()
+            } else {
+                cmds.into_iter().take(2).collect::<Vec<_>>().join(", ")
+            };
+            vec![
+                format!(
+                    "Instead of using a repo CLI, agents read raw internal files under `{}` {} times across {sess} sessions ({who}).",
+                    o.target,
+                    format_int(reads)
+                ),
+                format!(
+                    "Done via {via} ({} stdout tokens) — a clear signal that an inspection or log-tail subcommand is missing or hard to find.",
+                    format_compact(toks)
+                ),
+            ]
+        }
+        "output_filtering_tax" => {
+            let n = ev_u64(o, "total_piped_cli_calls").unwrap_or(0) as usize;
+            vec![
+                format!(
+                    "Agents manually piped repo CLI output through tail/grep/sed {} times ({who}) to cut through noise.",
+                    format_int(n)
+                ),
+                "Pipe-stripping wastes turns, hides exit codes (without pipefail), and shows the CLI's default output is too verbose or unformatted.".to_string(),
+            ]
+        }
+        "noisy_task_output" => {
+            let runs = ev_u64(o, "runs").unwrap_or(0) as usize;
+            let p50 = ev_u64(o, "p50_stdout_tokens").unwrap_or(0) as i64;
+            let eff = ev_u64(o, "effective_context_tokens").unwrap_or(0) as i64;
+            let noise = ev_str(o, "dominant_noise").unwrap_or("verbose_stdout");
+            vec![
+                format!(
+                    "`{}` dumps ~{} tokens/run (p50) of `{noise}` across {} runs ({who}).",
+                    o.target,
+                    format_compact(p50),
+                    format_int(runs)
+                ),
+                format!(
+                    "Because every subsequent turn re-reads that stdout in context, it accounts for ~{} effective context tokens.",
+                    format_compact(eff)
+                ),
+            ]
+        }
+        "broken_task_error_rate" => {
+            let errs = ev_u64(o, "errors").unwrap_or(0);
+            let runs = ev_u64(o, "runs").unwrap_or(0);
+            let rate = ev_f64(o, "error_rate").unwrap_or(0.0) * 100.0;
+            vec![
+                format!(
+                    "Repo task `{}` exited nonzero on {errs} of {runs} runs ({rate:.0}% failure rate, {who}).",
+                    o.target
+                ),
+                "High failure rates force blind retries, shell workarounds, and extra turns debugging tooling instead of product code.".to_string(),
+            ]
+        }
+        "flag_thrash" => {
+            let occ = ev_u64(o, "occurrences").unwrap_or(0);
+            let sess = ev_u64(o, "sessions").unwrap_or(0);
+            vec![
+                format!(
+                    "Agents failed and retried `{}` {occ} times across {sess} sessions ({who}) before getting a successful exit.",
+                    o.target
+                ),
+                "Usually caused by unintuitive CLI flags, missing prerequisite checks, or vague error messages.".to_string(),
+            ]
+        }
+        "tool_friction" => {
+            let calls = ev_u64(o, "calls").unwrap_or(0);
+            let sess = ev_u64(o, "sessions").unwrap_or(0);
+            let errs = ev_u64(o, "errors").unwrap_or(0);
+            let err_rate = ev_f64(o, "error_rate").unwrap_or(0.0) * 100.0;
+            let trunc = ev_u64(o, "truncated").unwrap_or(0);
+            let avg_kb = ev_f64(o, "avg_output_kb").unwrap_or(0.0);
+            let tool = clean_tool_label(&o.target);
+            if errs >= 3 {
+                vec![
+                    format!(
+                        "Tool `{tool}` failed on {errs} of {calls} calls ({err_rate:.0}% error rate) across {sess} sessions ({who})."
+                    ),
+                    format!(
+                        "Average payload is {avg_kb:.1} KB ({trunc} truncated) — failed tool calls stall the agent loop and often trigger shell fallbacks."
+                    ),
+                ]
+            } else {
+                vec![
+                    format!(
+                        "Tool `{tool}` returned truncated output on {trunc} of {calls} calls (avg {avg_kb:.1} KB) across {sess} sessions ({who})."
+                    ),
+                    "Oversized tool payloads lose critical details at the cut-off and force repeated follow-up calls.".to_string(),
+                ]
+            }
+        }
+        "context_handoff_bloat" => {
+            let hs = ev_u64(o, "handoff_sessions").unwrap_or(0);
+            let fs = ev_u64(o, "fresh_sessions").unwrap_or(0);
+            let h_tok = ev_u64(o, "handoff_avg_tokens").unwrap_or(0) as i64;
+            let f_tok = ev_u64(o, "fresh_avg_tokens").unwrap_or(0) as i64;
+            let mult = ev_f64(o, "multiplier").unwrap_or(0.0);
+            vec![
+                format!(
+                    "{hs} continued/handoff threads averaged {} tokens vs {} for {fs} fresh sessions ({mult:.1}× heavier, {who}).",
+                    format_compact(h_tok),
+                    format_compact(f_tok)
+                ),
+                "Carrying a huge compacted thread history into new tasks multiplies token burn on every single turn.".to_string(),
+            ]
+        }
+        "low_cache_efficiency" => {
+            let sess = ev_u64(o, "sessions").unwrap_or(0);
+            let rate = ev_f64(o, "weighted_cache_hit").unwrap_or(0.0) * 100.0;
+            let uncached = ev_u64(o, "uncached_input_tokens").unwrap_or(0) as i64;
+            vec![
+                format!(
+                    "Prompt cache hit rate is only {rate:.1}% across {sess} main sessions ({who}), leaving {} input tokens uncached.",
+                    format_compact(uncached)
+                ),
+                "Dynamic prompt prefixes, tool-list churn, or long pauses past cache TTL break prefix reuse and inflate cost/latency.".to_string(),
+            ]
+        }
+        "harness_divergence" => {
+            let metric = ev_str(o, "metric").unwrap_or("this behavior");
+            let top = ev_str(o, "top_harness")
+                .map(short_harness)
+                .unwrap_or("one harness");
+            let low = ev_str(o, "low_harness")
+                .map(short_harness)
+                .unwrap_or("another");
+            let tr = ev_f64(o, "top_rate").unwrap_or(0.0);
+            let lr = ev_f64(o, "low_rate").unwrap_or(0.0);
+            let cnt = ev_u64(o, "top_count").unwrap_or(0);
+            vec![
+                format!(
+                    "`{top}` triggers {metric} at {tr:.1}/1k commands ({cnt}×) vs {lr:.1}/1k in `{low}` on the exact same repository."
+                ),
+                format!(
+                    "Because `{low}` avoids this on the same codebase, the cause is almost certainly `{top}`'s harness config, instructions, or output/shell behavior."
+                ),
+            ]
+        }
+        "orientation_tax" => {
+            let cmds = ev_u64(o, "early_commands").unwrap_or(0);
+            let docs = ev_u64(o, "early_doc_reads").unwrap_or(0);
+            vec![
+                format!(
+                    "Agents spend turns 1–3 running {cmds} discovery commands and {docs} doc reads ({who}) just to orient themselves."
+                ),
+                "Missing project map, buried entrypoints, or scattered docs force every new session to pay the same ramp-up tax.".to_string(),
+            ]
+        }
+        "cli_help_tax" => {
+            let calls = ev_u64(o, "help_calls").unwrap_or(0);
+            let broken = ev_u64(o, "broken_help_calls").unwrap_or(0);
+            vec![
+                format!(
+                    "Agents invoked `--help` {calls} times ({broken} exited nonzero, {who}) trying to figure out repo CLI syntax."
+                ),
+                "Documenting the 5–10 most common invocations (and fixing broken `--help` exits) removes these discovery turns.".to_string(),
+            ]
+        }
+        "repeated_file_reread" => {
+            let reads = ev_u64(o, "reads").unwrap_or(0);
+            let sess = ev_u64(o, "sessions").unwrap_or(0);
+            let max_r = ev_u64(o, "max_reads_in_session").unwrap_or(0);
+            let toks = ev_u64(o, "total_tokens").unwrap_or(0) as i64;
+            vec![
+                format!(
+                    "`{}` was read {reads} times across {sess} sessions (up to {max_r}× in one session, {} tokens, {who}).",
+                    o.target,
+                    format_compact(toks)
+                ),
+                "Large monolith files or unindexed docs get re-read over and over whenever context trims or agents double-check symbols.".to_string(),
+            ]
+        }
+        "missing_composite_task" => {
+            let occ = ev_u64(o, "occurrences").unwrap_or(0);
+            let sess = ev_u64(o, "sessions").unwrap_or(0);
+            let wait = ev_f64(o, "combined_wait_s").unwrap_or(0.0);
+            vec![
+                format!(
+                    "Agents manually chain `{}` {occ} times across {sess} sessions ({} total wait, {who}).",
+                    o.target,
+                    format_duration(wait)
+                ),
+                "Each manual hand-off costs an extra model round-trip; a single composite task or richer first step eliminates the hop.".to_string(),
+            ]
+        }
+        _ => vec![o.impact_summary.clone()],
+    }
+}
+
+/// Plain-English fix guidance + human-readable success goal.
+fn insight_fix_guidance(o: &Opportunity) -> (String, String) {
+    match o.kind.as_str() {
+        "polling_tax" if o.target.starts_with("codex-wait") || o.target == "codex-write-stdin" => (
+            "Avoid interactive/background shell jobs in Codex or give commands a built-in `--wait` flag / higher exec timeout so Codex doesn't spin polling PTY output.".to_string(),
+            "Drop polling calls to ≤ 1.5× per session".to_string(),
+        ),
+        "polling_tax" => (
+            format!(
+                "Make `{}` block until done (or print a clear wait/notify hint in {}) instead of returning immediately for agents to poll.",
+                o.target, o.fix_target
+            ),
+            "Drop polling calls to ≤ 1.5× per session".to_string(),
+        ),
+        "context_handoff_bloat" => (
+            "Start fresh threads for new tasks instead of continuing long compacted sessions, or trim handoff summaries to only active state.".to_string(),
+            "Keep resumed sessions within 1.5× of fresh session tokens".to_string(),
+        ),
+        "low_cache_efficiency" => (
+            format!(
+                "Check {} for changing system-prompt prefixes, unstable tool definitions, or idle gaps exceeding prompt-cache TTL.",
+                o.fix_target
+            ),
+            "Raise weighted prompt cache hit to ≥ 90%".to_string(),
+        ),
+        "harness_divergence" => (
+            o.suggested_action.clone(),
+            "Bring both harnesses within 1.5× of each other".to_string(),
+        ),
+        _ => (o.suggested_action.clone(), o.acceptance_metric.clone()),
+    }
+}
+
 fn compact_opp_metric(o: &Opportunity) -> String {
     match o.kind.as_str() {
         "polling_tax" => {
@@ -955,9 +1751,9 @@ fn compact_opp_metric(o: &Opportunity) -> String {
             let wait = ev_f64(o, "total_wait_s").unwrap_or(0.0);
             if wait >= 60.0 {
                 format!(
-                    "{} polls · {}",
-                    format_int(calls as usize),
-                    format_duration(wait)
+                    "{} · {} polls",
+                    format_duration(wait),
+                    format_int(calls as usize)
                 )
             } else {
                 format!("{} polls", format_int(calls as usize))
@@ -977,7 +1773,8 @@ fn compact_opp_metric(o: &Opportunity) -> String {
         }
         "lossy_task_rebound" => {
             let n = ev_u64(o, "rebound_count").unwrap_or(0);
-            format!("{} fallbacks", format_int(n as usize))
+            let rate = ev_f64(o, "rebound_rate").unwrap_or(0.0) * 100.0;
+            format!("{rate:.0}% ({})", format_int(n as usize))
         }
         "orientation_tax" => {
             let cmds = ev_u64(o, "early_commands").unwrap_or(0)
@@ -1028,8 +1825,16 @@ fn compact_opp_metric(o: &Opportunity) -> String {
             format!("{r:.0}% cache hit")
         }
         "harness_divergence" => {
-            let r = ev_f64(o, "rate_ratio").unwrap_or(0.0);
-            format!("{r:.1}× gap")
+            let tr = ev_f64(o, "top_rate");
+            let lr = ev_f64(o, "low_rate");
+            match (tr, lr) {
+                (Some(t), Some(l)) if l < 0.5 => format!("{t:.0} vs 0 /1k"),
+                (Some(t), Some(l)) => format!("{t:.0} vs {l:.0} /1k"),
+                _ => {
+                    let r = ev_f64(o, "rate_ratio").unwrap_or(0.0);
+                    format!("{r:.1}× gap")
+                }
+            }
         }
         _ => truncate_ellipsis(&o.impact_summary, 18),
     }
@@ -1049,19 +1854,6 @@ fn primary_metric_for(item: &MergedInsight) -> String {
         return format!("{base} · {}", format_duration(wait));
     }
     base
-}
-
-fn sessions_label_for(o: &Opportunity) -> String {
-    if let Some(s) = ev_u64(o, "sessions") {
-        return format!("{s} sess");
-    }
-    if let Some(s) = ev_u64(o, "handoff_sessions") {
-        return format!("{s} sess");
-    }
-    if let Some(r) = ev_u64(o, "runs") {
-        return format!("{r} runs");
-    }
-    "—".to_string()
 }
 
 fn rounded_block<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
@@ -1318,7 +2110,155 @@ fn draw_active_tab(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 1: Insights (KPIs + Aligned Deduplicated Table + 2-Column Insight Card)
+// Shared Diagnosis Card Renderer (Used by Tab 1 Insights & Tab 3 Harnesses)
+// ---------------------------------------------------------------------------
+
+fn render_opportunity_diagnosis(
+    frame: &mut Frame,
+    area: Rect,
+    item: &MergedInsight,
+    focused: bool,
+) {
+    let o = &item.primary;
+    let (_, sev_col, _) = human_problem(&o.kind);
+    let headline = insight_headline(o);
+    let (scope_badge, scope_col) = if o.scope == "harness" {
+        ("AGENT RUNTIME", Color::LightBlue)
+    } else {
+        ("REPO HARNESS", Color::Green)
+    };
+
+    let card_title = Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(sev_col)),
+        Span::styled(
+            format!(
+                "{} ",
+                truncate_ellipsis(&headline, area.width.saturating_sub(28).max(16) as usize)
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("[{scope_badge}] "),
+            Style::default().fg(scope_col).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // 1. Plain-English Diagnosis
+    lines.push(Line::from(Span::styled(
+        "WHAT'S HAPPENING",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for para in insight_story(o) {
+        lines.push(Line::from(para));
+    }
+    if !item.related.is_empty() {
+        let also: Vec<String> = item
+            .related
+            .iter()
+            .map(|r| {
+                let (rl, _, _) = human_problem(&r.kind);
+                let m = compact_opp_metric(r);
+                format!("{rl} ({m})")
+            })
+            .collect();
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Related: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(also.join(" · "), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+
+    // 2. Who hits this (visual harness bars)
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "WHICH HARNESS HITS THIS",
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let bar_w = if area.width >= 56 { 14 } else { 10 };
+    lines.extend(harness_bar_lines(&o.by_harness, bar_w));
+
+    // 3. Cleaned Concrete Evidence
+    let cleaned_proofs: Vec<String> = o
+        .trace_proof
+        .iter()
+        .map(|tp| {
+            if let Some(rest) = tp.strip_prefix("Sample error: ") {
+                let unquoted = rest.trim_matches('`');
+                let c = clean_error_preview(unquoted);
+                if c.is_empty() {
+                    String::new()
+                } else {
+                    format!("Error: {c}")
+                }
+            } else {
+                tp.clone()
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .take(3)
+        .collect();
+    if !cleaned_proofs.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "REAL EVIDENCE FROM TRACES",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for tp in cleaned_proofs {
+            lines.push(Line::from(Span::styled(
+                format!("• {tp}"),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+
+    // 4. Actionable Fix & Plain-English Goal
+    let (fix_text, goal_text) = insight_fix_guidance(o);
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "HOW TO FIX ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({})", o.fix_target),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(fix_text));
+    lines.push(Line::from(vec![
+        Span::styled("Success target: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(goal_text, Style::default().fg(Color::Green)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press [Enter] to inspect full redacted command/tool trace samples",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(rounded_block(card_title, focused)),
+        area,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tab 1: Insights (Executive Summary Strip + Master/Detail Diagnosis)
 // ---------------------------------------------------------------------------
 
 fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1332,17 +2272,12 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     };
 
-    let detail_h = if area.height >= 30 { 12 } else { 9 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(7),
-            Constraint::Length(detail_h),
-        ])
+        .constraints([Constraint::Length(4), Constraint::Min(10)])
         .split(area);
 
-    // 1. Plain-English KPI Cards
+    // 1. Plain-English Executive KPI Strip
     let k = &repo.kpis;
     let cards = Layout::default()
         .direction(Direction::Horizontal)
@@ -1354,29 +2289,36 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         ])
         .split(rows[0]);
 
-    let cache_str = k
-        .cache_hit_rate
-        .map(|v| format!("{:.0}% cache", v * 100.0))
-        .unwrap_or_else(|| "no cache data".into());
+    let repo_cnt = repo.opportunities.len();
+    let harn_cnt = repo.harness_overhead.len();
+    let top_issue_hint = app
+        .visible_insights()
+        .first()
+        .map(|m| format!("Top: {}", primary_metric_for(m)))
+        .unwrap_or_else(|| "No major bottlenecks".into());
     let card1 = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                format_compact(k.median_tokens_per_session),
+                format!("{}", repo_cnt + harn_cnt),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(if repo_cnt + harn_cnt > 0 {
+                        Color::Yellow
+                    } else {
+                        Color::Green
+                    })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" median toks", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!(" issues ({repo_cnt} repo · {harn_cnt} runtime)"),
+                Style::default().fg(Color::Gray),
+            ),
         ]),
         Line::from(Span::styled(
-            format!(
-                "Top 5% hit {} · {cache_str}",
-                format_compact(k.p95_tokens_per_session)
-            ),
+            top_issue_hint,
             Style::default().fg(Color::Gray),
         )),
     ])
-    .block(rounded_block(" Session Size ", false));
+    .block(rounded_block(" Bottlenecks Found ", false));
 
     let card2 = Paragraph::new(vec![
         Line::from(vec![
@@ -1393,35 +2335,31 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::default().fg(Color::Gray),
         )),
     ])
-    .block(rounded_block(" Tool Wait ", false));
+    .block(rounded_block(" Time Waiting ", false));
 
-    let cli_val = k
-        .cli_adoption_rate
-        .map(|v| format!("{:.0}%", v * 100.0))
-        .unwrap_or_else(|| "n/a".into());
+    let cache_str = k
+        .cache_hit_rate
+        .map(|v| format!("{:.0}% cache", v * 100.0))
+        .unwrap_or_else(|| "no cache data".into());
     let card3 = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                cli_val,
+                format_compact(k.median_tokens_per_session),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" via repo CLI", Style::default().fg(Color::Gray)),
+            Span::styled(" med uncached", Style::default().fg(Color::Gray)),
         ]),
         Line::from(Span::styled(
             format!(
-                "{:.0}% fall back to shell",
-                k.escape_hatch_rebound_rate * 100.0
+                "{cache_str} · {} stdout",
+                format_compact(k.total_stdout_tokens)
             ),
-            Style::default().fg(if k.escape_hatch_rebound_rate >= 0.30 {
-                Color::Yellow
-            } else {
-                Color::Gray
-            }),
+            Style::default().fg(Color::Gray),
         )),
     ])
-    .block(rounded_block(" CLI Adoption ", false));
+    .block(rounded_block(" Context & Cache ", false));
 
     let err_col = if k.command_error_rate >= 0.10 {
         Color::Red
@@ -1430,6 +2368,10 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Color::Green
     };
+    let cli_str = k
+        .cli_adoption_rate
+        .map(|v| format!("{:.0}% repo CLI", v * 100.0))
+        .unwrap_or_else(|| "no repo CLI".into());
     let card4 = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -1439,71 +2381,85 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(" cmd errors", Style::default().fg(Color::Gray)),
         ]),
         Line::from(Span::styled(
-            format!("{} startup discovery", format_compact(k.orientation_tokens)),
-            Style::default().fg(Color::Gray),
+            format!(
+                "{cli_str} · {:.0}% fallbacks",
+                k.escape_hatch_rebound_rate * 100.0
+            ),
+            Style::default().fg(if k.escape_hatch_rebound_rate >= 0.30 {
+                Color::Yellow
+            } else {
+                Color::Gray
+            }),
         )),
     ])
-    .block(rounded_block(" Errors & Startup ", false));
+    .block(rounded_block(" Reliability & CLI ", false));
 
     frame.render_widget(card1, cards[0]);
     frame.render_widget(card2, cards[1]);
     frame.render_widget(card3, cards[2]);
     frame.render_widget(card4, cards[3]);
 
-    // 2. Scannable, Deduplicated Signals Table
+    // 2. Master-Detail Layout (Side-by-Side on wide terminals, Stacked on narrow)
     let merged = app.visible_insights();
-    let wide = rows[1].width >= 108;
+    let side_by_side = rows[1].width >= 104;
+    let panes = if side_by_side {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(rows[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+            .split(rows[1])
+    };
 
     let filter_title = Line::from(vec![
         Span::styled(
-            format!(" Signals ({}) ", merged.len()),
+            format!(" Issues ({}) ", merged.len()),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled("─ Filter: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("─ ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("[{}]", app.scope_filter.label()),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!(
-                "  ({} repo · {} harness)  (f) ",
-                repo.opportunities.len(),
-                repo.harness_overhead.len()
-            ),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("  (f) ", Style::default().fg(Color::DarkGray)),
     ]);
 
     if merged.is_empty() {
         let p = Paragraph::new(
-            "No friction signals in this scope & window.\nPress 'f' to switch scope (Repo / All / Harness) or 'w' to widen window.",
+            "No friction issues in this scope & window.\nPress 'f' to cycle scope (All / Repo harness / Agent runtime) or 'w' to widen window.",
         )
         .block(rounded_block(filter_title, focused));
-        frame.render_widget(p, rows[1]);
+        frame.render_widget(p, panes[0]);
     } else {
-        let target_w = if wide {
-            rows[1].width.saturating_sub(74).max(20) as usize
+        let max_score = merged
+            .iter()
+            .map(|m| m.primary.score.max(1))
+            .max()
+            .unwrap_or(1) as f64;
+        let show_load_bar = panes[0].width >= 56;
+        let issue_w = if show_load_bar {
+            panes[0].width.saturating_sub(38).max(16) as usize
         } else {
-            rows[1].width.saturating_sub(54).max(18) as usize
+            panes[0].width.saturating_sub(30).max(16) as usize
         };
 
-        let header = if wide {
+        let header = if show_load_bar {
             Row::new(vec![
-                Cell::from("Problem"),
-                Cell::from("Target"),
+                Cell::from("Origin"),
+                Cell::from("Issue"),
                 Cell::from(Line::from("Impact").right_aligned()),
-                Cell::from(Line::from("Scope").right_aligned()),
-                Cell::from("Harness"),
-                Cell::from("Area"),
+                Cell::from("Load"),
             ])
         } else {
             Row::new(vec![
-                Cell::from("Problem"),
-                Cell::from("Target"),
+                Cell::from("Origin"),
+                Cell::from("Issue"),
                 Cell::from(Line::from("Impact").right_aligned()),
-                Cell::from("Harness"),
             ])
         }
         .style(
@@ -1516,183 +2472,72 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             .iter()
             .map(|item| {
                 let o = &item.primary;
-                let (label, sev_col, _) = human_problem(&o.kind);
-                let problem_cell = Cell::from(Line::from(vec![
-                    Span::styled("● ", Style::default().fg(sev_col)),
-                    Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
-                ]));
-                let target_cell = Cell::from(truncate_ellipsis(&o.target, target_w));
-                let metric = primary_metric_for(item);
-                let impact_cell = Cell::from(Line::from(metric).right_aligned());
-                let (h_txt, h_col) = compact_harness_cell(&o.by_harness);
-                let harness_cell = Cell::from(h_txt).style(Style::default().fg(h_col));
-
-                if wide {
-                    let sess_or_scope = if app.scope_filter == ScopeFilter::All {
-                        o.scope.clone()
-                    } else {
-                        sessions_label_for(o)
-                    };
-                    Row::new(vec![
-                        problem_cell,
-                        target_cell,
-                        impact_cell,
-                        Cell::from(Line::from(sess_or_scope).right_aligned())
-                            .style(Style::default().fg(Color::Gray)),
-                        harness_cell,
-                        Cell::from(truncate_ellipsis(&o.fix_target, 16))
-                            .style(Style::default().fg(Color::DarkGray)),
-                    ])
+                let (_, sev_col, _) = human_problem(&o.kind);
+                let (tag, tag_col) = if o.scope == "harness" {
+                    ("HARN", Color::LightBlue)
                 } else {
-                    Row::new(vec![problem_cell, target_cell, impact_cell, harness_cell])
+                    ("REPO", Color::Green)
+                };
+                let origin_cell = Cell::from(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(sev_col)),
+                    Span::styled(
+                        tag,
+                        Style::default().fg(tag_col).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                let headline = insight_headline(o);
+                let issue_cell = Cell::from(truncate_ellipsis(&headline, issue_w));
+                let metric = primary_metric_for(item);
+                let impact_cell = Cell::from(Line::from(metric).right_aligned())
+                    .style(Style::default().fg(Color::White));
+
+                if show_load_bar {
+                    let frac = (o.score.max(0) as f64 / max_score).sqrt().clamp(0.15, 1.0);
+                    let bar_cell =
+                        Cell::from(bar_string(frac, 6)).style(Style::default().fg(sev_col));
+                    Row::new(vec![origin_cell, issue_cell, impact_cell, bar_cell])
+                } else {
+                    Row::new(vec![origin_cell, issue_cell, impact_cell])
                 }
             })
             .collect();
 
-        let constraints: Vec<Constraint> = if wide {
+        let constraints: Vec<Constraint> = if show_load_bar {
             vec![
-                Constraint::Length(17),
+                Constraint::Length(6),
                 Constraint::Fill(1),
-                Constraint::Length(18),
-                Constraint::Length(8),
-                Constraint::Length(12),
-                Constraint::Length(16),
+                Constraint::Length(17),
+                Constraint::Length(6),
             ]
         } else {
             vec![
-                Constraint::Length(17),
+                Constraint::Length(6),
                 Constraint::Fill(1),
-                Constraint::Length(18),
-                Constraint::Length(12),
+                Constraint::Length(17),
             ]
         };
 
         let table = Table::new(table_rows, constraints)
             .header(header)
-            .column_spacing(2)
+            .column_spacing(1)
             .block(rounded_block(filter_title, focused))
             .row_highlight_style(row_highlight_style())
             .highlight_symbol("▶ ");
-        frame.render_stateful_widget(table, rows[1], &mut app.opp_state);
+        frame.render_stateful_widget(table, panes[0], &mut app.opp_state);
     }
 
-    // 3. Rich 2-Column Insight Card
+    // 3. Full Plain-English Diagnosis Panel
     if let Some(idx) = app.opp_state.selected()
         && let Some(item) = merged.get(idx)
     {
-        let o = &item.primary;
-        let (label, sev_col, meaning) = human_problem(&o.kind);
-        let card_title = Line::from(vec![
-            Span::styled(" ● ", Style::default().fg(sev_col)),
-            Span::styled(
-                format!("{label}: {} ", truncate_ellipsis(&o.target, 52)),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("[{}] ", o.scope),
-                Style::default().fg(if o.scope == "harness" {
-                    Color::Blue
-                } else {
-                    Color::Green
-                }),
-            ),
-            Span::styled(
-                " [Enter] Inspect traces ",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-
-        let card_block = rounded_block(card_title, false);
-        let inner = card_block.inner(rows[2]);
-        frame.render_widget(card_block, rows[2]);
-
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(54),
-                Constraint::Length(2),
-                Constraint::Percentage(46),
-            ])
-            .split(inner);
-
-        // Left column: Plain-English explanation + Where to look
-        let mut left_lines = vec![
-            Line::from(Span::styled(
-                "WHAT'S HAPPENING",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(meaning),
-            Line::from(Span::styled(
-                format!("Impact: {}", o.impact_summary),
-                Style::default().fg(Color::Gray),
-            )),
-        ];
-        if !item.related.is_empty() {
-            let also: Vec<String> = item
-                .related
-                .iter()
-                .map(|r| {
-                    let (rl, _, _) = human_problem(&r.kind);
-                    let m = compact_opp_metric(r);
-                    format!("{rl} ({m})")
-                })
-                .collect();
-            left_lines.push(Line::from(Span::styled(
-                format!("Also: {}", also.join(" · ")),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-        left_lines.push(Line::from(""));
-        left_lines.push(Line::from(Span::styled(
-            "WHERE TO LOOK",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )));
-        left_lines.push(Line::from(o.suggested_action.clone()));
-        left_lines.push(Line::from(Span::styled(
-            format!("Goal: {}", o.acceptance_metric),
-            Style::default().fg(Color::Gray),
-        )));
-
-        frame.render_widget(
-            Paragraph::new(left_lines).wrap(Wrap { trim: true }),
-            cols[0],
-        );
-
-        // Right column: Who does it (visual proportion bars) + Concrete evidence
-        let mut right_lines = vec![Line::from(Span::styled(
-            "WHO DOES IT",
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
-        ))];
-        right_lines.extend(harness_bar_lines(&o.by_harness, 10));
-        if !o.trace_proof.is_empty() {
-            right_lines.push(Line::from(""));
-            right_lines.push(Line::from(Span::styled(
-                "CONCRETE EVIDENCE",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for tp in o.trace_proof.iter().take(2) {
-                right_lines.push(Line::from(Span::styled(
-                    format!("• {tp}"),
-                    Style::default().fg(Color::Gray),
-                )));
-            }
-        }
-        frame.render_widget(
-            Paragraph::new(right_lines).wrap(Wrap { trim: true }),
-            cols[2],
-        );
+        render_opportunity_diagnosis(frame, panes[1], item, false);
     } else {
-        let p = Paragraph::new("Select a signal above to inspect its plain-English breakdown.")
-            .block(rounded_block(" Insight ", false));
-        frame.render_widget(p, rows[2]);
+        let p = Paragraph::new(
+            "Select an issue on the left to read its plain-English diagnosis, harness split, real trace evidence, and fix guidance.",
+        )
+        .wrap(Wrap { trim: true })
+        .block(rounded_block(" Diagnosis ", false));
+        frame.render_widget(p, panes[1]);
     }
 }
 
@@ -2099,22 +2944,32 @@ fn draw_patterns_tab(frame: &mut Frame, area: Rect, app: &mut App) {
                 if !pat.pareto.storm_lifts.is_empty() {
                     detail_lines.push(Line::from(""));
                     detail_lines.push(Line::from(Span::styled(
-                        "RUNAWAY SESSION DRIVERS (TOP-25% VS BOT-50%)",
+                        "WHAT DRIVES EXPENSIVE SESSIONS (TOP 25% VS TYPICAL)",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     )));
-                    for lift in pat.pareto.storm_lifts.iter().take(4) {
-                        detail_lines.push(Line::from(Span::styled(
-                            format!(
-                                "• {} — {:.0}% vs {:.0}% ({})",
-                                lift.family,
-                                lift.top25_pct_sessions,
-                                lift.bottom50_pct_sessions,
-                                lift.lift_str
+                    for lift in pat.pareto.storm_lifts.iter().take(5) {
+                        let frac = (lift.top25_pct_sessions / 100.0).clamp(0.0, 1.0);
+                        let lift_clean = if lift.lift_str.starts_with("inf") {
+                            "top-25% only".to_string()
+                        } else {
+                            lift.lift_str.clone()
+                        };
+                        detail_lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{:<16} ", truncate_ellipsis(&lift.family, 16)),
+                                Style::default().fg(Color::White),
                             ),
-                            Style::default().fg(Color::Gray),
-                        )));
+                            Span::styled(bar_string(frac, 8), Style::default().fg(Color::Yellow)),
+                            Span::styled(
+                                format!(
+                                    " {:>3.0}% vs {:>2.0}% ({lift_clean})",
+                                    lift.top25_pct_sessions, lift.bottom50_pct_sessions
+                                ),
+                                Style::default().fg(Color::Gray),
+                            ),
+                        ]));
                     }
                 }
             } else {
@@ -2139,10 +2994,15 @@ fn draw_patterns_tab(frame: &mut Frame, area: Rect, app: &mut App) {
                     "improving" => ("IMPROVE", Color::Green),
                     _ => ("CHRONIC", Color::Yellow),
                 };
+                let delta_str = if d.early_runs == 0 {
+                    format!("NEW +{}", d.recent_runs)
+                } else {
+                    format!("{:.1}×", d.rate_ratio)
+                };
                 rows_vec.push(Row::new(vec![
                     Cell::from(tag).style(Style::default().fg(col).add_modifier(Modifier::BOLD)),
                     Cell::from(truncate_ellipsis(&d.cmd_family, left_w)),
-                    Cell::from(Line::from(format!("{:.1}×", d.rate_ratio)).right_aligned()),
+                    Cell::from(Line::from(delta_str).right_aligned()),
                 ]));
             }
             for c in &pat.cold_start_errors {
@@ -2303,8 +3163,91 @@ fn draw_patterns_tab(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 3: Harnesses (Side-by-Side Comparison + Harness Overhead + MCP Tools)
+// Tab 3: Harnesses (Takeaways + Visual Scorecard + Interactive Harness Issues)
 // ---------------------------------------------------------------------------
+
+fn render_mcp_tool_diagnosis(frame: &mut Frame, area: Rect, t: &ToolStat) {
+    let tool = clean_tool_label(&t.tool_name);
+    let title = Line::from(vec![
+        Span::styled(
+            " ● ",
+            Style::default().fg(if t.error_count > 0 {
+                Color::Red
+            } else {
+                Color::Yellow
+            }),
+        ),
+        Span::styled(
+            format!("MCP Tool: {} ", truncate_ellipsis(&tool, 40)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "[MCP TOOL] ",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "WHAT'S HAPPENING",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "`{tool}` failed on {} of {} calls ({:.0}% error rate) across {} sessions, with {} truncated outputs (avg {:.1} KB).",
+            t.error_count,
+            t.calls,
+            t.error_rate * 100.0,
+            t.sessions,
+            t.truncated_count,
+            t.avg_output_kb
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "WHICH HARNESS HITS THIS",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    lines.extend(harness_bar_lines(&t.by_harness, 12));
+
+    if let Some(err) = &t.sample_error {
+        let cleaned = clean_error_preview(err);
+        if !cleaned.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "SAMPLE ERROR MESSAGE",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                cleaned,
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "HOW TO FIX",
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(
+        "Inspect the MCP server schema, error handling, timeouts, or credentials for this tool — repeated tool errors stall agent turns and trigger manual shell fallbacks.",
+    ));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(rounded_block(title, false)),
+        area,
+    );
+}
 
 fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Main;
@@ -2315,32 +3258,97 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     };
 
+    let harness_rows = app.visible_harness_rows();
+    let table_h = (harness_rows.len() as u16 + 4).clamp(6, (area.height / 3).max(6));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(table_h),
+            Constraint::Min(10),
+        ])
         .split(area);
 
-    let wide = rows[0].width >= 108;
+    // 1. Auto-Synthesized Key Harness Takeaways
+    let mut takeaway_lines: Vec<Line<'static>> = Vec::new();
+    for hr in harness_rows.iter().take(2) {
+        let issues = app.issues_for_harness(&hr.agent_kind);
+        let short = short_harness(&hr.agent_kind);
+        let hcol = harness_color(short);
+        let cache_txt = hr
+            .weighted_cache_hit
+            .map(|r| format!("{:.0}% cache", r * 100.0))
+            .unwrap_or_else(|| "no cache data".into());
+        let top_issue = issues
+            .first()
+            .map(|iss| match iss {
+                HarnessIssueItem::Opp(m) => format!(
+                    "{} ({})",
+                    truncate_ellipsis(&insight_headline(&m.primary), 42),
+                    primary_metric_for(m)
+                ),
+                HarnessIssueItem::McpTool(t) => format!(
+                    "MCP {} failing ({:.0}%)",
+                    clean_tool_label(&t.tool_name),
+                    t.error_rate * 100.0
+                ),
+            })
+            .unwrap_or_else(|| "no major harness issues flagged".into());
+        takeaway_lines.push(Line::from(vec![
+            Span::styled("● ", Style::default().fg(hcol)),
+            Span::styled(
+                format!("{short:<11} "),
+                Style::default().fg(hcol).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{} sess · {} cmds · {cache_txt}  →  ",
+                    hr.sessions,
+                    format_compact(hr.commands as i64)
+                ),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(top_issue, Style::default().fg(Color::White)),
+        ]));
+    }
+    if takeaway_lines.is_empty() {
+        takeaway_lines.push(Line::from(Span::styled(
+            "No harness sessions recorded in this window.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(takeaway_lines)
+            .wrap(Wrap { trim: true })
+            .block(rounded_block(" Harness Key Takeaways ", false)),
+        rows[0],
+    );
+
+    // 2. Visual Harness Scorecard (Grouped by Agent by default, `d` toggles detailed strata)
+    let max_wait = harness_rows
+        .iter()
+        .map(|h| h.median_tool_wait_s)
+        .fold(1.0_f64, f64::max);
+    let wide = rows[1].width >= 106;
     let header = if wide {
         Row::new(vec![
-            Cell::from("Harness / Role"),
+            Cell::from("Harness"),
             Cell::from(Line::from("Sess").right_aligned()),
             Cell::from(Line::from("Cmds").right_aligned()),
             Cell::from(Line::from("Med Toks").right_aligned()),
-            Cell::from(Line::from("Uncached").right_aligned()),
             Cell::from("Cache Hit"),
-            Cell::from(Line::from("Med Wait").right_aligned()),
+            Cell::from("Med Wait"),
             Cell::from(Line::from("Err%").right_aligned()),
-            Cell::from(Line::from("Fallback%").right_aligned()),
+            Cell::from(Line::from("Issues").right_aligned()),
         ])
     } else {
         Row::new(vec![
-            Cell::from("Harness / Role"),
+            Cell::from("Harness"),
             Cell::from(Line::from("Sess").right_aligned()),
             Cell::from(Line::from("Cmds").right_aligned()),
-            Cell::from(Line::from("Med Toks").right_aligned()),
             Cell::from("Cache Hit"),
             Cell::from(Line::from("Err%").right_aligned()),
+            Cell::from(Line::from("Issues").right_aligned()),
         ])
     }
     .style(
@@ -2349,21 +3357,12 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let table_rows: Vec<Row> = pat
-        .harness_comparison
+    let table_rows: Vec<Row> = harness_rows
         .iter()
         .map(|h| {
             let short = short_harness(&h.agent_kind);
             let hcol = harness_color(short);
-            let role_label = if h.originator != "default" && !h.originator.is_empty() {
-                format!(
-                    "{short} ({} · {})",
-                    h.role,
-                    truncate_ellipsis(&h.originator, 10)
-                )
-            } else {
-                format!("{short} ({})", h.role)
-            };
+            let issue_cnt = app.issues_for_harness(&h.agent_kind).len();
             let cache_cell = match h.weighted_cache_hit {
                 Some(r) => {
                     let ccol = if r >= 0.85 {
@@ -2380,6 +3379,11 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
                 }
                 None => Cell::from("n/a").style(Style::default().fg(Color::DarkGray)),
             };
+            let wait_frac = (h.median_tool_wait_s / max_wait).clamp(0.0, 1.0);
+            let wait_cell = Cell::from(Line::from(vec![
+                Span::styled(bar_string(wait_frac, 6), Style::default().fg(Color::Yellow)),
+                Span::raw(format!(" {:>5}", format_duration(h.median_tool_wait_s))),
+            ]));
             let err_col = if h.error_rate >= 0.08 {
                 Color::Red
             } else if h.error_rate >= 0.03 {
@@ -2387,33 +3391,39 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Color::Green
             };
+            let iss_col = if issue_cnt >= 4 {
+                Color::Yellow
+            } else if issue_cnt > 0 {
+                Color::Cyan
+            } else {
+                Color::Green
+            };
 
             if wide {
                 Row::new(vec![
-                    Cell::from(truncate_ellipsis(&role_label, 28)).style(Style::default().fg(hcol)),
+                    Cell::from(truncate_ellipsis(&h.label, 28))
+                        .style(Style::default().fg(hcol).add_modifier(Modifier::BOLD)),
                     Cell::from(Line::from(h.sessions.to_string()).right_aligned()),
                     Cell::from(Line::from(format_compact(h.commands as i64)).right_aligned()),
                     Cell::from(Line::from(format_compact(h.median_total_tokens)).right_aligned()),
-                    Cell::from(Line::from(format_compact(h.avg_uncached_tokens)).right_aligned())
-                        .style(Style::default().fg(Color::Gray)),
                     cache_cell,
-                    Cell::from(Line::from(format_duration(h.median_tool_wait_s)).right_aligned()),
+                    wait_cell,
                     Cell::from(Line::from(format!("{:.1}%", h.error_rate * 100.0)).right_aligned())
                         .style(Style::default().fg(err_col)),
-                    Cell::from(
-                        Line::from(format!("{:.0}%", h.rebound_rate * 100.0)).right_aligned(),
-                    )
-                    .style(Style::default().fg(Color::Gray)),
+                    Cell::from(Line::from(issue_cnt.to_string()).right_aligned())
+                        .style(Style::default().fg(iss_col).add_modifier(Modifier::BOLD)),
                 ])
             } else {
                 Row::new(vec![
-                    Cell::from(truncate_ellipsis(&role_label, 24)).style(Style::default().fg(hcol)),
+                    Cell::from(truncate_ellipsis(&h.label, 24))
+                        .style(Style::default().fg(hcol).add_modifier(Modifier::BOLD)),
                     Cell::from(Line::from(h.sessions.to_string()).right_aligned()),
                     Cell::from(Line::from(format_compact(h.commands as i64)).right_aligned()),
-                    Cell::from(Line::from(format_compact(h.median_total_tokens)).right_aligned()),
                     cache_cell,
                     Cell::from(Line::from(format!("{:.1}%", h.error_rate * 100.0)).right_aligned())
                         .style(Style::default().fg(err_col)),
+                    Cell::from(Line::from(issue_cnt.to_string()).right_aligned())
+                        .style(Style::default().fg(iss_col).add_modifier(Modifier::BOLD)),
                 ])
             }
         })
@@ -2425,169 +3435,248 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(5),
             Constraint::Length(6),
             Constraint::Length(8),
-            Constraint::Length(8),
             Constraint::Length(14),
-            Constraint::Length(8),
+            Constraint::Length(13),
             Constraint::Length(6),
-            Constraint::Length(9),
+            Constraint::Length(6),
         ]
     } else {
         vec![
             Constraint::Fill(1),
             Constraint::Length(5),
             Constraint::Length(6),
-            Constraint::Length(8),
             Constraint::Length(14),
+            Constraint::Length(6),
             Constraint::Length(6),
         ]
     };
 
+    let mode_lbl = if app.harness_show_strata {
+        "Detailed Strata"
+    } else {
+        "By Harness"
+    };
+    let table_title = Line::from(vec![
+        Span::styled(
+            format!(" Harness Scorecard ({}) ", harness_rows.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("─ [{mode_lbl}] (d)  ·  [Space/Enter] Focus issues below "),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
     let table = Table::new(table_rows, constraints)
         .header(header)
         .column_spacing(2)
         .block(rounded_block(
-            format!(
-                " Harness Comparison ({} strata) ",
-                pat.harness_comparison.len()
-            ),
-            focused,
+            table_title,
+            focused && !app.harness_focus_issues,
         ))
         .row_highlight_style(row_highlight_style())
         .highlight_symbol("▶ ");
-    frame.render_stateful_widget(table, rows[0], &mut app.harness_state);
+    frame.render_stateful_widget(table, rows[1], &mut app.harness_state);
 
-    // Bottom split: Left = Harness-specific overhead | Right = Top friction & MCP errors
+    // 3. Bottom Master-Detail: Selectable Harness Issues (Left) + Full Plain-English Diagnosis (Right)
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(rows[1]);
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(rows[2]);
 
     let sel_h = app
         .harness_state
         .selected()
-        .and_then(|i| pat.harness_comparison.get(i));
+        .and_then(|i| harness_rows.get(i));
     let selected_ag = sel_h.map(|h| h.agent_kind.as_str()).unwrap_or("");
     let short_ag = short_harness(selected_ag);
+    let issues = app.issues_for_harness(selected_ag);
 
-    // Left: Harness overhead for selected agent
-    let mut ov_lines = Vec::new();
-    if let Some(repo) = &app.selected_repo {
-        let filtered: Vec<&Opportunity> = repo
-            .harness_overhead
-            .iter()
-            .filter(|o| selected_ag.is_empty() || o.by_harness.contains_key(selected_ag))
-            .collect();
-        let merged_ov = merge_opportunities(&filtered);
-        if merged_ov.is_empty() {
-            ov_lines.push(Line::from(Span::styled(
-                format!("No harness-specific overhead flagged for {short_ag}."),
-                Style::default().fg(Color::Green),
+    let iss_title = Line::from(vec![
+        Span::styled(
+            format!(" Issues in {short_ag} ({}) ", issues.len()),
+            Style::default()
+                .fg(harness_color(short_ag))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if app.harness_focus_issues {
+                "─ [j/k · Enter traces · Space back] "
+            } else {
+                "─ [Space/l to browse] "
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    if issues.is_empty() {
+        let mut lines = vec![Line::from(Span::styled(
+            format!("No major friction issues flagged for {short_ag} in this window."),
+            Style::default().fg(Color::Green),
+        ))];
+        if let Some(h) = sel_h {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "Avg output: {:.1} KB · Truncated outputs: {} ({:.0}% of sessions)",
+                h.avg_output_kb, h.truncated_outputs, h.truncated_sessions_pct
             )));
-        } else {
-            for item in merged_ov.iter().take(6) {
-                let (lbl, col, _) = human_problem(&item.primary.kind);
-                ov_lines.push(Line::from(vec![
-                    Span::styled("● ", Style::default().fg(col)),
-                    Span::styled(
-                        format!("{lbl:<15} "),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("{}  ", truncate_ellipsis(&item.primary.target, 24))),
-                    Span::styled(primary_metric_for(item), Style::default().fg(Color::Yellow)),
-                ]));
+            if !h.top_friction_cmds.is_empty() {
+                lines.push(Line::from(format!(
+                    "Most active commands: {}",
+                    h.top_friction_cmds.join(" · ")
+                )));
             }
         }
-        if let Some(h) = sel_h {
-            ov_lines.push(Line::from(""));
-            ov_lines.push(Line::from(Span::styled(
-                format!(
-                    "Avg output: {:.1} KB · Truncated outputs: {} ({:.0}% of sessions)",
-                    h.avg_output_kb, h.truncated_outputs, h.truncated_sessions_pct
-                ),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(ov_lines)
-            .wrap(Wrap { trim: true })
-            .block(rounded_block(
-                format!(" Harness Overhead ({short_ag}) "),
-                false,
-            )),
-        bottom[0],
-    );
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(rounded_block(
+                    iss_title,
+                    focused && app.harness_focus_issues,
+                )),
+            bottom[0],
+        );
+    } else {
+        let iss_w = bottom[0].width.saturating_sub(28).max(16) as usize;
+        let iss_header = Row::new(vec![
+            Cell::from("Type"),
+            Cell::from("Issue"),
+            Cell::from(Line::from("Impact").right_aligned()),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        );
 
-    // Right: Top friction commands, universal friction, and failing MCP tools
-    let mut right_lines = Vec::new();
-    if let Some(h) = sel_h
-        && !h.top_friction_cmds.is_empty()
-    {
-        right_lines.push(Line::from(Span::styled(
-            format!("TOP FRICTION COMMANDS ({short_ag})"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for (i, cmd) in h.top_friction_cmds.iter().take(4).enumerate() {
-            right_lines.push(Line::from(format!("  {}. {cmd}", i + 1)));
-        }
-        right_lines.push(Line::from(""));
-    }
-    if !pat.universal_friction_cmds.is_empty() {
-        right_lines.push(Line::from(Span::styled(
-            "UNIVERSAL FRICTION (≥2 HARNESSES)",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        right_lines.push(Line::from(Span::styled(
-            pat.universal_friction_cmds
-                .iter()
-                .take(6)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("  ·  "),
-            Style::default().fg(Color::Gray),
-        )));
-        right_lines.push(Line::from(""));
-    }
-    let mcp_for_ag: Vec<_> = pat
-        .top_mcp_errors
-        .iter()
-        .filter(|t| selected_ag.is_empty() || t.by_harness.contains_key(selected_ag))
-        .take(4)
-        .collect();
-    if !mcp_for_ag.is_empty() {
-        right_lines.push(Line::from(Span::styled(
-            format!("FAILING / TRUNCATED MCP TOOLS ({short_ag})"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )));
-        for t in mcp_for_ag {
-            right_lines.push(Line::from(vec![
-                Span::raw(format!("• {} ", truncate_ellipsis(&t.tool_name, 30))),
-                Span::styled(
-                    format!(
-                        "{} errs ({:.0}%) · {} trunc",
-                        t.error_count,
-                        t.error_rate * 100.0,
-                        t.truncated_count
-                    ),
-                    Style::default().fg(if t.error_count > 0 {
-                        Color::Red
+        let iss_rows: Vec<Row> = issues
+            .iter()
+            .map(|item| match item {
+                HarnessIssueItem::Opp(m) => {
+                    let (_, sev_col, _) = human_problem(&m.primary.kind);
+                    let (tag, tag_col) = if m.primary.scope == "harness" {
+                        ("HARN", Color::LightBlue)
                     } else {
-                        Color::Yellow
-                    }),
-                ),
-            ]));
+                        ("REPO", Color::Green)
+                    };
+                    Row::new(vec![
+                        Cell::from(Line::from(vec![
+                            Span::styled("● ", Style::default().fg(sev_col)),
+                            Span::styled(
+                                tag,
+                                Style::default().fg(tag_col).add_modifier(Modifier::BOLD),
+                            ),
+                        ])),
+                        Cell::from(truncate_ellipsis(&insight_headline(&m.primary), iss_w)),
+                        Cell::from(Line::from(primary_metric_for(m)).right_aligned()),
+                    ])
+                }
+                HarnessIssueItem::McpTool(t) => Row::new(vec![
+                    Cell::from(Line::from(vec![
+                        Span::styled("● ", Style::default().fg(Color::Red)),
+                        Span::styled(
+                            "MCP ",
+                            Style::default()
+                                .fg(Color::LightMagenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ])),
+                    Cell::from(truncate_ellipsis(
+                        &format!("Tool error: {}", clean_tool_label(&t.tool_name)),
+                        iss_w,
+                    )),
+                    Cell::from(
+                        Line::from(format!(
+                            "{} errs ({:.0}%)",
+                            t.error_count,
+                            t.error_rate * 100.0
+                        ))
+                        .right_aligned(),
+                    ),
+                ]),
+            })
+            .collect();
+
+        let iss_table = Table::new(
+            iss_rows,
+            [
+                Constraint::Length(6),
+                Constraint::Fill(1),
+                Constraint::Length(16),
+            ],
+        )
+        .header(iss_header)
+        .column_spacing(1)
+        .block(rounded_block(
+            iss_title,
+            focused && app.harness_focus_issues,
+        ))
+        .row_highlight_style(row_highlight_style())
+        .highlight_symbol("▶ ");
+        frame.render_stateful_widget(iss_table, bottom[0], &mut app.harness_issue_state);
+    }
+
+    // Bottom-Right: Full Plain-English Diagnosis of Selected Harness Issue (or Harness Profile)
+    let sel_issue = app
+        .harness_issue_state
+        .selected()
+        .and_then(|i| issues.get(i));
+    match sel_issue {
+        Some(HarnessIssueItem::Opp(m)) => {
+            render_opportunity_diagnosis(frame, bottom[1], m, false);
+        }
+        Some(HarnessIssueItem::McpTool(t)) => {
+            render_mcp_tool_diagnosis(frame, bottom[1], t);
+        }
+        None => {
+            let mut profile_lines = Vec::new();
+            if let Some(h) = sel_h {
+                profile_lines.push(Line::from(Span::styled(
+                    format!("{} PROFILE", short_ag.to_uppercase()),
+                    Style::default()
+                        .fg(harness_color(short_ag))
+                        .add_modifier(Modifier::BOLD),
+                )));
+                profile_lines.push(Line::from(format!(
+                    "{} sessions · {} shell commands · {} tool calls",
+                    h.sessions,
+                    format_int(h.commands),
+                    format_int(h.tool_calls)
+                )));
+                profile_lines.push(Line::from(format!(
+                    "Avg uncached: {} · Fallback rate: {:.0}% · Avg output: {:.1} KB · Truncated: {} ({:.0}% sess)",
+                    format_compact(h.avg_uncached_tokens),
+                    h.rebound_rate * 100.0,
+                    h.avg_output_kb,
+                    h.truncated_outputs,
+                    h.truncated_sessions_pct
+                )));
+                if !pat.universal_friction_cmds.is_empty() {
+                    profile_lines.push(Line::from(""));
+                    profile_lines.push(Line::from(Span::styled(
+                        "SHARED FRICTION ACROSS HARNESSES",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    profile_lines.push(Line::from(Span::styled(
+                        pat.universal_friction_cmds
+                            .iter()
+                            .take(6)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+            }
+            frame.render_widget(
+                Paragraph::new(profile_lines)
+                    .wrap(Wrap { trim: true })
+                    .block(rounded_block(" Issue Diagnosis ", false)),
+                bottom[1],
+            );
         }
     }
-    frame.render_widget(
-        Paragraph::new(right_lines)
-            .wrap(Wrap { trim: true })
-            .block(rounded_block(" Friction & MCP Tools ", false)),
-        bottom[1],
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3002,6 +4091,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("Sort/MCP  "));
+            spans.push(Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("Traces  "));
         }
         DetailTab::Brief => {
             spans.push(Span::styled(
@@ -3012,7 +4108,29 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ));
             spans.push(Span::raw("Prompt/YAML  "));
         }
-        DetailTab::Harnesses => {}
+        DetailTab::Harnesses => {
+            spans.push(Span::styled(
+                " Space ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("Issues  "));
+            spans.push(Span::styled(
+                " d ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("Strata  "));
+            spans.push(Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("Traces  "));
+        }
     }
     spans.extend([
         Span::styled(
@@ -3074,22 +4192,26 @@ fn draw_inspect_modal(frame: &mut Frame, area: Rect, res: &InspectResult, scroll
 
     let mut lines = Vec::new();
     if let Some(opp) = &res.opportunity {
-        let (label, sev_col, meaning) = human_problem(&opp.kind);
+        let (_, sev_col, _) = human_problem(&opp.kind);
+        let headline = insight_headline(opp);
+        let badge = if opp.scope == "harness" {
+            "AGENT RUNTIME"
+        } else {
+            "REPO HARNESS"
+        };
         lines.push(Line::from(vec![
             Span::styled("● ", Style::default().fg(sev_col)),
             Span::styled(
-                format!("{label} — {} ", opp.target),
+                format!("{headline} "),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("[{}]", opp.scope), Style::default().fg(Color::Gray)),
+            Span::styled(format!("[{badge}]"), Style::default().fg(Color::Gray)),
         ]));
-        lines.push(Line::from(meaning));
-        lines.push(Line::from(Span::styled(
-            format!("Impact: {}", opp.impact_summary),
-            Style::default().fg(Color::Gray),
-        )));
+        for para in insight_story(opp) {
+            lines.push(Line::from(para));
+        }
         lines.push(Line::from(vec![
             Span::styled(
                 "Harnesses: ",
@@ -3099,9 +4221,10 @@ fn draw_inspect_modal(frame: &mut Frame, area: Rect, res: &InspectResult, scroll
             ),
             Span::raw(opp.harness_summary.clone()),
         ]));
+        let (fix_text, _) = insight_fix_guidance(opp);
         lines.push(Line::from(vec![
-            Span::styled("Where to look: ", Style::default().fg(Color::Cyan)),
-            Span::raw(opp.suggested_action.clone()),
+            Span::styled("How to fix: ", Style::default().fg(Color::Green)),
+            Span::raw(fix_text),
         ]));
         lines.push(Line::from(""));
     }
@@ -3202,11 +4325,16 @@ fn draw_help_modal(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(
-            "  Insights:  f = Scope filter (Repo fixes / All / Harness)  ·  Enter = Inspect traces",
+            "  Insights:   f = Filter scope (All / Repo harness / Agent runtime)  ·  Enter = Traces",
         ),
-        Line::from("  Patterns:  v = Switch view (Workflows / Burst Storms / Drift & Cold-Start)"),
-        Line::from("  Commands:  s = Switch sort/view (Token Sinks / Slowest / Most Errors / MCP)"),
-        Line::from("  Brief:     m = Toggle Diagnosis Prompt (Markdown) vs Structured YAML"),
+        Line::from("  Patterns:   v = Switch view (Workflows / Burst Storms / Drift & Cold-Start)"),
+        Line::from(
+            "  Harnesses:  d = Toggle Grouped / Detailed strata  ·  Space/h/l = Focus issues  ·  Enter = Traces",
+        ),
+        Line::from(
+            "  Commands:   s = Switch sort/view (Tokens / Slowest / Errors / MCP)  ·  Enter = Traces",
+        ),
+        Line::from("  Brief:      m = Toggle Diagnosis Prompt (Markdown) vs Structured YAML"),
     ];
 
     let modal = Paragraph::new(lines).wrap(Wrap { trim: true }).block(

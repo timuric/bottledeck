@@ -1,5 +1,6 @@
 use crate::config::{TimeRange, parse_window_ms};
 use crate::repo_context::RepoContext;
+use crate::shell::clean_error_preview;
 use crate::workspace::{WorkspaceResolver, is_ephemeral_or_neutral_path};
 use anyhow::{Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -71,6 +72,8 @@ pub struct RepoKpis {
     pub cli_adoption_rate: Option<f64>,
     pub escape_hatch_rebound_rate: f64,
     pub orientation_tokens: i64,
+    pub total_cost_usd: Option<f64>,
+    pub cost_sessions: usize,
     pub detected_config: Vec<String>,
 }
 
@@ -278,6 +281,7 @@ struct SessionRow {
     input_tokens: i64,
     output_tokens: i64,
     cached_tokens: i64,
+    cost_usd: Option<f64>,
     total_tool_ms: i64,
     is_subagent: bool,
     is_handoff: bool,
@@ -366,6 +370,20 @@ pub fn format_compact(n: i64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+pub fn format_duration_human(secs: f64) -> String {
+    if secs < 0.05 {
+        "0s".to_string()
+    } else if secs < 1.0 {
+        format!("{:.0}ms", secs * 1000.0)
+    } else if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else if secs < 3600.0 {
+        format!("{:.1}m", secs / 60.0)
+    } else {
+        format!("{:.1}h", secs / 3600.0)
     }
 }
 
@@ -459,6 +477,23 @@ fn is_generic_git_read(tpl: &str) -> bool {
         || tpl.starts_with("git grep")
 }
 
+/// Routine VCS staging/inspection/commit steps that naturally follow a CLI task and
+/// should not be counted as "escape-hatch rebounds".
+pub(crate) fn is_normal_vcs_workflow_cmd(tpl: &str) -> bool {
+    is_generic_git_read(tpl)
+        || tpl.starts_with("git add")
+        || tpl.starts_with("git commit")
+        || tpl.starts_with("git push")
+        || tpl.starts_with("git pull")
+        || tpl.starts_with("git fetch")
+        || tpl.starts_with("git checkout")
+        || tpl.starts_with("git switch")
+        || tpl.starts_with("git stash")
+        || tpl.starts_with("git merge")
+        || tpl.starts_with("git rebase")
+        || tpl.starts_with("git reset")
+}
+
 fn is_harness_command(tpl: &str) -> bool {
     let l = tpl.to_ascii_lowercase();
     l.starts_with("codex-wait")
@@ -471,6 +506,7 @@ fn is_harness_tool(tool_name: &str) -> bool {
     let l = tool_name.to_ascii_lowercase();
     l.starts_with("mcp:t3-code:")
         || l.starts_with("mcp:codex-apps:")
+        || l.starts_with("codex:")
         || l.starts_with("t3_")
         || l.starts_with("preview_")
         || l.starts_with("device_")
@@ -585,7 +621,7 @@ pub fn list_repos(
     let mut s_stmt = conn.prepare(
         "SELECT session_id, agent_kind, workspace_id, repo_id, COALESCE(repo_name, repo_id),
                 cwd, COALESCE(started_at, ended_at, 0), turn_count, input_tokens, output_tokens,
-                cached_tokens, total_tool_ms, is_subagent, is_handoff
+                cached_tokens, cost_usd, total_tool_ms, is_subagent, is_handoff
          FROM sessions
          WHERE repo_id IS NOT NULL
            AND COALESCE(started_at, ended_at, 0) >= ?1
@@ -605,9 +641,10 @@ pub fn list_repos(
                 input_tokens: r.get(8)?,
                 output_tokens: r.get(9)?,
                 cached_tokens: r.get(10)?,
-                total_tool_ms: r.get(11)?,
-                is_subagent: r.get::<_, i64>(12)? != 0,
-                is_handoff: r.get::<_, i64>(13)? != 0,
+                cost_usd: r.get(11)?,
+                total_tool_ms: r.get(12)?,
+                is_subagent: r.get::<_, i64>(13)? != 0,
+                is_handoff: r.get::<_, i64>(14)? != 0,
             })
         })?
         .flatten()
@@ -903,7 +940,7 @@ pub fn analyze_repo(
     let mut s_stmt = conn.prepare(
         "SELECT session_id, agent_kind, workspace_id, repo_id, COALESCE(repo_name, repo_id),
                 cwd, COALESCE(started_at, ended_at, 0), turn_count, input_tokens, output_tokens,
-                cached_tokens, total_tool_ms, is_subagent, is_handoff
+                cached_tokens, cost_usd, total_tool_ms, is_subagent, is_handoff
          FROM sessions
          WHERE repo_id = ?1
            AND COALESCE(started_at, ended_at, 0) >= ?2
@@ -924,9 +961,10 @@ pub fn analyze_repo(
                 input_tokens: r.get(8)?,
                 output_tokens: r.get(9)?,
                 cached_tokens: r.get(10)?,
-                total_tool_ms: r.get(11)?,
-                is_subagent: r.get::<_, i64>(12)? != 0,
-                is_handoff: r.get::<_, i64>(13)? != 0,
+                cost_usd: r.get(11)?,
+                total_tool_ms: r.get(12)?,
+                is_subagent: r.get::<_, i64>(13)? != 0,
+                is_handoff: r.get::<_, i64>(14)? != 0,
             })
         })?
         .flatten()
@@ -1020,6 +1058,8 @@ pub fn analyze_repo(
     let mut agents_set = HashSet::new();
     let mut total_in_toks: i64 = 0;
     let mut total_cached_toks: i64 = 0;
+    let mut sum_cost_usd: f64 = 0.0;
+    let mut cost_sessions: usize = 0;
     for s in &sessions {
         session_turn_totals.insert(s.session_id.clone(), s.turn_count.max(1));
         session_agent.insert(s.session_id.clone(), s.agent_kind.clone());
@@ -1029,6 +1069,12 @@ pub fn analyze_repo(
         agents_set.insert(s.agent_kind.clone());
         total_in_toks += s.input_tokens;
         total_cached_toks += s.cached_tokens;
+        if let Some(c) = s.cost_usd
+            && c > 0.0
+        {
+            sum_cost_usd += c;
+            cost_sessions += 1;
+        }
     }
     for sp in &spans {
         if let Some(w) = &sp.workspace_id {
@@ -1148,13 +1194,15 @@ pub fn analyze_repo(
                 .entry(cur.cmd_template.as_str())
                 .or_insert(0) += 1;
 
-            // 1. Post-CLI Rebound: repo CLI immediately followed by exploration or raw shell fallback
+            // 1. Post-CLI Rebound: repo CLI immediately followed by exploration or non-git shell fallback
             if cur.is_repo_cli {
                 total_repo_cli_calls += 1;
                 if let Some(nx) = next
                     && !nx.is_repo_cli
+                    && !is_normal_vcs_workflow_cmd(&nx.cmd_template)
                     && (nx.category == "exploration" || nx.category == "vcs_ci")
                     && nx.turn_idx - cur.turn_idx <= 1
+                    && nx.started_at.saturating_sub(cur.started_at) <= 60_000
                 {
                     rebound_count += 1;
                     let rb = rebounds_by_tpl
@@ -1213,18 +1261,24 @@ pub fn analyze_repo(
                         *tp.by_harness
                             .entry(harness_key(cur.agent_kind.as_deref()))
                             .or_insert(0) += 1;
-                        if let Some(prev) = &cur.stderr_preview
-                            && tp.stderr_samples.len() < 3
-                        {
-                            tp.stderr_samples.push(prev.clone());
+                        if let Some(prev) = &cur.stderr_preview {
+                            let cleaned = clean_error_preview(prev);
+                            if !cleaned.is_empty() && tp.stderr_samples.len() < 3 {
+                                tp.stderr_samples.push(cleaned);
+                            }
                         }
                         if tp.proof.is_empty() {
+                            let clean_err = cur
+                                .stderr_preview
+                                .as_deref()
+                                .map(clean_error_preview)
+                                .filter(|e| !e.is_empty());
                             tp.proof.push(format!(
                                 "t{}: `{}` (exit={}{})",
                                 cur.turn_idx,
                                 truncate(&cur.raw_redacted, 85),
                                 cur.exit_code.unwrap_or(1),
-                                cur.stderr_preview
+                                clean_err
                                     .as_deref()
                                     .map(|e| format!(": {}", truncate(e, 65)))
                                     .unwrap_or_default()
@@ -1310,11 +1364,11 @@ pub fn analyze_repo(
                         .map(|x| format!("t{}", x.turn_idx))
                         .collect();
                     p.proof.push(format!(
-                        "`{}` polled {}x in one session ({}..., {:.1}s wait)",
+                        "`{}` polled {}x in one session ({}..., {} wait)",
                         tpl,
                         cnt,
                         turns.join(", "),
-                        sess_ms as f64 / 1000.0
+                        format_duration_human(sess_ms as f64 / 1000.0)
                     ));
                 }
             }
@@ -1374,12 +1428,17 @@ pub fn analyze_repo(
             g.errors += 1;
             *g.error_by_harness.entry(hkey.clone()).or_insert(0) += 1;
             if g.error_samples.len() < 3 {
+                let clean_err = sp
+                    .stderr_preview
+                    .as_deref()
+                    .map(clean_error_preview)
+                    .filter(|e| !e.is_empty());
                 g.error_samples.push(format!(
                     "t{}: `{}` (exit={}{})",
                     sp.turn_idx,
                     truncate(&sp.raw_redacted, 80),
                     sp.exit_code.unwrap_or(1),
-                    sp.stderr_preview
+                    clean_err
                         .as_deref()
                         .map(|e| format!(": {}", truncate(e, 75)))
                         .unwrap_or_default()
@@ -1615,8 +1674,12 @@ pub fn analyze_repo(
             target: tpl.clone(),
             score: (p.total_calls as i64) * 3200 + p.total_ms / 8,
             impact_summary: format!(
-                "{} polling calls ({:.1}x/session avg, max {}x) and {:.1}s wait across {} session(s)",
-                p.total_calls, avg_calls, p.max_in_session, wait_s, p.sessions
+                "{} polling calls ({:.1}x/session avg, max {}x) and {} wait across {} session(s)",
+                p.total_calls,
+                avg_calls,
+                p.max_in_session,
+                format_duration_human(wait_s),
+                p.sessions
             ),
             by_harness: p.by_harness.clone(),
             harness_summary: format_harness_breakdown(&p.by_harness),
@@ -1635,9 +1698,12 @@ pub fn analyze_repo(
         });
     }
 
-    // E. Latency Sinks (infra/build/test/vcs commands only)
+    // E. Latency Sinks (infra/build/test/vcs commands only; skip targets already flagged as polling loops)
     for g in by_tpl.values() {
-        if g.category == "exploration" || is_generic_git_read(&g.cmd_template) {
+        if g.category == "exploration"
+            || is_generic_git_read(&g.cmd_template)
+            || polling_by_tpl.contains_key(&g.cmd_template)
+        {
             continue;
         }
         if g.total_duration_ms >= 20_000 && g.durations_ms.len() >= 2 {
@@ -1657,8 +1723,10 @@ pub fn analyze_repo(
                 .as_ref()
                 .map(|(_, raw, turn, _)| {
                     vec![format!(
-                        "t{turn}: `{}` (p50 {p50s:.1}s, p95 {p95s:.1}s across {} runs)",
+                        "t{turn}: `{}` (p50 {}, p95 {} across {} runs)",
                         truncate(raw, 90),
+                        format_duration_human(p50s),
+                        format_duration_human(p95s),
                         g.runs
                     )]
                 })
@@ -1676,7 +1744,10 @@ pub fn analyze_repo(
                 target: g.cmd_template.clone(),
                 score: g.total_duration_ms / 6,
                 impact_summary: format!(
-                    "{total_s:.1}s total wait (p50 {p50s:.1}s, p95 {p95s:.1}s) across {} runs",
+                    "{} total wait (p50 {}, p95 {}) across {} runs",
+                    format_duration_human(total_s),
+                    format_duration_human(p50s),
+                    format_duration_human(p95s),
                     g.runs
                 ),
                 by_harness: g.by_harness.clone(),
@@ -1692,9 +1763,12 @@ pub fn analyze_repo(
         }
     }
 
-    // F. Workflow Chatter Chains (infra/workflow sequences only)
+    // F. Workflow Chatter Chains (infra/workflow sequences only; skip pure harness PTY wait pairs)
     for (chain, ch) in &chain_counts {
         if ch.count >= 4 && ch.sessions.len() >= 2 {
+            if chain.split(" -> ").all(is_harness_command) {
+                continue;
+            }
             let wait_s = round1(ch.total_ms as f64 / 1000.0);
             let mut ev = BTreeMap::new();
             ev.insert("occurrences".into(), serde_json::json!(ch.count));
@@ -1704,23 +1778,19 @@ pub fn analyze_repo(
                 serde_json::json!(ch.total_tokens),
             );
             ev.insert("combined_wait_s".into(), serde_json::json!(wait_s));
-            let is_h = chain.split(" -> ").all(is_harness_command);
             raw_opps.push(Opportunity {
                 id: String::new(),
-                scope: if is_h { "harness" } else { "repo" }.to_string(),
+                scope: "repo".to_string(),
                 kind: "missing_composite_task".to_string(),
-                fix_target: if is_h {
-                    "Agent harness".to_string()
-                } else {
-                    task_target.clone()
-                },
+                fix_target: task_target.clone(),
                 target: chain.clone(),
                 score: (ch.count as i64) * 3200 + ch.total_tokens / 2,
                 impact_summary: format!(
-                    "repeated {}x across {} sessions ({} tokens, {wait_s:.1}s)",
+                    "repeated {}x across {} sessions ({} tokens, {})",
                     ch.count,
                     ch.sessions.len(),
-                    format_compact(ch.total_tokens)
+                    format_compact(ch.total_tokens),
+                    format_duration_human(wait_s)
                 ),
                 by_harness: ch.by_harness.clone(),
                 harness_summary: format_harness_breakdown(&ch.by_harness),
@@ -1937,11 +2007,16 @@ pub fn analyze_repo(
         ev.insert("top_help_cmds".into(), serde_json::json!(top_list));
         let mut proof = vec![format!("Top help lookups: {}", top_list.join(", "))];
         if let Some(bh) = broken_helps.first() {
+            let clean_err = bh
+                .stderr_preview
+                .as_deref()
+                .map(clean_error_preview)
+                .filter(|e| !e.is_empty());
             proof.push(format!(
                 "Broken help: `{}` (exit={}{})",
                 truncate(&bh.raw_redacted, 80),
                 bh.exit_code.unwrap_or(1),
-                bh.stderr_preview
+                clean_err
                     .as_deref()
                     .map(|e| format!(": {}", truncate(e, 60)))
                     .unwrap_or_default()
@@ -2120,8 +2195,17 @@ pub fn analyze_repo(
 
         for (name, a) in tc_map {
             let err_rate = a.errors as f64 / a.calls.max(1) as f64;
+            let avg_kb = round1((a.bytes as f64 / 1024.0) / a.calls.max(1) as f64);
+            let is_builtin_reader = matches!(
+                name.to_ascii_lowercase().as_str(),
+                "read_file" | "read" | "view_file" | "grep_search" | "list_dir" | "find_by_name"
+            );
             let high_err = a.errors >= 3 && err_rate >= 0.10;
-            let high_trunc = a.truncs >= 8 && (a.truncs as f64 / a.calls.max(1) as f64) >= 0.10;
+            // Built-in chunked file readers (e.g. Antigravity read_file's 800-line pages) aren't broken tools
+            // unless they actually error out or return oversized (>10 KB avg) payloads.
+            let high_trunc = a.truncs >= 8
+                && (a.truncs as f64 / a.calls.max(1) as f64) >= 0.10
+                && (!is_builtin_reader || avg_kb >= 10.0);
             if !high_err && !high_trunc {
                 continue;
             }
@@ -2130,7 +2214,6 @@ pub fn analyze_repo(
             } else {
                 "repo"
             };
-            let avg_kb = round1((a.bytes as f64 / 1024.0) / a.calls.max(1) as f64);
             let h_counts = if high_err {
                 &a.err_by_harness
             } else {
@@ -2145,6 +2228,9 @@ pub fn analyze_repo(
             ev.insert("avg_output_kb".into(), serde_json::json!(avg_kb));
             let proof: Vec<String> = a
                 .sample_err
+                .as_deref()
+                .map(clean_error_preview)
+                .filter(|e| !e.is_empty())
                 .map(|e| vec![format!("Sample error: `{}`", truncate(&e, 140))])
                 .unwrap_or_default();
             let impact = if high_err && high_trunc {
@@ -2242,11 +2328,33 @@ pub fn analyze_repo(
             );
             ev.insert("total_tokens".into(), serde_json::json!(f.tokens));
             let hs = format_harness_breakdown(&f.by_harness);
+            let is_step_spill = fname == "steps/output.txt" || fname == "output.txt";
+            let (scope, kind, fix_target, suggested_action, acceptance_metric) = if is_step_spill {
+                (
+                    "harness".to_string(),
+                    "truncated_output_reread".to_string(),
+                    "Verbose CLI/MCP outputs & harness truncation".to_string(),
+                    format!(
+                        "`{fname}` is the agent harness's truncated step-output spill file — add quiet/summary defaults and pagination to noisy CLI commands & MCP tools so outputs stop overflowing into `{fname}`."
+                    ),
+                    format!("truncated `{fname}` re-reads drop by >= 50%"),
+                )
+            } else {
+                (
+                    "repo".to_string(),
+                    "repeated_file_reread".to_string(),
+                    fname.clone(),
+                    format!(
+                        "`{fname}` is repeatedly re-read across sessions — inspect whether it is oversized, poorly indexed, or missing a compact summary/module split."
+                    ),
+                    format!("token spend reading `{fname}` drops by >= 50%"),
+                )
+            };
             raw_opps.push(Opportunity {
                 id: String::new(),
-                scope: "repo".to_string(),
-                kind: "repeated_file_reread".to_string(),
-                fix_target: fname.clone(),
+                scope,
+                kind,
+                fix_target,
                 target: fname.clone(),
                 score: f.tokens * 2 + (f.reads as i64) * 1200,
                 impact_summary: format!(
@@ -2264,10 +2372,8 @@ pub fn analyze_repo(
                     format_compact(f.tokens / f.reads.max(1) as i64),
                     f.sessions.len()
                 )],
-                suggested_action: format!(
-                    "`{fname}` is repeatedly re-read across sessions — inspect whether it is oversized, poorly indexed, or missing a compact summary/module split."
-                ),
-                acceptance_metric: format!("token spend reading `{fname}` drops by >= 50%"),
+                suggested_action,
+                acceptance_metric,
             });
         }
     }
@@ -2449,8 +2555,18 @@ pub fn analyze_repo(
                         .collect();
                     let mut ev = BTreeMap::new();
                     ev.insert("metric".into(), serde_json::json!(metric_name));
+                    ev.insert("top_harness".into(), serde_json::json!(top.0));
+                    ev.insert("low_harness".into(), serde_json::json!(low.0));
+                    ev.insert("top_rate".into(), serde_json::json!(round1(top.2)));
+                    ev.insert("low_rate".into(), serde_json::json!(round1(low.2)));
+                    ev.insert("top_count".into(), serde_json::json!(top.1));
                     ev.insert("rate_ratio".into(), serde_json::json!(round1(ratio)));
                     ev.insert("rates_per_1k_cmds".into(), serde_json::json!(rate_desc));
+                    let gap_phrase = if low.2 < 0.5 {
+                        format!("vs {:.1}/1k in {}", low.2, low.0)
+                    } else {
+                        format!("vs {} at {:.1}/1k ({:.1}x gap)", low.0, low.2, ratio)
+                    };
                     raw_opps.push(Opportunity {
                         id: String::new(),
                         scope: "harness".to_string(),
@@ -2459,8 +2575,8 @@ pub fn analyze_repo(
                         target: format!("{metric_name} ({} vs {})", top.0, low.0),
                         score: (top.1 as i64) * 600,
                         impact_summary: format!(
-                            "{} triggers {metric_name} at {:.1}/1k cmds vs {} at {:.1}/1k ({:.1}x gap)",
-                            top.0, top.2, low.0, low.2, ratio
+                            "{} triggers {metric_name} at {:.1}/1k cmds {gap_phrase}",
+                            top.0, top.2
                         ),
                         by_harness: m.clone(),
                         harness_summary: format_harness_breakdown(&m),
@@ -2498,7 +2614,7 @@ pub fn analyze_repo(
         .collect();
     let harness_overhead: Vec<Opportunity> = harness_opps
         .into_iter()
-        .take(6)
+        .take(12)
         .enumerate()
         .map(|(i, mut o)| {
             o.id = format!("h-{}", i + 1);
@@ -2570,6 +2686,12 @@ pub fn analyze_repo(
                 0.0
             },
             orientation_tokens: orient_tokens,
+            total_cost_usd: if cost_sessions > 0 {
+                Some((sum_cost_usd * 100.0).round() / 100.0)
+            } else {
+                None
+            },
+            cost_sessions,
             detected_config: repo_ctx.config_files,
         },
         opportunities,
@@ -2653,26 +2775,270 @@ pub fn inspect_finding(
         .collect();
 
     let mut matched = Vec::new();
+
+    // Handle non-shell tool_friction (MCP & built-in tools) directly from `tool_calls`
+    if let Some(o) = &opp
+        && o.kind == "tool_friction"
+    {
+        let mut tc_stmt = conn.prepare(
+            "SELECT session_id, agent_kind, turn_idx, started_at, tool_name, is_error,
+                    duration_ms, output_tokens, is_truncated, error_preview
+             FROM tool_calls
+             WHERE repo_id = ?1 AND tool_name = ?2
+               AND started_at >= ?3 AND started_at < ?4
+               AND (is_error != 0 OR is_truncated != 0)
+             ORDER BY is_error DESC, output_bytes DESC",
+        )?;
+        let rows = tc_stmt.query_map(params![repo_id, o.target, since_ms, until_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)? != 0,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)? != 0,
+                r.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (sid, ag, turn, ts, name, is_err, dur, toks, is_trunc, err_prev) = row;
+            let dt = DateTime::from_timestamp_millis(ts)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            let clean_err = err_prev
+                .as_deref()
+                .map(clean_error_preview)
+                .filter(|s| !s.is_empty());
+            matched.push(TraceSample {
+                session_id: sid,
+                agent_kind: ag,
+                turn_idx: turn,
+                started_at: dt,
+                cmd_template: name.clone(),
+                raw_redacted: if is_err {
+                    format!("tool call `{name}` (error)")
+                } else {
+                    format!("tool call `{name}` (truncated output)")
+                },
+                exit_code: Some(if is_err { 1 } else { 0 }),
+                duration_ms: dur,
+                stdout_tokens: toks,
+                noise_kind: if is_trunc {
+                    Some("truncated".into())
+                } else {
+                    None
+                },
+                stderr_preview: clean_err,
+                next_cmd: None,
+            });
+        }
+        let total = matched.len();
+        matched.truncate(samples);
+        return Ok(InspectResult {
+            repo_id: repo_id.to_string(),
+            repo_name: report.repo_name,
+            query: query.to_string(),
+            opportunity: opp,
+            total_matching_spans: total,
+            samples: matched,
+        });
+    }
+
+    // Handle repeated_file_reread and truncated_output_reread directly from `file_reads`
+    if let Some(o) = &opp
+        && (o.kind == "repeated_file_reread" || o.kind == "truncated_output_reread")
+    {
+        let mut fr_stmt = conn.prepare(
+            "SELECT fr.session_id, COALESCE(s.agent_kind, 'unknown'), fr.turn_idx, fr.started_at,
+                    fr.target_name, fr.output_tokens
+             FROM file_reads fr
+             LEFT JOIN sessions s ON s.session_id = fr.session_id
+             WHERE fr.repo_id = ?1 AND fr.target_name = ?2
+               AND fr.started_at >= ?3 AND fr.started_at < ?4
+             ORDER BY fr.output_tokens DESC",
+        )?;
+        let rows = fr_stmt.query_map(params![repo_id, o.target, since_ms, until_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (sid, ag, turn, ts, fname, toks) = row;
+            let dt = DateTime::from_timestamp_millis(ts)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            matched.push(TraceSample {
+                session_id: sid,
+                agent_kind: ag,
+                turn_idx: turn,
+                started_at: dt,
+                cmd_template: format!("read:{fname}"),
+                raw_redacted: format!("read_file {fname}"),
+                exit_code: Some(0),
+                duration_ms: None,
+                stdout_tokens: toks,
+                noise_kind: None,
+                stderr_preview: None,
+                next_cmd: None,
+            });
+        }
+        let total = matched.len();
+        matched.truncate(samples);
+        return Ok(InspectResult {
+            repo_id: repo_id.to_string(),
+            repo_name: report.repo_name,
+            query: query.to_string(),
+            opportunity: opp,
+            total_matching_spans: total,
+            samples: matched,
+        });
+    }
+
+    // Handle session-level findings (`context_handoff_bloat`, `low_cache_efficiency`) directly from `sessions`
+    if let Some(o) = &opp
+        && (o.kind == "context_handoff_bloat" || o.kind == "low_cache_efficiency")
+    {
+        let target_agent = if o.kind == "low_cache_efficiency" {
+            o.target.split_whitespace().next().map(str::to_string)
+        } else {
+            None
+        };
+        let mut s_stmt = conn.prepare(
+            "SELECT session_id, agent_kind, turn_count, COALESCE(started_at, ended_at, 0),
+                    input_tokens, output_tokens, cached_tokens, total_tool_ms, is_handoff
+             FROM sessions
+             WHERE repo_id = ?1
+               AND is_subagent = 0
+               AND COALESCE(started_at, ended_at, 0) >= ?2
+               AND COALESCE(started_at, ended_at, 0) < ?3
+             ORDER BY (input_tokens + cached_tokens + output_tokens) DESC",
+        )?;
+        let rows = s_stmt.query_map(params![repo_id, since_ms, until_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)? != 0,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (sid, ag, turns, ts, in_t, out_t, cac_t, tool_ms, is_h) = row;
+            if o.kind == "context_handoff_bloat" && !is_h {
+                continue;
+            }
+            if let Some(ref ta) = target_agent
+                && ag != *ta
+            {
+                continue;
+            }
+            let total_t = in_t + cac_t + out_t;
+            let cache_pct = if in_t + cac_t > 0 {
+                (cac_t as f64 / (in_t + cac_t) as f64) * 100.0
+            } else {
+                0.0
+            };
+            let dt = DateTime::from_timestamp_millis(ts)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            matched.push(TraceSample {
+                session_id: sid.clone(),
+                agent_kind: ag,
+                turn_idx: turns,
+                started_at: dt,
+                cmd_template: o.kind.clone(),
+                raw_redacted: format!(
+                    "session `{sid}` ({turns} turns, {} total toks, {} uncached, cache {:.1}%)",
+                    format_compact(total_t),
+                    format_compact(in_t),
+                    cache_pct
+                ),
+                exit_code: Some(0),
+                duration_ms: if tool_ms > 0 { Some(tool_ms) } else { None },
+                stdout_tokens: total_t,
+                noise_kind: None,
+                stderr_preview: None,
+                next_cmd: None,
+            });
+        }
+        let total = matched.len();
+        matched.truncate(samples);
+        return Ok(InspectResult {
+            repo_id: repo_id.to_string(),
+            repo_name: report.repo_name,
+            query: query.to_string(),
+            opportunity: opp,
+            total_matching_spans: total,
+            samples: matched,
+        });
+    }
+
+    let div_metric = opp
+        .as_ref()
+        .filter(|o| o.kind == "harness_divergence")
+        .and_then(|o| o.evidence.get("metric").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    let div_top_ag = opp
+        .as_ref()
+        .filter(|o| o.kind == "harness_divergence")
+        .and_then(|o| o.evidence.get("top_harness").and_then(|v| v.as_str()))
+        .map(str::to_string);
+
     for i in 0..spans.len() {
         let sp = &spans[i];
         let next = spans.get(i + 1).filter(|nx| nx.session_id == sp.session_id);
-        let hit = sp.cmd_template == target_match
-            || sp.cmd_bin == target_match
-            || sp.cmd_template.to_ascii_lowercase().contains(&target_lower)
-            || (opp.as_ref().is_some_and(|o| o.kind == "orientation_tax")
-                && sp.is_orientation
-                && sp.turn_idx <= 3)
-            || (opp
-                .as_ref()
-                .is_some_and(|o| o.kind == "missing_composite_task")
-                && next.is_some_and(|nx| {
-                    format!("{} -> {}", sp.cmd_template, nx.cmd_template) == target_match
-                }));
+        let hit = match opp.as_ref().map(|o| o.kind.as_str()) {
+            Some("orientation_tax") => sp.is_orientation && sp.turn_idx <= 3,
+            Some("state_dir_bypass") => {
+                !sp.is_repo_cli && sp.state_dir_hint.as_deref() == Some(target_match.as_str())
+            }
+            Some("output_filtering_tax") => sp.is_repo_cli && sp.piped_filter.is_some(),
+            Some("cli_help_tax") => sp.is_repo_cli && is_help_invocation(sp),
+            Some("missing_composite_task") => next.is_some_and(|nx| {
+                format!("{} -> {}", sp.cmd_template, nx.cmd_template) == target_match
+            }),
+            Some("harness_divergence") => {
+                let ag_ok = div_top_ag
+                    .as_deref()
+                    .is_none_or(|ag| sp.agent_kind.as_deref() == Some(ag));
+                ag_ok
+                    && match div_metric.as_deref() {
+                        Some("CLI pipe-stripping") => sp.is_repo_cli && sp.piped_filter.is_some(),
+                        Some("command error rate") => sp.exit_code.is_some_and(|c| c != 0),
+                        Some("direct state-dir scraping") => {
+                            !sp.is_repo_cli && sp.state_dir_hint.is_some()
+                        }
+                        _ => false,
+                    }
+            }
+            _ => {
+                sp.cmd_template == target_match
+                    || sp.cmd_bin == target_match
+                    || sp.cmd_template.to_ascii_lowercase().contains(&target_lower)
+            }
+        };
 
         if hit {
             let dt = DateTime::from_timestamp_millis(sp.started_at)
                 .map(|d| d.to_rfc3339())
                 .unwrap_or_default();
+            let clean_err = sp
+                .stderr_preview
+                .as_deref()
+                .map(clean_error_preview)
+                .filter(|s| !s.is_empty());
             matched.push(TraceSample {
                 session_id: sp.session_id.clone().unwrap_or_default(),
                 agent_kind: sp.agent_kind.clone().unwrap_or_else(|| "unknown".into()),
@@ -2684,7 +3050,7 @@ pub fn inspect_finding(
                 duration_ms: sp.duration_ms,
                 stdout_tokens: sp.stdout_tokens,
                 noise_kind: sp.noise_kind.clone(),
-                stderr_preview: sp.stderr_preview.clone(),
+                stderr_preview: clean_err,
                 next_cmd: next.map(|n| n.cmd_template.clone()),
             });
         }
@@ -2871,12 +3237,12 @@ pub fn diff_repo(
         let sql = if before {
             "SELECT session_id, agent_kind, workspace_id, repo_id, COALESCE(repo_name, repo_id),
                     cwd, COALESCE(started_at, ended_at, 0), turn_count, input_tokens, output_tokens,
-                    cached_tokens, total_tool_ms, is_subagent, is_handoff
+                    cached_tokens, cost_usd, total_tool_ms, is_subagent, is_handoff
              FROM sessions WHERE repo_id = ?1 AND COALESCE(started_at, ended_at, 0) < ?2"
         } else {
             "SELECT session_id, agent_kind, workspace_id, repo_id, COALESCE(repo_name, repo_id),
                     cwd, COALESCE(started_at, ended_at, 0), turn_count, input_tokens, output_tokens,
-                    cached_tokens, total_tool_ms, is_subagent, is_handoff
+                    cached_tokens, cost_usd, total_tool_ms, is_subagent, is_handoff
              FROM sessions WHERE repo_id = ?1 AND COALESCE(started_at, ended_at, 0) >= ?2"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -2894,9 +3260,10 @@ pub fn diff_repo(
                     input_tokens: r.get(8)?,
                     output_tokens: r.get(9)?,
                     cached_tokens: r.get(10)?,
-                    total_tool_ms: r.get(11)?,
-                    is_subagent: r.get::<_, i64>(12)? != 0,
-                    is_handoff: r.get::<_, i64>(13)? != 0,
+                    cost_usd: r.get(11)?,
+                    total_tool_ms: r.get(12)?,
+                    is_subagent: r.get::<_, i64>(13)? != 0,
+                    is_handoff: r.get::<_, i64>(14)? != 0,
                 })
             })?
             .flatten()
@@ -2991,8 +3358,10 @@ pub fn diff_repo(
                     if let Some(nx) = sp.get(i + 1)
                         && nx.session_id == sp[i].session_id
                         && !nx.is_repo_cli
+                        && !is_normal_vcs_workflow_cmd(&nx.cmd_template)
                         && (nx.category == "exploration" || nx.category == "vcs_ci")
                         && nx.turn_idx - sp[i].turn_idx <= 1
+                        && nx.started_at.saturating_sub(sp[i].started_at) <= 60_000
                     {
                         rebounds += 1;
                     }

@@ -82,6 +82,9 @@ fn safe_realpath(p: &Path) -> PathBuf {
 }
 
 pub fn is_ephemeral_or_neutral_path(p: &str) -> bool {
+    if is_neutral_home_dir(p) {
+        return true;
+    }
     let norm = p.replace('\\', "/");
     let lower = norm.to_ascii_lowercase();
     if lower.starts_with("/tmp/")
@@ -93,6 +96,9 @@ pub fn is_ephemeral_or_neutral_path(p: &str) -> bool {
         || lower.contains("/.local/state/")
         || lower.contains("/.cache/")
         || lower.contains("/scratchpad")
+        || lower.contains("/claude/scratch-workspaces/")
+        || lower.contains("/documents/codex/")
+        || lower.contains("/quine-host/workspaces/")
     {
         return true;
     }
@@ -102,7 +108,11 @@ pub fn is_ephemeral_or_neutral_path(p: &str) -> bool {
         .find(|s| !s.is_empty())
         .unwrap_or("")
         .to_ascii_lowercase();
-    leaf.starts_with("tmp.") || leaf.starts_with(".tmp") || leaf == "empty" || leaf == "scratchpad"
+    leaf.starts_with("tmp.")
+        || leaf.starts_with(".tmp")
+        || leaf.starts_with("scratch-")
+        || leaf == "empty"
+        || leaf == "scratchpad"
 }
 
 pub fn is_neutral_home_dir(p: &str) -> bool {
@@ -136,18 +146,26 @@ fn infer_deleted_worktree_name(dir_path: &str, known_short_names: &[String]) -> 
         return caps[1].to_string();
     }
 
+    // Check every path segment (not just leaf) so subdirectories of deleted worktrees
+    // like `/Users/u/work/quineos-feat/packages/server/src/chat_events` match `quineos`.
+    for seg in norm.split('/').filter(|s| !s.is_empty()) {
+        let seg_lower = seg.to_ascii_lowercase();
+        for base in known_short_names {
+            if base.len() >= 3
+                && (seg_lower == *base
+                    || seg_lower.starts_with(&format!("{base}-"))
+                    || seg_lower.starts_with(&format!("{base}_")))
+            {
+                return base.clone();
+            }
+        }
+    }
+
     let leaf = norm
         .split('/')
         .rev()
         .find(|s| !s.is_empty())
         .unwrap_or("unknown");
-    let leaf_lower = leaf.to_ascii_lowercase();
-    for base in known_short_names {
-        if !base.is_empty() && (leaf_lower == *base || leaf_lower.starts_with(&format!("{base}-")))
-        {
-            return base.clone();
-        }
-    }
     leaf.to_string()
 }
 

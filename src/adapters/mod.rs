@@ -35,11 +35,12 @@ pub fn detect_truncation(text: &str) -> bool {
     lower.contains("tokens truncated")
         || lower.contains("chars truncated")
         || lower.contains("bytes truncated")
-        || lower.contains("<truncated")
         || lower.contains("[output truncated")
         || lower.contains("... truncated")
         || lower.contains("total output lines:")
         || lower.contains("output was truncated")
+        || lower.contains("warning: truncated output")
+        || lower.contains("truncated at the ")
 }
 
 /// Detect whether an initial prompt marks a context handoff / resumed continuation session.
@@ -50,6 +51,8 @@ pub fn detect_handoff_text(text: &str) -> bool {
         || trimmed.contains("This session is being continued from a previous conversation")
         || trimmed.contains("continued from a previous conversation")
         || trimmed.contains("Context handoff from ")
+        || trimmed.contains("Context handoff (")
+        || trimmed.contains("Provider context handoff")
 }
 
 /// Normalize a non-shell tool name across harnesses and classify whether it is an MCP/external tool.
@@ -79,6 +82,31 @@ pub fn normalize_tool_name(raw: &str) -> (String, bool) {
     (trimmed.to_string(), is_mcp_like)
 }
 
+/// Strip Antigravity / Codex wrapper headers so error detection inspects actual payload text.
+fn strip_tool_wrapper_prefix(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        if rest.starts_with("Created At:")
+            || rest.starts_with("Completed At:")
+            || rest.starts_with("Script completed")
+            || rest.starts_with("Wall time")
+            || rest.starts_with("Chunk ID:")
+            || rest.starts_with("Original token count:")
+            || rest.starts_with("Total output lines:")
+            || rest.starts_with("Output:")
+            || rest.starts_with("Command output:")
+        {
+            match rest.find('\n') {
+                Some(nl) => rest = rest[nl + 1..].trim_start(),
+                None => return "",
+            }
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
 /// Detect non-shell tool call failure from explicit error flag or standardized error envelopes.
 pub fn detect_tool_error(text: &str, explicit_err: bool) -> bool {
     if explicit_err {
@@ -87,42 +115,122 @@ pub fn detect_tool_error(text: &str, explicit_err: bool) -> bool {
     if text.is_empty() {
         return false;
     }
-    let head: String = text.chars().take(600).collect();
+    let body = strip_tool_wrapper_prefix(text);
+    if body.is_empty() {
+        return false;
+    }
+    // Normal file-read outputs contain arbitrary source code (e.g. `setTimeout`, `error:`) and are not tool errors.
+    if body.starts_with("Showing lines ") || body.starts_with("Partial read (") {
+        return false;
+    }
+    let head: String = body.chars().take(800).collect();
     let lower = head.to_ascii_lowercase();
+    let is_json_envelope = head.starts_with('{') || head.starts_with('[');
     head.contains("OrchestratorMcpFailure")
-        || head.contains("\"isError\":true")
-        || head.contains("\"ok\":false")
+        || head.contains("Encountered error in step execution")
+        || (is_json_envelope
+            && (head.contains("\"isError\":true") || head.contains("\"ok\":false")))
         || lower.starts_with("error:")
         || lower.starts_with("tool error:")
         || lower.starts_with("failed to ")
         || lower.contains("tool call failed")
-        || lower.contains("timed out")
-        || lower.contains("timeout ")
+        || lower.contains("timed out after")
+        || lower.contains("command timed out")
+        || lower.contains("operation timed out")
+        || lower.contains("request timed out")
+        || lower.contains("timeout expired")
+        || lower.contains("timeout exceeded")
         || lower.contains("operation not permitted")
         || lower.contains("belongs to another agent session")
+        || lower.contains("permission check failed")
+}
+
+/// Extract concrete file path targets from shell file-reading commands (`cat`, `sed`, `head`, `tail`, `nl`)
+/// so harnesses that read files via shell (such as Codex) populate `file_reads` alongside `read_file`/`Read`.
+pub fn extract_shell_file_read_paths(raw_cmd: &str, cmd_bin: &str) -> Vec<String> {
+    if !matches!(cmd_bin, "cat" | "sed" | "head" | "tail" | "nl") {
+        return Vec::new();
+    }
+    let tokens = crate::shell::tokenize_shell(raw_cmd);
+    if tokens.len() < 2 {
+        return Vec::new();
+    }
+    let mut start = 0usize;
+    for (idx, tok) in tokens.iter().enumerate() {
+        let base = Path::new(tok)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tok.as_str());
+        if base == cmd_bin {
+            start = idx + 1;
+            break;
+        }
+    }
+    if start == 0 || start >= tokens.len() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut i = start;
+    let mut saw_sed_expr = false;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if t == "--" {
+            i += 1;
+            continue;
+        }
+        if t.starts_with('-') {
+            if matches!(t.as_str(), "-n" | "-c" | "-e" | "-f" | "-b" | "-v" | "-w") {
+                if !(cmd_bin == "sed" && t == "-n") {
+                    if cmd_bin == "sed" && t == "-e" {
+                        saw_sed_expr = true;
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if t.starts_with('>') || t.starts_with('<') || t == "2>&1" {
+            i += if t == ">" || t == ">>" || t == "<" {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if cmd_bin == "sed" && !saw_sed_expr {
+            saw_sed_expr = true;
+            i += 1;
+            continue;
+        }
+        if t != "/dev/null"
+            && !t.contains('*')
+            && !t.starts_with('$')
+            && (t.contains('/') || t.contains('.'))
+            && t.len() <= 240
+        {
+            out.push(t.clone());
+        }
+        i += 1;
+    }
+    out
 }
 
 pub fn extract_tool_error_preview(text: &str, is_err: bool) -> Option<String> {
     if !is_err || text.trim().is_empty() {
         return None;
     }
-    let meaningful = text
-        .lines()
+    let cleaned = crate::shell::clean_error_preview(&redact_secrets(text));
+    let stripped = cleaned
+        .strip_prefix("Encountered error in step execution:")
         .map(str::trim)
-        .find(|l| {
-            !l.is_empty()
-                && !l.starts_with("Script completed")
-                && !l.starts_with("Wall time")
-                && !l.starts_with("Output:")
-                && !l.starts_with("Chunk ID:")
-                && !l.starts_with("Total output lines:")
-        })
-        .unwrap_or("")
-        .to_string();
-    if meaningful.is_empty() {
+        .unwrap_or(&cleaned);
+    if stripped.is_empty() {
         return None;
     }
-    Some(redact_secrets(&meaningful).chars().take(240).collect())
+    Some(stripped.chars().take(240).collect())
 }
 
 pub fn walk_files<F>(root: &Path, max_depth: usize, mut predicate: F) -> Vec<PathBuf>

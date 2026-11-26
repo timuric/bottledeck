@@ -961,11 +961,156 @@ pub fn classify_output_noise(text: &str, exit_code: Option<i64>) -> Option<Strin
     }
 }
 
+/// Strip harness wrapper envelopes (Codex chunk JSON, Antigravity timestamps, Wall time headers)
+/// so error previews show the actual human-readable error message.
+pub fn clean_error_preview(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Try extracting meaningful fields from JSON envelopes (MCP failures or Codex chunk JSON)
+    if let Some(json_start) = trimmed.find('{') {
+        let candidate = &trimmed[json_start..];
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if let Some(msg) = v.get("message").and_then(|x| x.as_str())
+                && !msg.trim().is_empty()
+            {
+                let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("");
+                let s = if code.is_empty() {
+                    msg.trim().to_string()
+                } else {
+                    format!("{code}: {}", msg.trim())
+                };
+                return s.chars().take(240).collect();
+            }
+            if let Some(out) = v
+                .get("output")
+                .or_else(|| v.get("value").and_then(|x| x.get("output")))
+                .or_else(|| v.get("response"))
+                .and_then(|x| x.as_str())
+                && !out.trim().is_empty()
+            {
+                return clean_error_preview(out);
+            }
+        } else {
+            // Partial/truncated JSON from stored previews: extract `"message":"..."` or `"output":"..."`
+            for key in ["\"message\":\"", "\"output\":\"", "\"response\":\""] {
+                if let Some(pos) = candidate.find(key) {
+                    let rest = &candidate[pos + key.len()..];
+                    let mut extracted = String::new();
+                    let mut esc = false;
+                    for ch in rest.chars() {
+                        if esc {
+                            match ch {
+                                'n' => extracted.push(' '),
+                                't' => extracted.push(' '),
+                                other => extracted.push(other),
+                            }
+                            esc = false;
+                            continue;
+                        }
+                        if ch == '\\' {
+                            esc = true;
+                            continue;
+                        }
+                        if ch == '"' {
+                            break;
+                        }
+                        extracted.push(ch);
+                    }
+                    let cleaned = extracted.trim();
+                    if !cleaned.is_empty() && !cleaned.starts_with('{') {
+                        return cleaned.chars().take(240).collect();
+                    }
+                }
+            }
+        }
+    }
+
+    // Split on newlines OR stored ` | ` / ` / ` separators and drop wrapper metadata lines
+    let mut high_signal: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for piece in trimmed
+        .split('\n')
+        .flat_map(|l| l.split(" | "))
+        .flat_map(|l| l.split(" / "))
+    {
+        let p = piece.trim();
+        if p.is_empty()
+            || p.starts_with("Script completed")
+            || p.starts_with("Wall time")
+            || p.starts_with("Chunk ID:")
+            || p.starts_with("Original token count:")
+            || p.starts_with("Total output lines:")
+            || p.starts_with("Created At:")
+            || p.starts_with("Completed At:")
+            || p.starts_with("Command exited with code")
+            || p.starts_with("Process exited with code")
+            || p == "Output:"
+            || p == "Command output:"
+            || p.starts_with("{\"chunk_id\"")
+            || p.starts_with("[{\"status\":\"fulfilled\"")
+            || p.starts_with("{\"status\":\"fulfilled\"")
+        {
+            continue;
+        }
+        let pl = p.to_ascii_lowercase();
+        let is_err_line = pl.contains("error")
+            || pl.contains("failed")
+            || pl.contains("fatal:")
+            || pl.contains("command not found")
+            || pl.contains("operation not permitted")
+            || pl.contains("permission denied")
+            || pl.contains("unknown argument")
+            || pl.contains("unknown command")
+            || pl.contains("unknown option")
+            || pl.contains("no such column")
+            || pl.contains("no such table")
+            || pl.contains("choose --scope")
+            || pl.contains("pass a single statement")
+            || pl.contains("eperm")
+            || pl.contains("could not resolve")
+            || pl.contains("timed out")
+            || pl.contains("forbidden:")
+            || pl.contains("validation:")
+            || pl.contains("conflict:")
+            || pl.contains("no github credential");
+        if is_err_line && high_signal.len() < 3 {
+            high_signal.push(p.to_string());
+        }
+        if kept.len() < 3 {
+            kept.push(p.to_string());
+        }
+    }
+
+    let chosen = if !high_signal.is_empty() {
+        high_signal
+    } else {
+        kept
+    };
+
+    let out = if chosen.is_empty() {
+        // Drop pure timestamp-only previews rather than showing noise
+        if trimmed.starts_with("Created At:") || trimmed.starts_with("Script completed") {
+            return String::new();
+        }
+        trimmed.to_string()
+    } else {
+        chosen.join(" | ")
+    };
+    out.chars().take(240).collect()
+}
+
 pub fn extract_stderr_preview(text: &str, exit_code: Option<i64>) -> Option<String> {
     if exit_code == Some(0) || text.trim().is_empty() {
         return None;
     }
     let redacted = redact_secrets(text);
+    let cleaned = clean_error_preview(&redacted);
+    if !cleaned.is_empty() {
+        return Some(cleaned);
+    }
     let joined: String = redacted
         .lines()
         .map(str::trim)
