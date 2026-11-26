@@ -1,26 +1,26 @@
 class Bottledeck < Formula
   desc "Zero-touch multi-harness telemetry, Ratatui dashboard, and bottleneck analyzer for coding agents"
   homepage "https://github.com/timuric/bottledeck"
-  version "0.1.0"
+  version "0.2.0"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/timuric/bottledeck/releases/download/v0.1.0/bottledeck-v0.1.0-aarch64-apple-darwin.tar.gz"
-      sha256 "910d34f60b562cb3f8e92caa3b44144113076ddc09e7874e2cfc1caa238ed317"
+      url "https://github.com/timuric/bottledeck/releases/download/v0.2.0/bottledeck-v0.2.0-aarch64-apple-darwin.tar.gz"
+      sha256 "0f718ff197768b0692ac5246a0facea47dd0e4f26e067d69748d9f04965bcaa3"
     else
-      url "https://github.com/timuric/bottledeck/releases/download/v0.1.0/bottledeck-v0.1.0-x86_64-apple-darwin.tar.gz"
-      sha256 "ed130f0cc1a24679a4f9208002105d6ca726346786d9aaf1f6cf5205829d9502"
+      url "https://github.com/timuric/bottledeck/releases/download/v0.2.0/bottledeck-v0.2.0-x86_64-apple-darwin.tar.gz"
+      sha256 "73dbc5c9b47a510c173e404bc8cca0731ac3950c109a9128e0abe1e1f052a53b"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/timuric/bottledeck/releases/download/v0.1.0/bottledeck-v0.1.0-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "f459b91f829d56add4e46f363777ce0e89162bdc1e99d36d2edfc7752ca6d73c"
+      url "https://github.com/timuric/bottledeck/releases/download/v0.2.0/bottledeck-v0.2.0-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "993c6837fc37deee7ae30c473ad6e121ff56d85994afa0144b7c2d701e586754"
     else
-      url "https://github.com/timuric/bottledeck/releases/download/v0.1.0/bottledeck-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "37feae975b6e9b7962293750f75c8f302850220456d8322b5c8f60b292a8de4c"
+      url "https://github.com/timuric/bottledeck/releases/download/v0.2.0/bottledeck-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "0e19c4d32469ca9274f07788772e8020be7db92c60f50a3090106482ec7bae3e"
     end
   end
 
