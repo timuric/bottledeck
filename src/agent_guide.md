@@ -14,8 +14,8 @@ Everything is local and read-only, except `bottledeck mark`, which records fix m
    `repo_name` (e.g. `owner/name`) or `repo_id`. Paths (`/…`, `~/…`, `./…`) also work. A
    bare substring picks the most active matching repo, so check the name in the output
    header. Worktrees roll up into their repo.
-3. **Set the time scope on purpose.** The default window is 14d (30d for `issues`). See
-   "Time scoping".
+3. **Set the scope on purpose.** The default window is 14d (30d for `issues`). See
+   "Time scoping". Add `--harness` to restrict any query to one agent harness.
 4. **Read `md`, parse `json`.** Every query takes `--format md|json`. `report --repo X`
    also takes `llm` (compact YAML brief) and `prompt` (a diagnosis bundle for a reviewing
    agent).
@@ -41,6 +41,9 @@ resolves to its commit time in the repo's worktrees.
 `--since` without `--window` means "everything after X", and combining both bounds gives
 a slice: `--since v0.3.0 --until v0.4.0`. Sessions are bucketed by start time, so a
 session that began before a fix counts as "before" even if it ran past it.
+
+`--harness claude-code|codex|antigravity|kimi` works on the same commands plus `diff`. It
+restricts every table to that harness's sessions, and report headers show it (`30d · codex only`).
 
 ## Which command answers which question
 
@@ -91,7 +94,8 @@ For any other view, run the command twice: `--until <ref>` vs `--since <ref>`. F
 `tools --mcp-only --since <ref>` against the same command with `--until <ref>`. Each prints a
 totals line, so you can compare error rates without summing rows. Add the same
 `--window`/`--since` lower bound to the "before" run when you want equal-length windows.
-Check the harness mix on both sides: a "fix" can just be one harness disappearing.
+Check the harness mix on both sides: a "fix" can just be one harness disappearing. If
+the mix differs, rerun both sides with `--harness <name>` to compare like with like.
 
 **Rank waste across tokens and time.**
 `report` findings mix units (tokens, wait, call counts). For a ranking, use
@@ -132,5 +136,8 @@ the top rows back to findings.
 - Antigravity and Kimi transcripts don't record a harness version.
 - Traces from `inspect` are redacted but still come from real sessions. Quote them
   sparingly.
-- `bottledeck doctor` shows transcript roots and the ledger path. `sync --force`
-  re-ingests everything (slow; only needed after an upgrade that changes parsing).
+- `bottledeck doctor` shows transcript roots and the ledger path. After an upgrade that
+  changes parsing, the first sync re-ingests everything once on its own (it says so on
+  stderr). `sync --force` does the same on demand.
+- `Ctx%` is peak context as a share of the model's window. A session that went past the
+  200k window is measured against the 1M tier, because transcripts don't record the tier.

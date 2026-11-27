@@ -1,4 +1,4 @@
-use crate::config::{TimeRange, default_context_window, estimate_cost_usd, parse_window_ms};
+use crate::config::{TimeRange, effective_context_window, estimate_cost_usd, parse_window_ms};
 use crate::repo_context::RepoContext;
 use crate::shell::clean_error_preview;
 use crate::workspace::{WorkspaceResolver, is_ephemeral_or_neutral_path};
@@ -419,11 +419,13 @@ impl SessionRow {
         if self.max_context_tokens <= 0 {
             return None;
         }
-        let win = self
-            .context_window
-            .filter(|&w| w > 0)
-            .or_else(|| default_context_window(self.model.as_deref(), &self.agent_kind))?;
-        Some(((self.max_context_tokens as f64 / win as f64) * 100.0).min(150.0))
+        let win = effective_context_window(
+            self.context_window,
+            self.max_context_tokens,
+            self.model.as_deref(),
+            &self.agent_kind,
+        )?;
+        Some(((self.max_context_tokens as f64 / win as f64) * 100.0).min(100.0))
     }
 }
 

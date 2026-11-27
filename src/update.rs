@@ -51,7 +51,56 @@ pub fn detect_target_triple() -> Result<&'static str> {
     }
 }
 
+/// Latest release tag. Follows the `releases/latest` web redirect first (no API rate limit:
+/// unauthenticated API calls are capped at 60/hour per IP), then falls back to the REST API.
 pub fn fetch_latest_release_tag() -> Result<String> {
+    let redirect_err = match fetch_latest_tag_via_redirect() {
+        Ok(tag) => return Ok(tag),
+        Err(e) => e,
+    };
+    fetch_latest_tag_via_api().map_err(|api_err| {
+        anyhow::anyhow!(
+            "Could not determine the latest release ({redirect_err:#}; {api_err:#}). \
+             Install a specific one with `bottledeck update --version <x.y.z>`."
+        )
+    })
+}
+
+fn fetch_latest_tag_via_redirect() -> Result<String> {
+    let url = format!("https://github.com/{GITHUB_REPO}/releases/latest");
+    let out = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "8",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            "-H",
+            "User-Agent: bottledeck-updater",
+            &url,
+        ])
+        .output()
+        .context("Failed to execute `curl` to check GitHub releases")?;
+    if !out.status.success() {
+        bail!(
+            "release redirect failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    tag_from_release_url(&String::from_utf8_lossy(&out.stdout))
+        .context("release redirect did not point at a tag")
+}
+
+/// `https://github.com/o/r/releases/tag/v1.2.3` -> `v1.2.3`
+fn tag_from_release_url(url: &str) -> Option<String> {
+    let tag = url.trim().rsplit_once("/releases/tag/")?.1;
+    let tag = tag.split(['?', '#', '/']).next()?.trim();
+    (!tag.is_empty()).then(|| tag.to_string())
+}
+
+fn fetch_latest_tag_via_api() -> Result<String> {
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let out = Command::new("curl")
         .args([
@@ -67,10 +116,9 @@ pub fn fetch_latest_release_tag() -> Result<String> {
         .output()
         .context("Failed to execute `curl` to check GitHub releases")?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
         bail!(
-            "Could not fetch latest release from GitHub: {}",
-            stderr.trim()
+            "releases API failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let val: serde_json::Value =
@@ -294,6 +342,22 @@ pub fn run_self_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_tag_from_release_redirect() {
+        assert_eq!(
+            tag_from_release_url("https://github.com/o/r/releases/tag/v0.4.1\n").as_deref(),
+            Some("v0.4.1")
+        );
+        assert_eq!(
+            tag_from_release_url("https://github.com/o/r/releases"),
+            None
+        );
+        assert_eq!(
+            tag_from_release_url("https://github.com/o/r/releases/tag/"),
+            None
+        );
+    }
 
     #[test]
     fn semver_comparison_works() {

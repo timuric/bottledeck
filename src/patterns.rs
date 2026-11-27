@@ -2,7 +2,7 @@ use crate::analyze::{
     ContextHealthSummary, LatencyBreakdown, OutcomeSummary, effective_context_tokens,
     format_compact, format_duration_human, format_harness_breakdown, is_normal_vcs_workflow_cmd,
 };
-use crate::config::{TimeRange, default_context_window, estimate_cost_usd};
+use crate::config::{TimeRange, effective_context_window, estimate_cost_usd};
 use crate::repo_context::RepoContext;
 use crate::shell::clean_error_preview;
 use anyhow::Result;
@@ -401,11 +401,13 @@ impl Sess {
         if self.max_context_tokens <= 0 {
             return None;
         }
-        let win = self
-            .context_window
-            .filter(|&w| w > 0)
-            .or_else(|| default_context_window(self.model.as_deref(), &self.agent_kind))?;
-        Some(((self.max_context_tokens as f64 / win as f64) * 100.0).min(150.0))
+        let win = effective_context_window(
+            self.context_window,
+            self.max_context_tokens,
+            self.model.as_deref(),
+            &self.agent_kind,
+        )?;
+        Some(((self.max_context_tokens as f64 / win as f64) * 100.0).min(100.0))
     }
 }
 

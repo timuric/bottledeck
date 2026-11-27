@@ -41,6 +41,8 @@ pub struct SyncStats {
     pub llm_calls_inserted: usize,
     pub by_adapter: BTreeMap<String, AdapterSyncStats>,
     pub errors: Vec<SyncError>,
+    /// Every file was re-ingested (`--force`, or a parser upgrade).
+    pub full_reparse: bool,
 }
 
 enum AdapterKind {
@@ -89,7 +91,30 @@ where
     out
 }
 
+/// Bump when adapters change how transcripts are parsed or classified. The next sync on a ledger
+/// written by an older parser then re-ingests every file once (tracked in `PRAGMA user_version`).
+/// 1: JSON tool results are judged by their error markers, not by error-sounding payload text.
+pub const PARSER_VERSION: i64 = 1;
+
 pub fn sync_all(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Result<SyncStats> {
+    let ledger_parser: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let has_data: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ingest_files)", [], |r| {
+        r.get(0)
+    })?;
+    let upgrade_reparse = !force && has_data && ledger_parser < PARSER_VERSION;
+    if upgrade_reparse {
+        eprintln!(
+            "bottledeck: re-parsing all transcripts once for this version's parser changes (this sync is slower)..."
+        );
+    }
+    let force = force || upgrade_reparse;
+    let mut stats = sync_sources(conn, roots, force)?;
+    stats.full_reparse = force;
+    conn.execute_batch(&format!("PRAGMA user_version = {PARSER_VERSION}"))?;
+    Ok(stats)
+}
+
+fn sync_sources(conn: &mut Connection, roots: &AdapterRoots, force: bool) -> Result<SyncStats> {
     let sources: Vec<(AdapterKind, Vec<PathBuf>)> = vec![
         (
             AdapterKind::Claude,

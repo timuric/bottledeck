@@ -9,7 +9,15 @@ use bottledeck::analyze::{
     resolve_time_range,
 };
 use bottledeck::config::{TimeRange, adapter_roots, db_path, parse_window_ms, state_dir};
-use bottledeck::db::open_db;
+
+/// Tag a time range's label with the harness filter so report headers say what was included.
+fn with_harness(mut range: TimeRange, harness: Option<&str>) -> TimeRange {
+    if let Some(h) = harness {
+        range.label = format!("{} · {h} only", range.label);
+    }
+    range
+}
+use bottledeck::db::{apply_harness_filter, open_db};
 use bottledeck::guide::{
     AGENT_GUIDE, SkillTarget, install_paths, installed_skill_version, skill_locations,
     skill_markdown, write_skill,
@@ -93,10 +101,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration (e.g. 48h), or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         /// md: readable; llm: compact YAML brief; prompt: diagnosis bundle for a reviewing agent (per repo); json: full data
@@ -105,6 +113,9 @@ enum Commands {
         /// Include temp/fixture repos in the fleet report
         #[arg(long)]
         include_temp: bool,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -119,10 +130,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         /// Number of trace samples to show
@@ -130,6 +141,9 @@ enum Commands {
         samples: usize,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -144,10 +158,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 30d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         /// Only issues that still need attention (regressed / new / active / unchanged / improved)
@@ -155,6 +169,9 @@ enum Commands {
         open: bool,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -195,6 +212,9 @@ enum Commands {
         repo: String,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -207,10 +227,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         /// effective: context cost; tokens: raw stdout; wait: wall time; runs; errors; pipes: output piped/filtered
@@ -224,6 +244,9 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -236,10 +259,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         /// Maximum rows
@@ -247,6 +270,9 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -259,14 +285,17 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -279,14 +308,17 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -299,10 +331,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         #[arg(long, default_value = "tokens", value_parser = ["tokens", "wait", "stdout", "errors"])]
@@ -312,6 +344,9 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -324,10 +359,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         /// Shortest sequence length (calls)
@@ -350,6 +385,9 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -362,10 +400,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         /// errors: error count; calls; bytes: average output size; truncated: truncated outputs
@@ -379,6 +417,9 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -388,10 +429,10 @@ enum Commands {
         /// Trailing window: 24h, 7d, 2w, 30d, all [default: all]
         #[arg(long)]
         window: Option<String>,
-        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started at or after this ISO date, relative duration (48h), or git commit/ref; no trailing window unless --window is given
         #[arg(long)]
         since: Option<String>,
-        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        /// Only sessions that started strictly before this point (same formats); without --since/--window it covers all earlier history
         #[arg(long)]
         until: Option<String>,
         #[arg(long, default_value = "md", value_parser = ["md", "json"])]
@@ -399,6 +440,9 @@ enum Commands {
         /// Same as --format json
         #[arg(long, hide = true)]
         json: bool,
+        /// Only sessions from one harness, e.g. to compare like with like across a fix
+        #[arg(long, value_parser = ["claude-code", "codex", "antigravity", "kimi"])]
+        harness: Option<String>,
         /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
@@ -584,8 +628,15 @@ fn run() -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
                 println!(
-                    "Synced {} file(s) ({} unchanged, {} scanned).",
-                    stats.files_ingested, stats.files_skipped, stats.files_scanned
+                    "Synced {} file(s) ({} unchanged, {} scanned{}).",
+                    stats.files_ingested,
+                    stats.files_skipped,
+                    stats.files_scanned,
+                    if stats.full_reparse {
+                        ", full re-parse"
+                    } else {
+                        ""
+                    }
                 );
                 println!(
                     "  sessions: +{} | command_spans: +{} | tool_calls: +{} | file_reads: +{} | llm_calls: +{}",
@@ -615,12 +666,16 @@ fn run() -> Result<ExitCode> {
             until,
             format,
             json,
+            harness,
             no_sync,
         }) => {
             let json = json || format == "json";
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let default_win = window.as_deref().or(Some("all"));
             let cwd = std::env::current_dir()?;
@@ -636,6 +691,7 @@ fn run() -> Result<ExitCode> {
                 None,
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let repos = list_repos(&conn, &range, false)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&repos)?);
@@ -666,11 +722,15 @@ fn run() -> Result<ExitCode> {
             until,
             format,
             include_temp,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             if all || repo.is_none() {
                 let cwd = std::env::current_dir()?;
@@ -682,6 +742,7 @@ fn run() -> Result<ExitCode> {
                     None,
                     &cwd,
                 )?;
+                let range = with_harness(range, harness.as_deref());
                 let fleet = analyze_fleet(&conn, &range, include_temp)?;
                 println!("{}", format_fleet_report(&fleet, &format));
             } else {
@@ -699,6 +760,7 @@ fn run() -> Result<ExitCode> {
                     Some(&repo_id),
                     &cwd,
                 )?;
+                let range = with_harness(range, harness.as_deref());
                 let rep = analyze_repo(&conn, &repo_id, &range, 10)?;
                 if format == "prompt" {
                     let pat = analyze_cross_session_patterns(&conn, &repo_id, &range)?;
@@ -717,11 +779,15 @@ fn run() -> Result<ExitCode> {
             until,
             samples,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -736,6 +802,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let res = inspect_finding(&conn, &repo_id, &query, &range, samples)?;
             println!("{}", format_inspect_report(&res, &format));
             Ok(ExitCode::SUCCESS)
@@ -749,11 +816,15 @@ fn run() -> Result<ExitCode> {
             category,
             limit,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -768,6 +839,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let cmds = query_commands(&conn, &repo_id, &range, &sort, category.as_deref(), limit)?;
             println!(
                 "{}",
@@ -782,11 +854,15 @@ fn run() -> Result<ExitCode> {
             until,
             limit,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -801,6 +877,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let errs = query_errors(&conn, &repo_id, &range, limit)?;
             println!("{}", format_errors_report(&repo_name, &errs, &format));
             Ok(ExitCode::SUCCESS)
@@ -811,11 +888,15 @@ fn run() -> Result<ExitCode> {
             since,
             until,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -830,6 +911,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let rep = query_bypasses(&conn, &repo_id, &range)?;
             println!("{}", format_bypasses_report(&rep, &format));
             Ok(ExitCode::SUCCESS)
@@ -840,11 +922,15 @@ fn run() -> Result<ExitCode> {
             since,
             until,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -859,6 +945,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let rep = analyze_cross_session_patterns(&conn, &repo_id, &range)?;
             println!("{}", format_patterns_report(&rep, &format));
             Ok(ExitCode::SUCCESS)
@@ -871,11 +958,15 @@ fn run() -> Result<ExitCode> {
             sort,
             limit,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -890,6 +981,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let rows = query_top_sessions(&conn, &repo_id, &range, &sort, limit)?;
             println!(
                 "{}",
@@ -909,11 +1001,15 @@ fn run() -> Result<ExitCode> {
             sort,
             limit,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -928,6 +1024,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let rows = query_sequences(
                 &conn,
                 &repo_id,
@@ -954,11 +1051,15 @@ fn run() -> Result<ExitCode> {
             mcp_only,
             limit,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -973,6 +1074,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let rows = query_tools(&conn, &repo_id, &range, &sort, mcp_only, usize::MAX)?;
             println!(
                 "{}",
@@ -988,11 +1090,15 @@ fn run() -> Result<ExitCode> {
             until,
             open,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -1012,6 +1118,7 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
+            let range = with_harness(range, harness.as_deref());
             let mut rep = track_issues(&conn, &repo_id, &range)?;
             if let Some(q) = issue {
                 let key = match pick_issue_key(&q, resolve_issue_ref(&conn, &repo_id, &range, &q)?)
@@ -1121,11 +1228,15 @@ fn run() -> Result<ExitCode> {
             since,
             repo,
             format,
+            harness,
             no_sync,
         }) => {
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
+            }
+            if let Some(h) = &harness {
+                apply_harness_filter(&conn, h)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
                 eprintln!("{}", no_repo_msg(&repo));
@@ -1133,6 +1244,10 @@ fn run() -> Result<ExitCode> {
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
             let (since_ms, label) = resolve_time_point(&conn, &since, Some(&repo_id), &cwd)?;
+            let label = match &harness {
+                Some(h) => format!("{label} · {h} only"),
+                None => label,
+            };
             let res = diff_repo(&conn, &repo_id, since_ms, &label)?;
             println!("{}", format_diff_report(&res, &format));
             Ok(ExitCode::SUCCESS)

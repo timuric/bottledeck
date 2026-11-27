@@ -687,3 +687,81 @@ pub fn insert_llm_call(conn: &Connection, lc: &LlmCallRecord) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Harness names as stored in `agent_kind`.
+pub const HARNESSES: [&str; 4] = ["claude-code", "codex", "antigravity", "kimi"];
+
+/// Restrict every later query on this connection to one harness by shadowing the telemetry
+/// tables with TEMP views (SQLite resolves unqualified names in `temp` before `main`).
+/// Call it after syncing: the views are read-only.
+pub fn apply_harness_filter(conn: &Connection, harness: &str) -> Result<()> {
+    anyhow::ensure!(
+        HARNESSES.contains(&harness),
+        "unknown harness \"{harness}\" (expected one of: {})",
+        HARNESSES.join(", ")
+    );
+    // `harness` is one of the fixed names above, so inlining it is safe (views can't bind params).
+    let by_kind = |t: &str| {
+        format!(
+            "DROP VIEW IF EXISTS temp.{t};
+             CREATE TEMP VIEW {t} AS SELECT * FROM main.{t} WHERE agent_kind = '{harness}';"
+        )
+    };
+    let mut sql = String::new();
+    for t in ["sessions", "command_spans", "tool_calls", "llm_calls"] {
+        sql.push_str(&by_kind(t));
+    }
+    sql.push_str(&format!(
+        "DROP VIEW IF EXISTS temp.file_reads;
+         CREATE TEMP VIEW file_reads AS SELECT * FROM main.file_reads
+           WHERE session_id IN (SELECT session_id FROM main.sessions WHERE agent_kind = '{harness}');"
+    ));
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_filter_shadows_every_telemetry_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("ledger.db")).unwrap();
+        for (sid, kind) in [("s-codex", "codex"), ("s-claude", "claude-code")] {
+            conn.execute(
+                "INSERT INTO sessions (session_id, agent_kind, source_file) VALUES (?1, ?2, 'f')",
+                params![sid, kind],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tool_calls (call_id, session_id, source_file, agent_kind, tool_name, started_at)
+                 VALUES (?1, ?1, 'f', ?2, 't', 0)",
+                params![sid, kind],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_reads (read_id, session_id, source_file, target_name, started_at)
+                 VALUES (?1, ?1, 'f', 'x.rs', 0)",
+                params![sid],
+            )
+            .unwrap();
+        }
+        let count = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        apply_harness_filter(&conn, "codex").unwrap();
+        assert_eq!(count("sessions"), 1);
+        assert_eq!(count("tool_calls"), 1);
+        assert_eq!(count("file_reads"), 1);
+        assert_eq!(count("main.sessions"), 2);
+        // Re-applying switches harness instead of failing on the existing views.
+        apply_harness_filter(&conn, "claude-code").unwrap();
+        let sid: String = conn
+            .query_row("SELECT session_id FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sid, "s-claude");
+        assert!(apply_harness_filter(&conn, "x'; DROP TABLE sessions; --").is_err());
+    }
+}

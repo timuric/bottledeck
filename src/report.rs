@@ -653,11 +653,18 @@ pub fn format_diagnosis_prompt(
     }
 
     // Finding ids are ranks within this scope, so drill-downs must reuse the same time flags.
-    let scope = if crate::config::parse_window_ms(&report.window).is_ok() {
-        format!("--window {}", report.window)
-    } else {
-        format!("<same --since/--until as this report: {}>", report.window)
+    let (window, harness) = match report.window.split_once(" · ") {
+        Some((w, h)) => (w, h.strip_suffix(" only")),
+        None => (report.window.as_str(), None),
     };
+    let mut scope = if crate::config::parse_window_ms(window).is_ok() {
+        format!("--window {window}")
+    } else {
+        format!("<same --since/--until as this report: {window}>")
+    };
+    if let Some(h) = harness {
+        scope.push_str(&format!(" --harness {h}"));
+    }
     let r = &report.repo_name;
     lines.push("## Drill-Down Commands".to_string());
     lines.push(

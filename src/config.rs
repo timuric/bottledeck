@@ -209,6 +209,37 @@ pub fn default_context_window(model: Option<&str>, agent_kind: &str) -> Option<i
     }
 }
 
+/// Larger context tier a model family can run on (e.g. Claude's 1M-context mode). Transcripts log
+/// the same model id for both tiers, so the tier is only visible through the context size reached.
+fn larger_context_tier(model: Option<&str>, agent_kind: &str) -> Option<i64> {
+    let m = model.unwrap_or("").to_ascii_lowercase();
+    let is_claude = ["opus", "sonnet", "haiku", "claude", "fable"]
+        .iter()
+        .any(|k| m.contains(k))
+        || (m.is_empty() && agent_kind == "claude-code");
+    is_claude.then_some(1_000_000)
+}
+
+/// Window to measure a session's peak context against: the reported window, else the model
+/// default, bumped to the larger tier when the session provably ran past the smaller one.
+pub fn effective_context_window(
+    reported: Option<i64>,
+    peak_tokens: i64,
+    model: Option<&str>,
+    agent_kind: &str,
+) -> Option<i64> {
+    let win = reported
+        .filter(|&w| w > 0)
+        .or_else(|| default_context_window(model, agent_kind))?;
+    if peak_tokens > win
+        && let Some(tier) = larger_context_tier(model, agent_kind)
+        && tier > win
+    {
+        return Some(tier);
+    }
+    Some(win)
+}
+
 pub fn parse_window_ms(window_str: &str) -> Result<Option<i64>> {
     let s = window_str.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("all") {
@@ -230,4 +261,23 @@ pub fn parse_window_ms(window_str: &str) -> Result<Option<i64>> {
         _ => bail!("Invalid --window \"{s}\". Use e.g. 24h, 7d, 14d, 30d, or all."),
     };
     Ok(Some(n.saturating_mul(mult)))
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::*;
+
+    #[test]
+    fn peak_above_default_window_means_larger_claude_tier() {
+        // Claude Code logs the same model id for the 200k and 1M tiers.
+        let w = |peak| effective_context_window(None, peak, Some("claude-opus-5-5"), "claude-code");
+        assert_eq!(w(150_000), Some(200_000));
+        assert_eq!(w(788_162), Some(1_000_000));
+        // A reported window is trusted unless the session ran past it.
+        assert_eq!(
+            effective_context_window(Some(258_400), 279_060, Some("gpt-6-astra"), "codex"),
+            Some(258_400)
+        );
+        assert_eq!(effective_context_window(None, 10, None, "unknown"), None);
+    }
 }

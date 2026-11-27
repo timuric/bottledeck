@@ -154,7 +154,7 @@ Signals are automatically split into **repo-level fixes you control** and **harn
 
 ## CLI & Agent Workflows
 
-Every analytical command auto-syncs incrementally (pass `--no-sync` to skip) and supports `--window <24h|7d|14d|30d|all>`, `--since`, `--until`, and `--format <md|json>`. `--since`/`--until` take an ISO date, a relative duration (`48h`), or a git commit/ref, so "everything after this fix" is `--since <sha>`.
+Every analytical command auto-syncs incrementally (pass `--no-sync` to skip) and supports `--window <24h|7d|14d|30d|all>`, `--since`, `--until`, `--harness <claude-code|codex|antigravity|kimi>`, and `--format <md|json>`. `--since`/`--until` take an ISO date, a relative duration (`48h`), or a git commit/ref, so "everything after this fix" is `--since <sha>`.
 
 ### Teach your agents to use it
 
@@ -215,7 +215,7 @@ bottledeck mark --list --repo .   /   bottledeck mark --remove 3 --repo .
 | `QUIET` | no marker, but the clean streak since the last hit is unlikely by chance — mark the fix to confirm |
 | `ACTIVE` / `NEW` | no marker and still recurring / only present in the newest sessions |
 
-Each issue also shows a per-harness verdict and an affected/exposed breakdown per **harness version** (Claude Code and Codex record theirs; run `bottledeck sync --force` once to backfill older sessions), so a harness release that fixes or breaks something shows up directly. Fleet-level comparisons (`harness_divergence`, `low_cache_efficiency`, `missing_composite_task`, `slow_task_latency`, `context_handoff_bloat`) aren't per-session events and stay in `report`.
+Each issue also shows a per-harness verdict and an affected/exposed breakdown per **harness version** (Claude Code and Codex record theirs; older sessions are backfilled by the one-time re-parse after upgrading), so a harness release that fixes or breaks something shows up directly. Fleet-level comparisons (`harness_divergence`, `low_cache_efficiency`, `missing_composite_task`, `slow_task_latency`, `context_handoff_bloat`) aren't per-session events and stay in `report`.
 
 ### 4. Deep inspection
 

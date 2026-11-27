@@ -202,12 +202,19 @@ pub fn detect_tool_error(text: &str, explicit_err: bool) -> bool {
     }
     let head: String = body.chars().take(800).collect();
     let lower = head.to_ascii_lowercase();
-    let is_json_envelope = head.starts_with('{') || head.starts_with('[');
-    head.contains("OrchestratorMcpFailure")
+    if head.contains("OrchestratorMcpFailure")
         || head.contains("Encountered error in step execution")
-        || (is_json_envelope
-            && (head.contains("\"isError\":true") || head.contains("\"ok\":false")))
-        || lower.starts_with("error:")
+    {
+        return true;
+    }
+    // Structured results carry their own error markers. Their free text is payload (chat
+    // messages, logs, search hits) and must not be scanned for error-sounding phrases.
+    if (head.starts_with('{') || head.starts_with('['))
+        && let Some(is_err) = json_result_is_error(body, &head)
+    {
+        return is_err;
+    }
+    lower.starts_with("error:")
         || lower.starts_with("tool error:")
         || lower.starts_with("failed to ")
         || lower.contains("tool call failed")
@@ -220,6 +227,43 @@ pub fn detect_tool_error(text: &str, explicit_err: bool) -> bool {
         || lower.contains("operation not permitted")
         || lower.contains("belongs to another agent session")
         || lower.contains("permission check failed")
+}
+
+/// Error markers of a JSON tool result: `isError: true`, `ok: false`, or a non-null `error`,
+/// at the top level or inside wrapper objects (`result`, `structuredContent`, …). `None` when
+/// the text isn't JSON at all (e.g. a printed Python list), so text heuristics apply instead.
+fn json_result_is_error(body: &str, head: &str) -> Option<bool> {
+    fn envelope_is_error(v: &serde_json::Value, depth: usize) -> bool {
+        let serde_json::Value::Object(map) = v else {
+            return false;
+        };
+        let flagged = map.get("isError").and_then(|v| v.as_bool()) == Some(true)
+            || map.get("is_error").and_then(|v| v.as_bool()) == Some(true)
+            || map.get("ok").and_then(|v| v.as_bool()) == Some(false)
+            || map
+                .get("error")
+                .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(false));
+        flagged
+            || (depth < 4
+                && ["result", "structuredContent", "response"]
+                    .iter()
+                    .filter_map(|k| map.get(*k))
+                    .any(|inner| envelope_is_error(inner, depth + 1)))
+    }
+    match serde_json::from_str::<serde_json::Value>(body.trim()) {
+        Ok(v) => Some(envelope_is_error(&v, 0)),
+        // Truncated JSON: fall back to textual markers if it at least looks like a JSON object.
+        Err(_) if head.starts_with("{\"") || head.starts_with("[{") => {
+            let compact: String = head.chars().filter(|c| !c.is_whitespace()).collect();
+            Some(
+                compact.contains("\"isError\":true")
+                    || compact.contains("\"ok\":false")
+                    || compact.starts_with("{\"error\":{")
+                    || compact.starts_with("{\"error\":\""),
+            )
+        }
+        Err(_) => None,
+    }
 }
 
 /// Extract concrete file path targets from shell file-reading commands (`cat`, `sed`, `head`, `tail`, `nl`)

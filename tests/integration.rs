@@ -339,6 +339,23 @@ fn end_to_end_ingest_analysis_diff_and_tui_render() {
     let stats2 = sync_all(&mut conn, &roots, false).unwrap();
     assert_eq!(stats2.files_ingested, 0);
     assert_eq!(stats2.files_skipped, 3);
+    assert!(!stats2.full_reparse);
+
+    // A ledger written by an older parser is re-ingested once, then syncs are incremental again.
+    let parser_version = |c: &rusqlite::Connection| -> i64 {
+        c.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(parser_version(&conn), bottledeck::ingest::PARSER_VERSION);
+    conn.execute_batch("PRAGMA user_version = 0").unwrap();
+    let upgraded = sync_all(&mut conn, &roots, false).unwrap();
+    assert!(upgraded.full_reparse);
+    assert_eq!(upgraded.files_ingested, 3);
+    assert_eq!(upgraded.sessions_upserted, 3);
+    assert_eq!(parser_version(&conn), bottledeck::ingest::PARSER_VERSION);
+    let after = sync_all(&mut conn, &roots, false).unwrap();
+    assert!(!after.full_reparse);
+    assert_eq!(after.files_ingested, 0);
 
     let range_14d = TimeRange::from_window(Some(14 * 86_400_000), "14d");
     let fleet = analyze_fleet(&conn, &range_14d, true).unwrap();
@@ -1067,6 +1084,31 @@ fn regression_fixes_tool_errors_codex_steps_kimi_pruning_rebounds_and_inspect() 
     ));
     assert!(detect_tool_error(
         r#"{"_tag":"OrchestratorMcpFailure","code":"invalid_request"}"#,
+        false
+    ));
+    // JSON results: judged by their error markers (also nested in wrappers), not by payload text.
+    assert!(!detect_tool_error(
+        r#"{"has_more":true,"messages":[{"text":"Safari history couldn't be read (`Operation not permitted`)."}]}"#,
+        false
+    ));
+    assert!(!detect_tool_error(
+        r#"{"status":"fulfilled","value":"{\"body\":\"the upload timed out after 30s yesterday\"}"}"#,
+        false
+    ));
+    assert!(detect_tool_error(
+        r#"{"result":{"result":{"diagnostic":"session-page/owned-unresponsive","isError":true}}}"#,
+        false
+    ));
+    assert!(detect_tool_error(r#"{"ok":false,"message":"nope"}"#, false));
+    assert!(detect_tool_error(r#"{"error":{"code":403}}"#, false));
+    assert!(!detect_tool_error(r#"{"error":null,"rows":[]}"#, false));
+    // Text that merely starts with `[` (a printed Python list) still gets the text heuristics.
+    assert!(!detect_tool_error(
+        "['12-plugin-status.log']\nall good",
+        false
+    ));
+    assert!(detect_tool_error(
+        "['a']\npermission check failed for mcp \"x\"",
         false
     ));
 

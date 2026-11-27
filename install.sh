@@ -53,14 +53,23 @@ if [ -n "${BOTTLEDECK_VERSION:-}" ]; then
     *)  TAG="v$BOTTLEDECK_VERSION" ;;
   esac
 else
+  # Follow the releases/latest redirect first: it isn't subject to the API's 60/hour limit.
   TAG="$(
-    curl -fsSL \
-      -H "Accept: application/vnd.github+json" \
+    curl -fsSL -o /dev/null -w '%{url_effective}' \
       -H "User-Agent: bottledeck-installer" \
-      "https://api.github.com/repos/$REPO/releases/latest" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n 1
+      "https://github.com/$REPO/releases/latest" 2>/dev/null \
+    | sed -n 's#.*/releases/tag/\([^/?#]*\).*#\1#p'
   )"
+  if [ -z "$TAG" ]; then
+    TAG="$(
+      curl -fsSL \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: bottledeck-installer" \
+        "https://api.github.com/repos/$REPO/releases/latest" \
+      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | head -n 1
+    )"
+  fi
   [ -n "$TAG" ] || err "could not determine latest release tag from GitHub"
 fi
 
