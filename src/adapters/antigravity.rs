@@ -599,6 +599,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             "main".to_string()
         }),
         is_handoff,
+        harness_version: None,
     };
 
     Ok(ParsedFile {

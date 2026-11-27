@@ -1,3 +1,7 @@
+use crate::analyze::issues::{
+    IssueTrack, IssuesReport, SessionCell, Verdict, add_marker, format_ago, issue_key,
+    list_markers, remove_marker, track_issues,
+};
 use crate::analyze::{
     CommandStat, FleetReport, InspectResult, Opportunity, RepoReport, analyze_fleet, analyze_repo,
     format_compact, format_duration_human, inspect_finding,
@@ -39,35 +43,48 @@ pub enum DetailTab {
     Harnesses = 2,
     Commands = 3,
     Brief = 4,
+    Issues = 5,
 }
 
+const TAB_COUNT: usize = 6;
+
 impl DetailTab {
-    fn titles() -> [&'static str; 5] {
+    fn titles() -> [&'static str; TAB_COUNT] {
         [
             "1 Insights",
             "2 Patterns",
             "3 Harnesses",
             "4 Commands",
             "5 Brief",
+            "6 Issues",
         ]
     }
 
     fn next(self) -> Self {
-        Self::from_index((self as usize + 1) % 5)
+        Self::from_index((self as usize + 1) % TAB_COUNT)
     }
 
     fn prev(self) -> Self {
-        Self::from_index((self as usize + 4) % 5)
+        Self::from_index((self as usize + TAB_COUNT - 1) % TAB_COUNT)
     }
 
     fn from_index(i: usize) -> Self {
-        match i % 5 {
+        match i % TAB_COUNT {
             0 => Self::Insights,
             1 => Self::Patterns,
             2 => Self::Harnesses,
             3 => Self::Commands,
-            _ => Self::Brief,
+            4 => Self::Brief,
+            _ => Self::Issues,
         }
+    }
+}
+
+/// Issue tracking needs history: never judge recurrence on less than 30 days.
+fn issues_window(label: &str) -> &'static str {
+    match label {
+        "all" => "all",
+        _ => "30d",
     }
 }
 
@@ -204,6 +221,10 @@ pub struct App {
     pub cached_brief: String,
     pub modal: Option<InspectResult>,
     pub modal_scroll: u16,
+    /// Lazily computed when the Issues tab is first shown for the selected repo.
+    pub issues: Option<IssuesReport>,
+    pub issues_state: TableState,
+    pub issues_open_only: bool,
     pub status_msg: String,
     pub update_available: Option<String>,
     pub should_quit: bool,
@@ -277,6 +298,9 @@ impl App {
             cached_brief: String::new(),
             modal: None,
             modal_scroll: 0,
+            issues: None,
+            issues_state: TableState::default(),
+            issues_open_only: false,
             status_msg,
             update_available: crate::update::cached_available_update(),
             should_quit: false,
@@ -689,8 +713,55 @@ impl App {
             .selected()
             .and_then(|i| self.fleet.repos.get(i))
             .and_then(|r| analyze_cross_session_patterns(conn, &r.repo_id, &range).ok());
+        self.issues = None;
         self.reset_tab_selections();
         self.refresh_cached_brief();
+        Ok(())
+    }
+
+    fn visible_issues(&self) -> Vec<&IssueTrack> {
+        self.issues
+            .as_ref()
+            .map(|r| {
+                r.issues
+                    .iter()
+                    .filter(|t| !self.issues_open_only || t.verdict.verdict.is_open())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn selected_issue(&self) -> Option<&IssueTrack> {
+        let idx = self.issues_state.selected()?;
+        self.visible_issues().get(idx).copied()
+    }
+
+    /// Compute session-level issue tracking for the selected repo if it isn't cached yet.
+    pub fn ensure_issues(&mut self, conn: &Connection) -> Result<()> {
+        if self.issues.is_some() {
+            return Ok(());
+        }
+        let Some(repo_id) = self.selected_repo.as_ref().map(|r| r.repo_id.clone()) else {
+            return Ok(());
+        };
+        self.reload_issues(conn, &repo_id, None)
+    }
+
+    fn reload_issues(
+        &mut self,
+        conn: &Connection,
+        repo_id: &str,
+        keep: Option<String>,
+    ) -> Result<()> {
+        let win = issues_window(self.window_label());
+        let range = TimeRange::from_window(parse_window_ms(win)?, win);
+        let rep = track_issues(conn, repo_id, &range)?;
+        self.issues = Some(rep);
+        let vis = self.visible_issues();
+        let idx = keep
+            .and_then(|k| vis.iter().position(|t| t.key == k))
+            .or(if vis.is_empty() { None } else { Some(0) });
+        self.issues_state.select(idx);
         Ok(())
     }
 
@@ -810,6 +881,60 @@ impl App {
                 self.tab = DetailTab::Brief;
                 self.focus = Focus::Main;
             }
+            KeyCode::Char('6') => {
+                self.tab = DetailTab::Issues;
+                self.focus = Focus::Main;
+            }
+            KeyCode::Char('o') if self.tab == DetailTab::Issues => {
+                self.issues_open_only = !self.issues_open_only;
+                let len = self.visible_issues().len();
+                self.issues_state
+                    .select(if len > 0 { Some(0) } else { None });
+                self.status_msg = if self.issues_open_only {
+                    "Issues: open only (regressed / new / active / unchanged / improved)".into()
+                } else {
+                    "Issues: all tracked".into()
+                };
+            }
+            KeyCode::Char('m') if self.tab == DetailTab::Issues => {
+                if let (Some(repo_id), Some(key)) = (
+                    self.selected_repo.as_ref().map(|r| r.repo_id.clone()),
+                    self.selected_issue().map(|t| t.key.clone()),
+                ) {
+                    let now = chrono::Utc::now();
+                    let label = now.format("%Y-%m-%dT%H:%MZ (tui)").to_string();
+                    let id = add_marker(
+                        conn,
+                        &repo_id,
+                        Some(&key),
+                        now.timestamp_millis(),
+                        &label,
+                        None,
+                    )?;
+                    self.reload_issues(conn, &repo_id, Some(key.clone()))?;
+                    self.status_msg = format!(
+                        "Marker #{id} set now for {key} — sessions from here on are compared with earlier ones (u = undo)"
+                    );
+                }
+            }
+            KeyCode::Char('u') if self.tab == DetailTab::Issues => {
+                if let (Some(repo_id), Some(key)) = (
+                    self.selected_repo.as_ref().map(|r| r.repo_id.clone()),
+                    self.selected_issue().map(|t| t.key.clone()),
+                ) {
+                    let latest = list_markers(conn, &repo_id)?
+                        .into_iter()
+                        .filter(|m| m.issue_key.as_deref() == Some(key.as_str()))
+                        .max_by_key(|m| m.marker_id);
+                    if let Some(m) = latest {
+                        remove_marker(conn, &repo_id, m.marker_id)?;
+                        self.reload_issues(conn, &repo_id, Some(key.clone()))?;
+                        self.status_msg = format!("Removed marker #{} from {key}", m.marker_id);
+                    } else {
+                        self.status_msg = format!("No issue-specific marker on {key}");
+                    }
+                }
+            }
             KeyCode::Left | KeyCode::Char('h') => {
                 if self.sidebar_open {
                     self.focus = Focus::Drawer;
@@ -920,6 +1045,26 @@ impl App {
                             self.modal_scroll = 0;
                         }
                     }
+                } else if self.tab == DetailTab::Issues
+                    && let Some(repo) = &self.selected_repo
+                    && let Some(t) = self.selected_issue()
+                {
+                    let q = repo
+                        .opportunities
+                        .iter()
+                        .chain(repo.harness_overhead.iter())
+                        .find(|o| issue_key(&o.kind, &o.target) == t.key)
+                        .map(|o| o.id.clone())
+                        .unwrap_or_else(|| t.target.clone());
+                    let win_label = self.window_label();
+                    let range = TimeRange::from_window(parse_window_ms(win_label)?, win_label);
+                    match inspect_finding(conn, &repo.repo_id, &q, &range, 6) {
+                        Ok(res) => {
+                            self.modal = Some(res);
+                            self.modal_scroll = 0;
+                        }
+                        Err(e) => self.status_msg = format!("No traces for {}: {e}", t.key),
+                    }
                 } else if self.tab == DetailTab::Commands
                     && self.commands_view != CommandsView::Mcp
                     && let Some(repo) = &self.selected_repo
@@ -1016,6 +1161,10 @@ impl App {
                 let len = self.visible_command_count();
                 Self::move_table(&mut self.cmd_state, len, delta);
             }
+            DetailTab::Issues => {
+                let len = self.visible_issues().len();
+                Self::move_table(&mut self.issues_state, len, delta);
+            }
             DetailTab::Brief => {
                 if delta > 0 {
                     self.brief_scroll = self.brief_scroll.saturating_add(delta as u16);
@@ -1072,6 +1221,11 @@ pub fn run_tui(
                 && key.kind == KeyEventKind::Press
             {
                 app.handle_key(key.code, key.modifiers, conn, roots)?;
+            }
+            if app.tab == DetailTab::Issues
+                && let Err(e) = app.ensure_issues(conn)
+            {
+                app.status_msg = format!("Issue tracking failed: {e}");
             }
         }
         Ok(())
@@ -1981,6 +2135,7 @@ fn draw_active_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         DetailTab::Harnesses => draw_harnesses_tab(frame, area, app),
         DetailTab::Commands => draw_commands_tab(frame, area, app),
         DetailTab::Brief => draw_brief_tab(frame, area, app),
+        DetailTab::Issues => draw_issues_tab(frame, area, app),
     }
 }
 
@@ -3953,6 +4108,308 @@ fn draw_brief_tab(frame: &mut Frame, area: Rect, app: &App) {
 // Footer, Trace Drill-Down Modal & Keybind Help Overlay
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tab 6: Issues — session-by-session recurrence
+// ---------------------------------------------------------------------------
+
+fn verdict_color(v: Verdict) -> Color {
+    match v {
+        Verdict::Regressed => Color::Red,
+        Verdict::New => Color::LightMagenta,
+        Verdict::Active | Verdict::Unchanged => Color::Yellow,
+        Verdict::Improved => Color::LightGreen,
+        Verdict::Waiting => Color::Gray,
+        Verdict::Quiet | Verdict::Gone => Color::Green,
+    }
+}
+
+/// Styled strip of the most recent exposed sessions that fit in `width` cells.
+fn strip_spans(cells: &[SessionCell], marker_at: Option<i64>, width: usize) -> Vec<Span<'static>> {
+    let has_marker = marker_at.is_some();
+    let budget = width.saturating_sub(usize::from(has_marker)).max(1);
+    // When truncating, the leading "…" takes one cell of the budget.
+    let start = match cells.len().saturating_sub(budget) {
+        0 => 0,
+        s => s + 1,
+    };
+    let marker_idx = marker_at.map(|at| {
+        cells
+            .iter()
+            .position(|c| c.started_at >= at)
+            .unwrap_or(cells.len())
+    });
+    let mk = || {
+        Span::styled(
+            "│",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut out = Vec::new();
+    if start > 0 {
+        out.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+        if marker_idx.is_some_and(|m| m < start) {
+            out.push(mk());
+        }
+    }
+    for (i, c) in cells.iter().enumerate().skip(start) {
+        if marker_idx == Some(i) {
+            out.push(mk());
+        }
+        out.push(if c.affected {
+            Span::styled("●", Style::default().fg(Color::Red))
+        } else {
+            Span::styled("○", Style::default().fg(Color::Green))
+        });
+    }
+    if marker_idx == Some(cells.len()) {
+        out.push(mk());
+    }
+    out
+}
+
+fn draw_issues_tab(frame: &mut Frame, area: Rect, app: &mut App) {
+    let focused = app.focus == Focus::Main;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Min(9)])
+        .split(area);
+
+    let Some(rep) = app.issues.as_ref() else {
+        let msg = if app.selected_repo.is_some() {
+            "Computing session-by-session issue tracking…"
+        } else {
+            "No repository selected."
+        };
+        frame.render_widget(
+            Paragraph::new(msg).block(rounded_block(" Issues ", focused)),
+            area,
+        );
+        return;
+    };
+
+    let title = Line::from(vec![
+        Span::raw(" Issues by session "),
+        Span::styled(
+            format!("({}, {} sessions) ", rep.window, rep.sessions),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if app.issues_open_only {
+                "[open only] "
+            } else {
+                "[all] "
+            },
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled("(o) ", Style::default().fg(Color::DarkGray)),
+        Span::styled("● affected ", Style::default().fg(Color::Red)),
+        Span::styled("○ clean ", Style::default().fg(Color::Green)),
+        Span::styled("│ fix marker ", Style::default().fg(Color::Cyan)),
+    ]);
+
+    let visible = app.visible_issues();
+    let strip_w = (rows[0].width as usize).saturating_sub(70).clamp(12, 48);
+    let key_w = (rows[0].width as usize)
+        .saturating_sub(strip_w + 38)
+        .max(16);
+    let header = Row::new(vec![
+        Cell::from("Verdict"),
+        Cell::from("Issue"),
+        Cell::from(Line::from("Hit").right_aligned()),
+        Cell::from("Last seen"),
+        Cell::from("Recent exposed sessions"),
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    );
+    let t_rows: Vec<Row> = visible
+        .iter()
+        .map(|t| {
+            let v = t.verdict.verdict;
+            Row::new(vec![
+                Cell::from(v.label()).style(
+                    Style::default()
+                        .fg(verdict_color(v))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(truncate_ellipsis(&t.key, key_w)),
+                Cell::from(Line::from(format!("{}/{}", t.affected, t.exposed)).right_aligned()),
+                Cell::from(t.last_seen.map_or("-".to_string(), format_ago)),
+                Cell::from(Line::from(strip_spans(
+                    &t.cells,
+                    t.marker.as_ref().map(|m| m.at_ms),
+                    strip_w,
+                ))),
+            ])
+        })
+        .collect();
+    let empty = t_rows.is_empty();
+    let table = Table::new(
+        t_rows,
+        [
+            Constraint::Length(10),
+            Constraint::Fill(1),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(strip_w as u16 + 2),
+        ],
+    )
+    .header(header)
+    .column_spacing(1)
+    .block(rounded_block(title, focused))
+    .row_highlight_style(row_highlight_style())
+    .highlight_symbol("▶ ");
+    let sel_key = app.selected_issue().map(|t| t.key.clone());
+    let aggregate_note = if rep.aggregate_only.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} fleet-level finding(s) are not tracked per session — see Insights.",
+            rep.aggregate_only.len()
+        )
+    };
+    frame.render_stateful_widget(table, rows[0], &mut app.issues_state);
+    if empty {
+        let inner = rows[0].inner(ratatui::layout::Margin::new(2, 2));
+        frame.render_widget(
+            Paragraph::new("No session-trackable issues in this window.")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+    }
+
+    let label = |s: &str| {
+        Span::styled(
+            format!("{s:<11}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let dim = |s: String| Span::styled(s, Style::default().fg(Color::DarkGray));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(t) = sel_key
+        .as_ref()
+        .and_then(|k| app.issues.as_ref()?.issues.iter().find(|t| &t.key == k))
+    {
+        let v = t.verdict.verdict;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", v.label()),
+                Style::default()
+                    .fg(verdict_color(v))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(t.key.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            dim(format!("  · scope {}", t.scope)),
+        ]));
+        lines.push(Line::from(vec![
+            label("Verdict"),
+            Span::raw(t.verdict.reason.clone()),
+        ]));
+        let mut detail_w = rows[1].width.saturating_sub(16) as usize;
+        detail_w = detail_w.max(20);
+        let mut strip_line = vec![label("Sessions")];
+        strip_line.extend(strip_spans(
+            &t.cells,
+            t.marker.as_ref().map(|m| m.at_ms),
+            detail_w,
+        ));
+        lines.push(Line::from(strip_line));
+        if let Some(m) = &t.marker {
+            let b = t.verdict.before.unwrap_or_default();
+            let a = t.verdict.after.unwrap_or_default();
+            lines.push(Line::from(vec![
+                label("Marker"),
+                Span::raw(format!(
+                    "#{} {}{} — before {}/{}, after {}/{}",
+                    m.marker_id,
+                    m.label,
+                    m.note
+                        .as_deref()
+                        .map(|n| format!(" “{n}”"))
+                        .unwrap_or_default(),
+                    b.affected,
+                    b.exposed,
+                    a.affected,
+                    a.exposed
+                )),
+            ]));
+        }
+        if let (Some(ls), Some(sid)) = (t.last_seen, &t.last_seen_session) {
+            lines.push(Line::from(vec![
+                label("Last seen"),
+                Span::raw(format!(
+                    "{} in {} · {}{}",
+                    format_ago(ls),
+                    truncate_ellipsis(sid.rsplit(':').next().unwrap_or(sid), 12),
+                    t.last_seen_harness.as_deref().unwrap_or("?"),
+                    t.last_seen_version
+                        .as_deref()
+                        .map(|v| format!(" {v}"))
+                        .unwrap_or_default()
+                )),
+            ]));
+        }
+        let mut hs = vec![label("Harnesses")];
+        for (i, h) in t.by_harness.iter().enumerate() {
+            if i > 0 {
+                hs.push(dim(" · ".into()));
+            }
+            hs.push(Span::styled(
+                short_harness(&h.harness).to_string(),
+                Style::default().fg(harness_color(&h.harness)),
+            ));
+            hs.push(Span::raw(format!(" {}/{} ", h.affected, h.exposed)));
+            hs.push(Span::styled(
+                h.verdict.label().to_ascii_lowercase(),
+                Style::default().fg(verdict_color(h.verdict)),
+            ));
+        }
+        lines.push(Line::from(hs));
+        let versions: Vec<String> = t
+            .by_version
+            .iter()
+            .filter(|v| v.version != "?")
+            .map(|v| {
+                format!(
+                    "{} {} {}/{}",
+                    short_harness(&v.harness),
+                    v.version,
+                    v.affected,
+                    v.exposed
+                )
+            })
+            .collect();
+        if !versions.is_empty() {
+            lines.push(Line::from(vec![
+                label("Versions"),
+                Span::raw(versions.join(" · ")),
+            ]));
+        }
+        if let Some(h) = &t.headline {
+            lines.push(Line::from(vec![label("Detector"), dim(h.clone())]));
+        }
+    } else {
+        lines.push(Line::from(dim(
+            "Select an issue to see its session history.".into(),
+        )));
+    }
+    if !aggregate_note.is_empty() {
+        lines.push(Line::from(dim(aggregate_note)));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(rounded_block(" Session history ", false)),
+        rows[1],
+    );
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(
@@ -4014,6 +4471,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ));
             spans.push(Span::raw("Prompt/YAML  "));
         }
+        DetailTab::Issues => {
+            for (k, l) in [
+                (" m ", "Mark fix now  "),
+                (" u ", "Undo mark  "),
+                (" o ", "Open only  "),
+                (" Enter ", "Traces  "),
+            ] {
+                spans.push(Span::styled(
+                    k,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(l));
+            }
+        }
         DetailTab::Harnesses => {
             spans.push(Span::styled(
                 " Space ",
@@ -4040,7 +4513,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
     spans.extend([
         Span::styled(
-            " 1-5/Tab ",
+            " 1-6/Tab ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -4214,7 +4687,7 @@ fn draw_help_modal(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(
-            "  1–5 / Tab / Shift-Tab   Switch views (Insights, Patterns, Harnesses, Commands, Brief)",
+            "  1–6 / Tab / Shift-Tab   Switch views (Insights, Patterns, Harnesses, Commands, Brief, Issues)",
         ),
         Line::from("  b                       Toggle Fleet Repos & Cross-Repo drawer"),
         Line::from("  [ / ]                   Previous / Next repository inline"),
@@ -4241,6 +4714,9 @@ fn draw_help_modal(frame: &mut Frame, area: Rect) {
             "  Commands:   s = Switch sort/view (Tokens / Slowest / Errors / MCP)  ·  Enter = Traces",
         ),
         Line::from("  Brief:      m = Toggle Diagnosis Prompt (Markdown) vs Structured YAML"),
+        Line::from(
+            "  Issues:     m = Mark fix now  ·  u = Undo last mark  ·  o = Open only  ·  Enter = Traces",
+        ),
     ];
 
     let modal = Paragraph::new(lines).wrap(Wrap { trim: true }).block(

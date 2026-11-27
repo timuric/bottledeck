@@ -63,13 +63,15 @@ Run `bottledeck` in any terminal to sync local transcripts and open the dashboar
 
 | Key | Scope | Action |
 | :--- | :--- | :--- |
-| `1`–`5` / `Tab` / `Shift-Tab` | Global | Switch views (`1 Insights`, `2 Patterns`, `3 Harnesses`, `4 Commands`, `5 Brief`) |
+| `1`–`6` / `Tab` / `Shift-Tab` | Global | Switch views (`1 Insights`, `2 Patterns`, `3 Harnesses`, `4 Commands`, `5 Brief`, `6 Issues`) |
 | `j` / `k` / `↑` / `↓` | Global | Navigate rows or scroll (`PgUp`/`PgDn`, `g`/`G` to jump) |
 | `Enter` | `1 Insights` | Open redacted trace drill-down for the selected signal (or pick repo in drawer) |
 | `f` | `1 Insights` | Cycle scope filter (`Repo fixes` → `All signals` → `Harness overhead`) |
 | `v` | `2 Patterns` | Cycle view (`Workflows` → `Burst Storms` → `Drift & Cold-Start`) |
 | `s` | `4 Commands` | Cycle sort/view (`Token Sinks` → `Slowest` → `Most Errors` → `MCP`) |
 | `m` | `5 Brief` | Toggle `Diagnosis Prompt` (Markdown) vs `Structured YAML` |
+| `m` / `u` | `6 Issues` | Mark a fix for the selected issue *now* / undo the last mark |
+| `o` | `6 Issues` | Show only open issues (regressed, new, active, unchanged, improved) |
 | `b` | Global | Toggle Fleet Repos & Cross-Repo drawer (`h`/`l` switches focus) |
 | `[` / `]` | Global | Step to previous / next repository inline |
 | `w` | Global | Cycle time window (`24h` → `7d` → `14d` → `30d` → `all`) |
@@ -182,7 +184,31 @@ bottledeck report --repo . --since 9f2a1c4
 bottledeck commands --repo . --since 2026-11-20 --until HEAD
 ```
 
-### 3. Deep inspection
+### 3. Track issues session by session
+
+`--since` compares aggregates. `issues` asks the sharper question: **after a fix, do new sessions still hit the same issue?** Every issue gets a stable key (`<kind>:<target>`, e.g. `polling_tax:gh run view`) and a strip with one cell per session that *could* have hit it — `●` affected, `○` clean, `│` fix marker. Sessions that never did the relevant work (never ran the polled command, never called the tool) are excluded, so unrelated sessions can't make an issue look fixed.
+
+```sh
+bottledeck issues --repo .                      # every trackable issue, problems first
+bottledeck issues --repo . --open               # only issues that still need attention
+bottledeck issues "gh run view" --repo .        # one issue (key, unique substring, or opp-N)
+bottledeck mark polling_tax:gh run view --at 9f2a1c4 --note "added mise run ci-wait"
+bottledeck mark --all --at 2026-11-25 --note "codex 0.171 upgrade"   # repo-wide marker
+bottledeck mark --list --repo .   /   bottledeck mark --remove 3 --repo .
+```
+
+| Verdict | Meaning |
+| :--- | :--- |
+| `GONE` | 0 hits since the marker, in enough sessions that this would be < 5% likely at the old rate |
+| `IMPROVED` / `REGRESSED` | the post-marker rate is significantly lower / higher (exact binomial test, p ≤ 0.05) |
+| `UNCHANGED` | enough post-marker sessions, no significant change |
+| `WAITING` | too few exposed sessions since the marker to tell — the report says how many more are needed |
+| `QUIET` | no marker, but the clean streak since the last hit is unlikely by chance — mark the fix to confirm |
+| `ACTIVE` / `NEW` | no marker and still recurring / only present in the newest sessions |
+
+Each issue also shows a per-harness verdict and an affected/exposed breakdown per **harness version** (Claude Code and Codex record theirs; run `bottledeck sync --force` once to backfill older sessions), so a harness release that fixes or breaks something shows up directly. Fleet-level comparisons (`harness_divergence`, `low_cache_efficiency`, `missing_composite_task`, `slow_task_latency`, `context_handoff_bloat`) aren't per-session events and stay in `report`.
+
+### 4. Deep inspection
 
 ```sh
 bottledeck inspect opp-1 --repo . --samples 5            # Redacted trace samples for a signal or command
@@ -195,7 +221,7 @@ bottledeck bypasses --repo .                             # State scrapes, pipe-s
 bottledeck sessions --repo . --sort tokens               # Top sessions by tokens | wait | stdout | errors
 ```
 
-### 4. Inventory & diagnostics
+### 5. Inventory & diagnostics
 
 ```sh
 bottledeck repos          # List every discovered repository and worktree count

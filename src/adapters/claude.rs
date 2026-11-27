@@ -69,6 +69,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     let mut first_msg_seen = false;
     let mut first_user_seen = false;
     let mut originator: Option<String> = None;
+    let mut harness_version: Option<String> = None;
     let mut is_handoff = false;
 
     let mut seen_msg_ids: HashSet<String> = HashSet::new();
@@ -105,6 +106,12 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             && let Some(ep) = obj.get("entrypoint").and_then(Value::as_str)
         {
             originator = Some(ep.to_string());
+        }
+        // Keep the LATEST version seen: a resumed session may continue on an upgraded CLI.
+        if let Some(v) = obj.get("version").and_then(Value::as_str)
+            && !v.is_empty()
+        {
+            harness_version = Some(v.to_string());
         }
         if effort.is_none()
             && let Some(ef) = obj
@@ -674,6 +681,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
         originator,
         subagent_kind: Some(if is_subagent { "subagent" } else { "main" }.to_string()),
         is_handoff,
+        harness_version,
     };
 
     Ok(ParsedFile {

@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   is_subagent          INTEGER NOT NULL DEFAULT 0,
   originator           TEXT,
   subagent_kind        TEXT,
-  is_handoff           INTEGER NOT NULL DEFAULT 0
+  is_handoff           INTEGER NOT NULL DEFAULT 0,
+  harness_version      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS command_spans (
@@ -164,6 +165,19 @@ CREATE TABLE IF NOT EXISTS llm_calls (
   started_at         INTEGER NOT NULL
 );
 
+-- Fix markers: user-declared points in time (commit, date) after which an issue should stop recurring.
+-- issue_key NULL = applies to every tracked issue in the repo.
+CREATE TABLE IF NOT EXISTS issue_markers (
+  marker_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id     TEXT NOT NULL,
+  issue_key   TEXT,
+  at_ms       INTEGER NOT NULL,
+  label       TEXT NOT NULL,
+  note        TEXT,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_markers_repo ON issue_markers(repo_id, issue_key);
 CREATE INDEX IF NOT EXISTS idx_sessions_repo_time ON sessions(repo_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source_file);
 CREATE INDEX IF NOT EXISTS idx_spans_repo_time ON command_spans(repo_id, started_at);
@@ -221,6 +235,8 @@ pub struct SessionRecord {
     pub originator: Option<String>,
     pub subagent_kind: Option<String>,
     pub is_handoff: bool,
+    /// Harness CLI/app version that produced the transcript (e.g. Claude Code `2.1.3`, Codex `0.171.0`).
+    pub harness_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -370,6 +386,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         "ALTER TABLE sessions ADD COLUMN context_window INTEGER",
         "ALTER TABLE sessions ADD COLUMN effort TEXT",
         "ALTER TABLE sessions ADD COLUMN turn_origin TEXT",
+        "ALTER TABLE sessions ADD COLUMN harness_version TEXT",
         "ALTER TABLE file_reads ADD COLUMN target_path TEXT",
         "ALTER TABLE tool_calls ADD COLUMN seq_idx INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE tool_calls ADD COLUMN tool_call_id TEXT",
@@ -418,11 +435,11 @@ pub fn upsert_session(conn: &Connection, s: &SessionRecord) -> Result<()> {
           total_tool_ms, tool_wall_ms, api_duration_ms, api_retry_ms, thinking_duration_ms,
           ttft_ms_sum, ttft_count, compaction_count, aborted_turns, api_errors, outcome,
           parent_session_id, lines_added, lines_removed, max_context_tokens, context_window,
-          effort, turn_origin, is_subagent, originator, subagent_kind, is_handoff
+          effort, turn_origin, is_subagent, originator, subagent_kind, is_handoff, harness_version
         ) VALUES (
           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
           ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36,
-          ?37, ?38, ?39, ?40, ?41
+          ?37, ?38, ?39, ?40, ?41, ?42
         )
         ON CONFLICT(session_id) DO UPDATE SET
           model = COALESCE(excluded.model, sessions.model),
@@ -470,7 +487,8 @@ pub fn upsert_session(conn: &Connection, s: &SessionRecord) -> Result<()> {
           is_subagent = MAX(sessions.is_subagent, excluded.is_subagent),
           originator = COALESCE(excluded.originator, sessions.originator),
           subagent_kind = COALESCE(excluded.subagent_kind, sessions.subagent_kind),
-          is_handoff = MAX(sessions.is_handoff, excluded.is_handoff)",
+          is_handoff = MAX(sessions.is_handoff, excluded.is_handoff),
+          harness_version = COALESCE(excluded.harness_version, sessions.harness_version)",
         params![
             s.session_id,
             s.agent_kind,
@@ -513,6 +531,7 @@ pub fn upsert_session(conn: &Connection, s: &SessionRecord) -> Result<()> {
             s.originator,
             s.subagent_kind,
             if s.is_handoff { 1 } else { 0 },
+            s.harness_version,
         ],
     )?;
     Ok(())

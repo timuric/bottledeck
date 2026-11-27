@@ -1,3 +1,4 @@
+use bottledeck::analyze::issues::{add_marker, format_issues_report, issue_key, track_issues};
 use bottledeck::analyze::{
     analyze_fleet, analyze_repo, diff_repo, inspect_finding, resolve_time_range,
 };
@@ -19,6 +20,22 @@ use ratatui::backend::TestBackend;
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
+
+/// Fixture root for synthetic transcripts.
+///
+/// Adapters deliberately treat OS temp dirs (`/tmp`, `/var/folders`, …) as scratch space with no
+/// repository, and a path inside a git checkout resolves to that checkout. Fixtures therefore live
+/// in a throwaway dir under `$HOME` (override with `BOTTLEDECK_TEST_TMP`), removed on drop.
+fn fixture_tmp() -> TempDir {
+    let base = std::env::var_os("BOTTLEDECK_TEST_TMP")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    tempfile::Builder::new()
+        .prefix(".bottledeck-it-")
+        .tempdir_in(base)
+        .unwrap()
+}
 
 #[test]
 fn shell_parsing_and_secret_redaction() {
@@ -54,7 +71,7 @@ fn workspace_remote_normalization_and_worktree_collapsing() {
         Some("github.com/acme/demo")
     );
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = fixture_tmp();
     let repo_dir = tmp.path().join("demo");
     let wt_dir = tmp.path().join("demo-wt");
     fs::create_dir_all(&repo_dir).unwrap();
@@ -105,7 +122,7 @@ fn workspace_remote_normalization_and_worktree_collapsing() {
 
 #[test]
 fn end_to_end_ingest_analysis_diff_and_tui_render() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = fixture_tmp();
     let repo_dir = tmp.path().join("sample-repo");
     fs::create_dir_all(&repo_dir).unwrap();
     let repo_str = repo_dir.to_string_lossy().to_string();
@@ -384,6 +401,50 @@ fn end_to_end_ingest_analysis_diff_and_tui_render() {
     assert_eq!(diff.before.sessions, 1);
     assert_eq!(diff.after.sessions, 2);
 
+    // Session-level issue tracking: stable keys, one cell per exposed session, markers split it.
+    let tracked = track_issues(&conn, repo_id, &range_14d).unwrap();
+    assert_eq!(tracked.sessions, 3);
+    let noisy_key = issue_key(&noisy.kind, &noisy.target);
+    let noisy_track = tracked
+        .issues
+        .iter()
+        .find(|t| t.key == noisy_key)
+        .expect("noisy_task_output should be tracked per session");
+    assert_eq!(noisy_track.exposed, 3);
+    assert_eq!(noisy_track.affected, 3);
+    assert!(
+        noisy_track
+            .cells
+            .windows(2)
+            .all(|w| w[0].started_at <= w[1].started_at)
+    );
+    assert_eq!(noisy_track.by_harness.len(), 3);
+    assert!(tracked.issues.iter().all(|t| t.exposed > 0));
+
+    let marker_id = add_marker(
+        &conn,
+        repo_id,
+        Some(&noisy_key),
+        t1 - 100,
+        "midpoint",
+        Some("quiet flag"),
+    )
+    .unwrap();
+    let marked = track_issues(&conn, repo_id, &range_14d).unwrap();
+    let t = marked.issues.iter().find(|t| t.key == noisy_key).unwrap();
+    assert_eq!(t.marker.as_ref().map(|m| m.marker_id), Some(marker_id));
+    let (before, after) = (t.verdict.before.unwrap(), t.verdict.after.unwrap());
+    assert_eq!((before.exposed, after.exposed), (1, 2));
+    // One session before the marker is no baseline: the verdict must say so instead of guessing.
+    assert!(
+        t.verdict.reason.contains("no baseline"),
+        "{}",
+        t.verdict.reason
+    );
+    let md = format_issues_report(&marked, "md");
+    assert!(md.contains(&noisy_key));
+    assert!(md.contains("│"));
+
     // Verify Ratatui TUI renders cleanly across all tabs, drawer, and modal using TestBackend
     let mut app = App::load(&conn, "14d", Some(repo_id)).unwrap();
     let backend = TestBackend::new(140, 40);
@@ -395,10 +456,24 @@ fn end_to_end_ingest_analysis_diff_and_tui_render() {
         DetailTab::Harnesses,
         DetailTab::Commands,
         DetailTab::Brief,
+        DetailTab::Issues,
     ] {
         app.tab = tab;
+        if tab == DetailTab::Issues {
+            app.ensure_issues(&conn).unwrap();
+        }
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
+    let issues_screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(issues_screen.contains("Issues by session"));
+    assert!(issues_screen.contains("noisy_task_output"));
+    assert!(issues_screen.contains("Session history"));
 
     app.sidebar_open = true;
     app.tab = DetailTab::Insights;
@@ -421,7 +496,7 @@ fn end_to_end_ingest_analysis_diff_and_tui_render() {
 
 #[test]
 fn cross_session_originator_subagent_mcp_tools_and_truncation() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = fixture_tmp();
     let repo_dir = tmp.path().join("demo-app");
     fs::create_dir_all(&repo_dir).unwrap();
     Command::new("git")
@@ -760,7 +835,7 @@ fn error_preview_cleaning_strips_harness_wrappers() {
 
 #[test]
 fn antigravity_adapter_handles_full_transcripts_quoted_args_mcp_errors_and_tokens() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = fixture_tmp();
     let repo_dir = tmp.path().join("demo-agy-repo");
     fs::create_dir_all(repo_dir.join("src")).unwrap();
     fs::write(repo_dir.join("src/cards.rs"), "pub fn card() {}\n").unwrap();
@@ -1006,7 +1081,7 @@ fn regression_fixes_tool_errors_codex_steps_kimi_pruning_rebounds_and_inspect() 
         "/Users/alice/.local/state/quine-host/workspaces/kimi/tasks/x/work"
     ));
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = fixture_tmp();
     let repo_dir = tmp.path().join("reg-repo");
     fs::create_dir_all(&repo_dir).unwrap();
     Command::new("git")
@@ -1370,7 +1445,7 @@ fn shell_parser_loops_wrappers_exit_codes_and_parallel_intervals() {
 
 #[test]
 fn advanced_telemetry_latency_tokens_trajectories_churn_and_diff() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = fixture_tmp();
     let repo_a = tmp.path().join("alpha-repo");
     let repo_b = tmp.path().join("beta-repo");
     fs::create_dir_all(repo_a.join("src")).unwrap();

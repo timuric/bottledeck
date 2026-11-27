@@ -601,6 +601,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
             originator: Some("kimi-code".to_string()),
             subagent_kind,
             is_handoff,
+            harness_version: None,
             workspace_id: final_ws_id,
             repo_id: final_repo_id,
             repo_name: final_repo_name,

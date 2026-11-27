@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod issues;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoSummary {
     pub repo_id: String,

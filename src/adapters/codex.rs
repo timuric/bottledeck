@@ -305,6 +305,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
     let mut saw_tool_output_since_step = false;
     let mut is_subagent = false;
     let mut originator: Option<String> = None;
+    let mut harness_version: Option<String> = None;
     let mut subagent_kind: Option<String> = None;
     let mut is_handoff = false;
     let mut first_user_seen = false;
@@ -416,6 +417,11 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
                     }
                     if let Some(orig) = payload.get("originator").and_then(Value::as_str) {
                         originator = Some(orig.to_string());
+                    }
+                    if let Some(v) = payload.get("cli_version").and_then(Value::as_str)
+                        && !v.is_empty()
+                    {
+                        harness_version = Some(v.to_string());
                     }
                     if let Some(br) = payload
                         .get("git")
@@ -1221,6 +1227,7 @@ pub fn parse_file(file_path: &Path, resolver: &mut WorkspaceResolver<'_>) -> Res
         subagent_kind: subagent_kind
             .or_else(|| Some(if is_subagent { "subagent" } else { "main" }.to_string())),
         is_handoff,
+        harness_version,
     };
 
     Ok(ParsedFile {

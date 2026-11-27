@@ -1,4 +1,8 @@
 use anyhow::Result;
+use bottledeck::analyze::issues::{
+    add_marker, format_issues_report, list_markers, pick_issue_key, remove_marker,
+    resolve_issue_ref, track_issues,
+};
 use bottledeck::analyze::{
     analyze_fleet, analyze_repo, diff_repo, format_compact, inspect_finding, list_repos,
     query_bypasses, query_commands, query_errors, resolve_repo_selector, resolve_time_point,
@@ -91,6 +95,46 @@ enum Commands {
         samples: usize,
         #[arg(long, default_value = "md")]
         format: String,
+        #[arg(long)]
+        no_sync: bool,
+    },
+    /// Track issues session by session: after a fix, do new sessions still hit it?
+    Issues {
+        /// One issue: key (e.g. "polling_tax:gh run view"), unique substring, or opp-N / h-N
+        issue: Option<String>,
+        #[arg(long, default_value = ".")]
+        repo: String,
+        #[arg(long, default_value = "30d")]
+        window: String,
+        /// Only issues that still need attention (regressed / new / active / unchanged / improved)
+        #[arg(long)]
+        open: bool,
+        #[arg(long, default_value = "md")]
+        format: String,
+        #[arg(long)]
+        no_sync: bool,
+    },
+    /// Record a fix point so sessions after it are compared with sessions before it
+    Mark {
+        /// Issue key, unique substring, or opp-N / h-N (omit together with --all)
+        issue: Option<String>,
+        /// Apply the marker to every issue in the repo (e.g. a harness upgrade)
+        #[arg(long)]
+        all: bool,
+        /// When the fix landed: git commit/ref, ISO date, or relative duration (e.g. 2h)
+        #[arg(long, default_value = "HEAD")]
+        at: String,
+        /// Free-text description of the fix
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = ".")]
+        repo: String,
+        /// List existing markers
+        #[arg(long)]
+        list: bool,
+        /// Delete a marker by id
+        #[arg(long)]
+        remove: Option<i64>,
         #[arg(long)]
         no_sync: bool,
     },
@@ -798,6 +842,126 @@ fn run() -> Result<ExitCode> {
             )?;
             let rows = query_tools(&conn, &repo_id, &range, &sort, mcp_only, limit)?;
             println!("{}", format_tools_report(&repo_name, &sort, &rows, &format));
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Commands::Issues {
+            issue,
+            repo,
+            window,
+            open,
+            format,
+            no_sync,
+        }) => {
+            let mut conn = open_db(&db_path())?;
+            if !no_sync {
+                sync_all(&mut conn, &roots, false)?;
+            }
+            let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
+                eprintln!("No telemetry found for repo \"{repo}\".");
+                return Ok(ExitCode::FAILURE);
+            };
+            let cwd = fallback_cwd_for_repo(Some(&repo))?;
+            let range = resolve_time_range(&conn, Some(&window), None, None, Some(&repo_id), &cwd)?;
+            let mut rep = track_issues(&conn, &repo_id, &range)?;
+            if let Some(q) = issue {
+                let key = match pick_issue_key(&q, resolve_issue_ref(&conn, &repo_id, &range, &q)?)
+                {
+                    Ok(k) => k,
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        return Ok(ExitCode::FAILURE);
+                    }
+                };
+                rep.issues.retain(|t| t.key == key);
+                if rep.issues.is_empty() {
+                    eprintln!("Issue \"{key}\" has no exposed sessions in {window}.");
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            if open {
+                rep.issues.retain(|t| t.verdict.verdict.is_open());
+            }
+            println!("{}", format_issues_report(&rep, &format));
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Commands::Mark {
+            issue,
+            all,
+            at,
+            note,
+            repo,
+            list,
+            remove,
+            no_sync,
+        }) => {
+            let mut conn = open_db(&db_path())?;
+            if !no_sync && !list && remove.is_none() {
+                sync_all(&mut conn, &roots, false)?;
+            }
+            let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
+                eprintln!("No telemetry found for repo \"{repo}\".");
+                return Ok(ExitCode::FAILURE);
+            };
+            if let Some(id) = remove {
+                if remove_marker(&conn, &repo_id, id)? {
+                    println!("Removed marker #{id}.");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                eprintln!("No marker #{id} for {repo_name}.");
+                return Ok(ExitCode::FAILURE);
+            }
+            if list {
+                let markers = list_markers(&conn, &repo_id)?;
+                if markers.is_empty() {
+                    println!("No markers for {repo_name}.");
+                }
+                for m in markers {
+                    println!(
+                        "#{:<4} {:<32} {}{}",
+                        m.marker_id,
+                        m.label,
+                        m.issue_key.as_deref().unwrap_or("(all issues)"),
+                        m.note.map(|n| format!("  — {n}")).unwrap_or_default()
+                    );
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let cwd = fallback_cwd_for_repo(Some(&repo))?;
+            let key = match (issue, all) {
+                (Some(_), true) => {
+                    eprintln!("Pass either an issue or --all, not both.");
+                    return Ok(ExitCode::FAILURE);
+                }
+                (None, false) => {
+                    eprintln!("Pass an issue key (see `bottledeck issues`) or --all.");
+                    return Ok(ExitCode::FAILURE);
+                }
+                (None, true) => None,
+                (Some(q), false) => {
+                    let range =
+                        resolve_time_range(&conn, Some("30d"), None, None, Some(&repo_id), &cwd)?;
+                    match pick_issue_key(&q, resolve_issue_ref(&conn, &repo_id, &range, &q)?) {
+                        Ok(k) => Some(k),
+                        Err(msg) => {
+                            eprintln!("{msg}");
+                            return Ok(ExitCode::FAILURE);
+                        }
+                    }
+                }
+            };
+            let (at_ms, label) = resolve_time_point(&conn, &at, Some(&repo_id), &cwd)?;
+            let id = add_marker(
+                &conn,
+                &repo_id,
+                key.as_deref(),
+                at_ms,
+                &label,
+                note.as_deref(),
+            )?;
+            println!(
+                "Marker #{id} at {label} → {}. Sessions started after it are compared with earlier ones in `bottledeck issues`.",
+                key.as_deref().unwrap_or("all issues")
+            );
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Diff {
