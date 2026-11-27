@@ -274,6 +274,9 @@ pub struct TraceSample {
     /// `cmd:<raw>` / `tool:<name>` identity of the occurrence; `None` matches any item at that instant.
     #[serde(skip)]
     pub match_text: Option<String>,
+    /// First tokens of the filter the output was piped into (`tail -1`, `grep -v`), if any.
+    #[serde(skip)]
+    pub piped_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2287,11 +2290,33 @@ pub fn analyze_repo(
         }
     }
     if total_cli_piped >= 12 {
-        piped_cli_breakdown.sort_by_key(|(_, c, _, _)| std::cmp::Reverse(*c));
+        // Rank by count weighted by rate, so a task piped on nearly every run (its output is
+        // never usable as-is) outranks a bigger task that is only sometimes trimmed.
+        piped_cli_breakdown.sort_by(|a, b| {
+            let w = |(_, c, r, _): &(String, usize, usize, String)| {
+                (*c as f64) * (*c as f64) / (*r).max(1) as f64
+            };
+            w(b).total_cmp(&w(a)).then_with(|| b.1.cmp(&a.1))
+        });
         let top_str: Vec<String> = piped_cli_breakdown
             .iter()
             .take(5)
-            .map(|(t, c, r, f)| format!("{t} ({c}/{r} -> | {f})"))
+            .map(|(t, c, r, f)| {
+                let label = crate::context::pipe_purpose_label(crate::context::pipe_purpose(f));
+                format!("{t} ({c}/{r} -> | {f}: {label})")
+            })
+            .collect();
+        let piped_tasks: Vec<serde_json::Value> = piped_cli_breakdown
+            .iter()
+            .map(|(t, c, r, f)| {
+                serde_json::json!({
+                    "template": t,
+                    "piped": c,
+                    "runs": r,
+                    "filter": f,
+                    "purpose": crate::context::pipe_purpose(f),
+                })
+            })
             .collect();
         let mut ev = BTreeMap::new();
         ev.insert(
@@ -2299,6 +2324,7 @@ pub fn analyze_repo(
             serde_json::json!(total_cli_piped),
         );
         ev.insert("top_piped_tasks".into(), serde_json::json!(top_str));
+        ev.insert("piped_tasks".into(), serde_json::json!(piped_tasks));
         let piped_hs = format_harness_breakdown(&piped_by_harness);
         raw_opps.push(Opportunity {
             id: String::new(),
@@ -3428,6 +3454,7 @@ pub fn match_finding_samples(
                 next_cmd: None,
                 started_ms: ts,
                 match_text: Some(format!("tool:{name}")),
+                piped_filter: None,
             });
         }
         return Ok(matched);
@@ -3481,6 +3508,7 @@ pub fn match_finding_samples(
                 next_cmd: None,
                 started_ms: ts,
                 match_text: Some(format!("tool:{name}")),
+                piped_filter: None,
             });
         }
         return Ok(matched);
@@ -3529,6 +3557,7 @@ pub fn match_finding_samples(
                 next_cmd: None,
                 started_ms: ts,
                 match_text: Some(format!("read:{fname}")),
+                piped_filter: None,
             });
         }
         return Ok(matched);
@@ -3630,6 +3659,7 @@ pub fn match_finding_samples(
                 next_cmd: None,
                 started_ms: s.started_at,
                 match_text: None,
+                piped_filter: None,
             });
         }
         return Ok(matched);
@@ -3704,6 +3734,7 @@ pub fn match_finding_samples(
                 next_cmd: next.map(|n| n.cmd_template.clone()),
                 started_ms: sp.started_at,
                 match_text: Some(format!("cmd:{}", sp.raw_redacted)),
+                piped_filter: sp.piped_filter.clone(),
             });
         }
     }

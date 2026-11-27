@@ -76,6 +76,9 @@ bottledeck report --repo R --window 30d --no-sync
 bottledeck inspect opp-1 --repo R --window 30d --no-sync
 ```
 Then read the files and commands named in "Where to look" before proposing a fix.
+For polling and piped-output findings, `inspect` splits the matches into **Shapes**
+(e.g. short-timeout retry vs one wait per item; keeping the last line vs bounding long
+output). Fix the largest shape that has a fix; shapes marked `(-)` need none.
 
 **Check whether a fix worked (per session).**
 ```

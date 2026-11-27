@@ -1087,6 +1087,36 @@ pub fn format_inspect_report(res: &InspectResult, format: &str) -> String {
         lines.push(String::new());
     }
 
+    let ctx = &res.context;
+    if !ctx.shapes.is_empty() {
+        lines.push(format!(
+            "### Shapes ({} sessions with a matching call)",
+            ctx.affected_sessions
+        ));
+        lines.push(
+            "One finding, several behaviours; fix the largest one that needs a fix (`-` = no fix needed)."
+                .into(),
+        );
+        lines.push(String::new());
+        for sh in &ctx.shapes {
+            let minor = crate::context::is_minor_shape(&sh.key);
+            lines.push(format!(
+                "- **{}**{} — {} calls in {} sessions: {}.{}",
+                sh.label,
+                if minor { " (-)" } else { "" },
+                sh.calls,
+                sh.sessions,
+                sh.description,
+                if minor {
+                    String::new()
+                } else {
+                    format!(" Fix: {}", sh.fix)
+                }
+            ));
+        }
+        lines.push(String::new());
+    }
+
     for (i, s) in res.samples.iter().enumerate() {
         lines.push(format!(
             "### Sample {} ({}, {}, turn {})",

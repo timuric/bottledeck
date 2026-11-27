@@ -8,7 +8,7 @@ use crate::analyze::{
 };
 use crate::config::{AdapterRoots, TimeRange, parse_window_ms};
 use crate::context::{
-    Episode, EpisodeLine, FindingContext, LineRole, ShapeSummary, finding_context,
+    Episode, EpisodeLine, FindingContext, LineRole, ShapeSummary, finding_context, is_minor_shape,
 };
 use crate::ingest::sync_all;
 use crate::patterns::{
@@ -2848,8 +2848,10 @@ fn render_opportunity_diagnosis(
                 dim,
             ),
         ]));
-        for (i, s) in c.shapes.iter().enumerate() {
-            let muted = s.key == "one_off";
+        // Keep the pane for the example: list the biggest shapes, fold the rest into one line.
+        const SHOWN: usize = 3;
+        for (i, s) in c.shapes.iter().enumerate().take(SHOWN) {
+            let muted = is_minor_shape(&s.key);
             shapes.push(Line::from(vec![
                 Span::styled(
                     format!(" {} ", shape_letter(i)),
@@ -2862,7 +2864,7 @@ fn render_opportunity_diagnosis(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("{:<20}", s.label),
+                    format!("{:<20} ", s.label),
                     if muted {
                         dim
                     } else {
@@ -2876,6 +2878,22 @@ fn render_opportunity_diagnosis(
                     shapes.push(Line::styled(format!("    {l}"), dim));
                 }
             }
+        }
+        if c.shapes.len() > SHOWN {
+            let rest = &c.shapes[SHOWN..];
+            let labels: Vec<&str> = rest.iter().map(|s| s.label.as_str()).collect();
+            shapes.push(Line::styled(
+                truncate_ellipsis(
+                    &format!(
+                        " +{} more ({} calls): {}",
+                        rest.len(),
+                        rest.iter().map(|s| s.calls).sum::<usize>(),
+                        labels.join(", ")
+                    ),
+                    w,
+                ),
+                dim,
+            ));
         }
     }
 
@@ -5458,16 +5476,25 @@ fn draw_inspect_modal(
             lines.push(Line::from(""));
             lines.push(Line::from(section_header("SHAPES", Color::Cyan)));
             for (i, s) in ctx.shapes.iter().enumerate() {
+                let muted = is_minor_shape(&s.key);
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!(" {} ", shape_letter(i)),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(if muted {
+                                Color::DarkGray
+                            } else {
+                                Color::Yellow
+                            })
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("{:<20}", s.label),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        format!("{:<20} ", s.label),
+                        if muted {
+                            dim
+                        } else {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        },
                     ),
                     Span::styled(
                         truncate_ellipsis(

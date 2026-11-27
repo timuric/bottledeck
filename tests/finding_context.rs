@@ -241,3 +241,78 @@ fn polling_finding_gets_episodes_shapes_and_contextual_ui() {
         "Tab jumps to the first session episode"
     );
 }
+
+#[test]
+fn output_filtering_finding_splits_by_what_the_filter_keeps() {
+    let tmp = TempDir::new().unwrap();
+    let conn = open_db(&tmp.path().join("ledger.db")).unwrap();
+    let now = Utc::now().timestamp_millis();
+    for (s, sid) in ["codex:p1", "codex:p2"].iter().enumerate() {
+        let base = now - 3_600_000 * (s as i64 + 1);
+        insert_session(&conn, sid, base, 40);
+        let calls = (0..8)
+            .map(|_| {
+                (
+                    "mise run verify",
+                    "mise run verify -- --scope web 2>&1",
+                    "tail -1",
+                )
+            })
+            .chain((0..3).map(|_| {
+                (
+                    "mise run vps sql",
+                    "mise run vps -- sql 'select 1'",
+                    "head -40",
+                )
+            }));
+        for (turn, (tpl, raw, pipe)) in calls.enumerate() {
+            let turn = turn as i64 + 1;
+            conn.execute(
+                "INSERT INTO command_spans (span_id, session_id, source_file, source_kind, agent_kind,
+                                            turn_idx, seq_idx, repo_id, repo_name, category, is_repo_cli,
+                                            cmd_bin, cmd_template, raw_redacted, exit_code, duration_ms,
+                                            piped_filter, started_at)
+                 VALUES (?1, ?2, 'x.jsonl', 'transcript', 'codex', ?3, 0, ?4, 'acme/jobs', 'repo_task', 1,
+                         'mise', ?5, ?6, 0, 1000, ?7, ?8)",
+                params![format!("{sid}-{turn}"), sid, turn, REPO, tpl, raw, pipe, base + turn * 1000],
+            )
+            .unwrap();
+        }
+    }
+    let range = TimeRange::from_window(Some(14 * 86_400_000), "14d");
+    let report = analyze_repo(&conn, REPO, &range, 16).unwrap();
+    let opp = report
+        .opportunities
+        .iter()
+        .find(|o| o.kind == "output_filtering_tax")
+        .expect("pipe finding detected")
+        .clone();
+    // The task piped on every run ranks first, labelled with what the filter keeps.
+    let top = opp.evidence["top_piped_tasks"][0].as_str().unwrap();
+    assert_eq!(top, "mise run verify (16/16 -> | tail -1: keeps ≤5 lines)");
+
+    let ctx = finding_context(&conn, REPO, &opp, &range, 5).unwrap();
+    let keys: Vec<(&str, usize)> = ctx
+        .shapes
+        .iter()
+        .map(|s| (s.key.as_str(), s.calls))
+        .collect();
+    assert_eq!(keys, vec![("few_lines", 16), ("window", 6)]);
+    let few = ctx.dominant_shape().unwrap();
+    assert!(few.description.contains("mise run verify (16 of 16 runs)"));
+    assert!(few.fix.contains("`quiet = true`"));
+    // Episodes illustrate each shape and mark only that shape's calls.
+    let shapes: Vec<&str> = ctx
+        .episodes
+        .iter()
+        .filter_map(|e| e.shape.as_deref())
+        .collect();
+    assert_eq!(shapes[..2], ["few_lines", "window"]);
+    assert!(
+        ctx.episodes[0]
+            .lines
+            .iter()
+            .filter(|l| l.role == LineRole::Match)
+            .all(|l| l.text.ends_with("| tail -1"))
+    );
+}
