@@ -154,7 +154,16 @@ Signals are automatically split into **repo-level fixes you control** and **harn
 
 ## CLI & Agent Workflows
 
-Every analytical command auto-syncs incrementally (pass `--no-sync` to skip) and supports `--window <24h|7d|14d|30d|all>`, `--since`, `--until`, and `--format <md|json>`.
+Every analytical command auto-syncs incrementally (pass `--no-sync` to skip) and supports `--window <24h|7d|14d|30d|all>`, `--since`, `--until`, and `--format <md|json>`. `--since`/`--until` take an ISO date, a relative duration (`48h`), or a git commit/ref, so "everything after this fix" is `--since <sha>`.
+
+### Teach your agents to use it
+
+```sh
+bottledeck agent-guide            # Print the agent guide: question → command map, time scoping, verdicts, gotchas
+bottledeck agent-guide --install  # Install it as a skill for Claude Code ($CLAUDE_CONFIG_DIR or ~/.claude) and Codex ($CODEX_HOME or ~/.codex)
+```
+
+Once the skill is installed, asking an agent "did the polling fix in quineos stick?" or "what wasted the most tokens in this repo last week?" is enough: the agent knows to sync once, name the repo, scope the time range, and pick `issues`, `report`, `tools`, or `diff`. Agents that only see `bottledeck --help` are pointed at `agent-guide` too. `bottledeck doctor` shows whether the installed skill matches the binary version; re-run `--install` after upgrading.
 
 ### 1. Hand an evidence-backed diagnosis brief straight to an agent
 
@@ -211,11 +220,11 @@ Each issue also shows a per-harness verdict and an affected/exposed breakdown pe
 ### 4. Deep inspection
 
 ```sh
-bottledeck inspect opp-1 --repo . --samples 5            # Redacted trace samples for a signal or command
+bottledeck inspect opp-1 --repo . --samples 5            # Redacted traces for opp-N/h-N, an issue key, or a command
 bottledeck patterns --repo .                             # Pareto split, motifs, burst storms, drift, harness gaps
 bottledeck sequences --repo . --min-len 3 --min-sessions 2  # Repeating multi-step command workflows
-bottledeck tools --repo . --mcp-only                     # MCP & non-shell tool errors, sizes, and truncation
-bottledeck commands --repo . --sort effective            # Sort by effective | raw | wait | runs | errors | piped
+bottledeck tools --repo . --mcp-only                     # MCP & non-shell tool errors, sizes, truncation (+ totals)
+bottledeck commands --repo . --sort effective            # Sort by effective | tokens | wait | runs | errors | pipes
 bottledeck errors --repo .                               # Recurring nonzero-exit error clusters
 bottledeck bypasses --repo .                             # State scrapes, pipe-stripping, help tax, shell rebounds
 bottledeck sessions --repo . --sort tokens               # Top sessions by tokens | wait | stdout | errors

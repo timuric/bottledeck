@@ -10,6 +10,10 @@ use bottledeck::analyze::{
 };
 use bottledeck::config::{TimeRange, adapter_roots, db_path, parse_window_ms, state_dir};
 use bottledeck::db::open_db;
+use bottledeck::guide::{
+    AGENT_GUIDE, SkillTarget, install_paths, installed_skill_version, skill_locations,
+    skill_markdown, write_skill,
+};
 use bottledeck::ingest::sync_all;
 use bottledeck::patterns::{
     analyze_cross_session_patterns, format_patterns_report, format_sequences_report,
@@ -27,11 +31,14 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+const AFTER_HELP: &str = "Agents: run `bottledeck agent-guide` for workflows, time scoping, and how to read the output.\nInstall it as a Claude Code / Codex skill with `bottledeck agent-guide --install`.";
+
 #[derive(Parser)]
 #[command(
     name = "bottledeck",
     version,
-    about = "Zero-touch multi-harness telemetry, Ratatui dashboard, and bottleneck analyzer for coding agents"
+    about = "Zero-touch multi-harness telemetry, Ratatui dashboard, and bottleneck analyzer for coding agents",
+    after_help = AFTER_HELP
 )]
 struct Cli {
     #[command(subcommand)]
@@ -41,28 +48,49 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::enum_variant_names)]
 enum Commands {
+    /// Print the agent usage guide (or install it as a Claude Code / Codex skill)
+    #[command(visible_alias = "guide")]
+    AgentGuide {
+        /// Install the guide as a skill (SKILL.md) for agent harnesses instead of printing it
+        #[arg(long)]
+        install: bool,
+        /// Which harness to install for
+        #[arg(long, value_enum, default_value = "all", requires = "install")]
+        target: SkillTarget,
+        /// Print the guide wrapped as a SKILL.md (frontmatter included)
+        #[arg(long, conflicts_with = "install")]
+        skill: bool,
+    },
     /// Launch the interactive Ratatui dashboard
     Tui {
+        /// Initial time window: 24h, 7d, 14d, 30d, 90d, all
         #[arg(long, default_value = "14d")]
         window: String,
+        /// Repo to open: `.`, a path, owner/name, repo_id, or unique substring
         #[arg(long)]
         repo: Option<String>,
+        /// Skip the transcript sync on start
         #[arg(long)]
         no_sync: bool,
     },
     /// Incrementally ingest local coding-agent transcripts and spans into the SQLite ledger
     Sync {
+        /// Re-ingest every transcript, even unchanged ones (slow; use after upgrades that change parsing)
         #[arg(long)]
         force: bool,
+        /// Print sync statistics as JSON
         #[arg(long)]
         json: bool,
     },
     /// Generate fleet-wide or per-repo reports (md, llm, prompt, json)
     Report {
+        /// Fleet-wide report across all repos (the default when --repo is omitted)
         #[arg(long)]
         all: bool,
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long)]
         repo: Option<String>,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration (e.g. 48h), or git commit/ref
@@ -71,18 +99,24 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
-        #[arg(long, default_value = "md")]
+        /// md: readable; llm: compact YAML brief; prompt: diagnosis bundle for a reviewing agent (per repo); json: full data
+        #[arg(long, default_value = "md", value_parser = ["md", "llm", "prompt", "json"])]
         format: String,
+        /// Include temp/fixture repos in the fleet report
         #[arg(long)]
         include_temp: bool,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
-    /// Drill into a finding (e.g. opp-1) or command template with redacted trace samples
+    /// Drill into a finding (opp-N / h-N, an issue key, or a command template) with redacted trace samples
     Inspect {
+        /// opp-N / h-N from `report` (use the same time flags), an issue key from `issues`, or a command template
         query: String,
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -91,10 +125,12 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
+        /// Number of trace samples to show
         #[arg(long, default_value_t = 5)]
         samples: usize,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
@@ -102,15 +138,24 @@ enum Commands {
     Issues {
         /// One issue: key (e.g. "polling_tax:gh run view"), unique substring, or opp-N / h-N
         issue: Option<String>,
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
-        #[arg(long, default_value = "30d")]
-        window: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 30d, or all when --since/--until is set]
+        #[arg(long)]
+        window: Option<String>,
+        /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
+        #[arg(long)]
+        since: Option<String>,
+        /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
+        #[arg(long)]
+        until: Option<String>,
         /// Only issues that still need attention (regressed / new / active / unchanged / improved)
         #[arg(long)]
         open: bool,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
@@ -127,6 +172,7 @@ enum Commands {
         /// Free-text description of the fix
         #[arg(long)]
         note: Option<String>,
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
         /// List existing markers
@@ -135,24 +181,30 @@ enum Commands {
         /// Delete a marker by id
         #[arg(long)]
         remove: Option<i64>,
+        /// Skip the transcript sync first
         #[arg(long)]
         no_sync: bool,
     },
-    /// Compare before/after metrics around an infra commit SHA or ISO date
+    /// Compare sessions after a change (commit SHA, ref, or date) with a matched window before it
     Diff {
+        /// The change point: git commit/ref, ISO date, or relative duration (e.g. 72h)
         #[arg(long)]
         since: String,
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
     /// List commands for a repo sorted by effective tokens, raw tokens, wait, runs, errors, or pipe-stripping
     Commands {
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -161,21 +213,27 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
-        #[arg(long, default_value = "effective")]
+        /// effective: context cost; tokens: raw stdout; wait: wall time; runs; errors; pipes: output piped/filtered
+        #[arg(long, default_value = "effective", value_parser = ["effective", "tokens", "wait", "runs", "errors", "pipes"])]
         sort: String,
-        #[arg(long)]
+        /// Only one command category
+        #[arg(long, value_parser = ["exploration", "vcs_ci", "repo_task", "build_test", "polling", "package_mgr", "other"])]
         category: Option<String>,
+        /// Maximum rows
         #[arg(long, default_value_t = 30)]
         limit: usize,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
     /// Show recurring nonzero-exit command error clusters for a repo
     Errors {
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -184,17 +242,21 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
+        /// Maximum rows
         #[arg(long, default_value_t = 25)]
         limit: usize,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
     /// Audit state-directory scrapes, CLI pipe-stripping, help tax, and raw tool bypasses
     Bypasses {
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -203,15 +265,18 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
     /// Analyze cross-session longitudinal & systemic patterns (motifs, drift, harness asymmetry, cold starts, bloat drivers, burst storms)
     Patterns {
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -220,15 +285,18 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
     /// List top sessions (by total tokens, wait, stdout, or errors) with command-family breakdowns
     Sessions {
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -237,19 +305,23 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
-        #[arg(long, default_value = "tokens")]
+        #[arg(long, default_value = "tokens", value_parser = ["tokens", "wait", "stdout", "errors"])]
         sort: String,
+        /// Maximum rows
         #[arg(long, default_value_t = 15)]
         limit: usize,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
     /// Mine repeating multi-step call sequences (3-12 calls) across sessions with token/session counts
     Sequences {
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -258,27 +330,36 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
+        /// Shortest sequence length (calls)
         #[arg(long, default_value_t = 3)]
         min_len: usize,
+        /// Longest sequence length (calls)
         #[arg(long, default_value_t = 10)]
         max_len: usize,
+        /// Only sequences seen in at least this many sessions
         #[arg(long, default_value_t = 2)]
         min_sessions: usize,
+        /// Keep pure exploration sequences (ls/cat/grep chains), hidden by default
         #[arg(long)]
         include_exploration: bool,
-        #[arg(long, default_value = "impact")]
+        /// impact: sessions × length × calls × tokens; sessions; len; tokens; wait
+        #[arg(long, default_value = "impact", value_parser = ["impact", "sessions", "len", "tokens", "wait"])]
         sort: String,
+        /// Maximum rows
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
     /// Audit non-shell & MCP tool calls (error rates, output size, truncation) across all harnesses
     Tools {
+        /// Repo: `.`, a path, owner/name, repo_id, or unique substring (see `bottledeck repos`)
         #[arg(long, default_value = ".")]
         repo: String,
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: 14d, or all when --since/--until is set]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -287,19 +368,24 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
-        #[arg(long, default_value = "errors")]
+        /// errors: error count; calls; bytes: average output size; truncated: truncated outputs
+        #[arg(long, default_value = "errors", value_parser = ["errors", "calls", "bytes", "truncated"])]
         sort: String,
+        /// Only MCP tools
         #[arg(long)]
         mcp_only: bool,
+        /// Maximum rows
         #[arg(long, default_value_t = 25)]
         limit: usize,
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
         format: String,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
     /// List all discovered repositories in the ledger
     Repos {
+        /// Trailing window: 24h, 7d, 2w, 30d, all [default: all]
         #[arg(long)]
         window: Option<String>,
         /// Include only sessions at or after this ISO date, relative duration, or git commit/ref
@@ -308,8 +394,12 @@ enum Commands {
         /// Include only sessions strictly before this ISO date, relative duration, or git commit/ref
         #[arg(long)]
         until: Option<String>,
-        #[arg(long)]
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
+        format: String,
+        /// Same as --format json
+        #[arg(long, hide = true)]
         json: bool,
+        /// Skip the transcript sync before querying (sync once, then pass this)
         #[arg(long)]
         no_sync: bool,
     },
@@ -353,6 +443,12 @@ fn fallback_cwd_for_repo(repo_sel: Option<&str>) -> Result<PathBuf> {
         return Ok(PathBuf::from(r));
     }
     Ok(std::env::current_dir()?)
+}
+
+fn no_repo_msg(sel: &str) -> String {
+    format!(
+        "No telemetry found for repo \"{sel}\". Run `bottledeck repos --no-sync` and pass a listed repo_name (e.g. --repo owner/name)."
+    )
 }
 
 fn print_roots(label: &str, paths: &[PathBuf]) {
@@ -403,6 +499,34 @@ fn run() -> Result<ExitCode> {
             run_tui(&mut conn, &roots, &window, repo_id.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(Commands::AgentGuide {
+            install,
+            target,
+            skill,
+        }) => {
+            if !install {
+                print!(
+                    "{}",
+                    if skill {
+                        skill_markdown(CURRENT_VERSION)
+                    } else {
+                        AGENT_GUIDE.to_string()
+                    }
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            for (harness, path) in install_paths(target) {
+                write_skill(&path, CURRENT_VERSION)?;
+                println!(
+                    "Installed bottledeck skill for {harness}: {}",
+                    path.display()
+                );
+            }
+            println!(
+                "Agents pick it up in new sessions. Re-run after `bottledeck update` to refresh it."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Commands::Wrap { surface, cmd }) => {
             let code = run_wrapped_command(&cmd, surface.as_deref())?;
             Ok(ExitCode::from(code.clamp(0, 255) as u8))
@@ -433,6 +557,15 @@ fn run() -> Result<ExitCode> {
             print_roots("codex_dir:", &roots.codex);
             print_roots("agy_dir:", &roots.antigravity);
             print_roots("kimi_dir:", &roots.kimi);
+            for (harness, path) in skill_locations() {
+                let status = match installed_skill_version(&path) {
+                    Some(v) if v == CURRENT_VERSION => format!("v{v}, current"),
+                    Some(v) => format!("v{v}, outdated — run `bottledeck agent-guide --install`"),
+                    None if path.exists() => "custom".to_string(),
+                    None => "absent — `bottledeck agent-guide --install`".to_string(),
+                };
+                println!("  skill:       {} [{harness}] ({status})", path.display());
+            }
             println!(
                 "  spans_file:  {} ({})",
                 roots.spans.display(),
@@ -480,9 +613,11 @@ fn run() -> Result<ExitCode> {
             window,
             since,
             until,
+            format,
             json,
             no_sync,
         }) => {
+            let json = json || format == "json";
             let mut conn = open_db(&db_path())?;
             if !no_sync {
                 sync_all(&mut conn, &roots, false)?;
@@ -552,9 +687,7 @@ fn run() -> Result<ExitCode> {
             } else {
                 let sel = repo.as_deref().unwrap_or(".");
                 let Some((repo_id, _)) = resolve_repo_selector(&conn, sel)? else {
-                    eprintln!(
-                        "No telemetry found for repo \"{sel}\". Run 'bottledeck repos' to list known repos."
-                    );
+                    eprintln!("{}", no_repo_msg(sel));
                     return Ok(ExitCode::FAILURE);
                 };
                 let cwd = fallback_cwd_for_repo(Some(sel))?;
@@ -591,7 +724,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
@@ -623,7 +756,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
@@ -656,7 +789,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
@@ -685,7 +818,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
@@ -714,7 +847,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
@@ -745,7 +878,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
@@ -783,7 +916,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
@@ -828,7 +961,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
@@ -840,14 +973,19 @@ fn run() -> Result<ExitCode> {
                 Some(&repo_id),
                 &cwd,
             )?;
-            let rows = query_tools(&conn, &repo_id, &range, &sort, mcp_only, limit)?;
-            println!("{}", format_tools_report(&repo_name, &sort, &rows, &format));
+            let rows = query_tools(&conn, &repo_id, &range, &sort, mcp_only, usize::MAX)?;
+            println!(
+                "{}",
+                format_tools_report(&repo_name, &sort, &rows, limit, &format)
+            );
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Issues {
             issue,
             repo,
             window,
+            since,
+            until,
             open,
             format,
             no_sync,
@@ -857,11 +995,23 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;
-            let range = resolve_time_range(&conn, Some(&window), None, None, Some(&repo_id), &cwd)?;
+            let window = match (&window, since.is_some() || until.is_some()) {
+                (Some(w), _) => w.clone(),
+                (None, true) => "all".to_string(),
+                (None, false) => "30d".to_string(),
+            };
+            let range = resolve_time_range(
+                &conn,
+                Some(&window),
+                since.as_deref(),
+                until.as_deref(),
+                Some(&repo_id),
+                &cwd,
+            )?;
             let mut rep = track_issues(&conn, &repo_id, &range)?;
             if let Some(q) = issue {
                 let key = match pick_issue_key(&q, resolve_issue_ref(&conn, &repo_id, &range, &q)?)
@@ -874,7 +1024,10 @@ fn run() -> Result<ExitCode> {
                 };
                 rep.issues.retain(|t| t.key == key);
                 if rep.issues.is_empty() {
-                    eprintln!("Issue \"{key}\" has no exposed sessions in {window}.");
+                    eprintln!(
+                        "Issue \"{key}\" has no exposed sessions in {}.",
+                        range.label
+                    );
                     return Ok(ExitCode::FAILURE);
                 }
             }
@@ -899,7 +1052,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, repo_name)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             if let Some(id) = remove {
@@ -975,7 +1128,7 @@ fn run() -> Result<ExitCode> {
                 sync_all(&mut conn, &roots, false)?;
             }
             let Some((repo_id, _)) = resolve_repo_selector(&conn, &repo)? else {
-                eprintln!("No telemetry found for repo \"{repo}\".");
+                eprintln!("{}", no_repo_msg(&repo));
                 return Ok(ExitCode::FAILURE);
             };
             let cwd = fallback_cwd_for_repo(Some(&repo))?;

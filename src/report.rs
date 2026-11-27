@@ -652,18 +652,32 @@ pub fn format_diagnosis_prompt(
         lines.push(String::new());
     }
 
+    // Finding ids are ranks within this scope, so drill-downs must reuse the same time flags.
+    let scope = if crate::config::parse_window_ms(&report.window).is_ok() {
+        format!("--window {}", report.window)
+    } else {
+        format!("<same --since/--until as this report: {}>", report.window)
+    };
+    let r = &report.repo_name;
     lines.push("## Drill-Down Commands".to_string());
+    lines.push(
+        "Run `bottledeck agent-guide` for the full command map, time scoping and verdict meanings."
+            .to_string(),
+    );
     lines.push(format!(
-        "- Inspect raw traces for any finding: `bottledeck inspect <opp-id|h-id> --repo {} --no-sync`",
-        report.repo_name
+        "- Raw traces for a finding (ids are ranks in this report, so keep the scope): `bottledeck inspect <opp-id|h-id> --repo {r} {scope} --no-sync`"
     ));
     lines.push(format!(
-        "- Verify whether an issue persists after a fix commit: `bottledeck report --repo {} --since <commit-sha> --no-sync`",
-        report.repo_name
+        "- Is an issue still happening, session by session? `bottledeck issues --repo {r} --open --no-sync` (stable `kind:target` keys)"
     ));
     lines.push(format!(
-        "- Full cross-session / MCP / sequence views: `bottledeck patterns --repo {} --no-sync` | `bottledeck tools --repo {} --no-sync` | `bottledeck sequences --repo {} --no-sync`",
-        report.repo_name, report.repo_name, report.repo_name
+        "- After a fix lands: `bottledeck mark <kind:target> --at <fix-commit> --repo {r} --note \"…\"`, then `bottledeck issues <kind:target> --repo {r} --no-sync`"
+    ));
+    lines.push(format!(
+        "- Aggregate before/after a change: `bottledeck diff --since <commit|date> --repo {r} --no-sync`"
+    ));
+    lines.push(format!(
+        "- Cross-session / MCP / sequence views: `bottledeck patterns --repo {r} {scope} --no-sync` | `bottledeck tools --repo {r} {scope} --no-sync` | `bottledeck sequences --repo {r} {scope} --no-sync`"
     ));
 
     lines.join("\n")

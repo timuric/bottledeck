@@ -3288,25 +3288,41 @@ pub fn query_tools(
     Ok(out)
 }
 
+/// `rows` is every tool in scope; only the first `limit` are listed, but the totals line covers all.
 pub fn format_tools_report(
     repo_name: &str,
     sort_by: &str,
     rows: &[ToolStat],
+    limit: usize,
     format: &str,
 ) -> String {
+    let shown = &rows[..rows.len().min(limit)];
     if format == "json" {
-        return serde_json::to_string_pretty(rows).unwrap_or_default();
+        return serde_json::to_string_pretty(shown).unwrap_or_default();
     }
+    let calls: usize = rows.iter().map(|t| t.calls).sum();
+    let errors: usize = rows.iter().map(|t| t.error_count).sum();
+    let truncated: usize = rows.iter().map(|t| t.truncated_count).sum();
     let mut lines = vec![
         format!(
-            "# Non-Shell & MCP Tools in `{repo_name}` (sorted by `{sort_by}`, showing {})",
+            "# Non-Shell & MCP Tools in `{repo_name}` (sorted by `{sort_by}`, showing {} of {})",
+            shown.len(),
             rows.len()
+        ),
+        String::new(),
+        format!(
+            "**Totals across all {} tools:** {} calls · {} errors ({:.1}%) · {} truncated outputs",
+            rows.len(),
+            calls,
+            errors,
+            if calls > 0 { errors as f64 * 100.0 / calls as f64 } else { 0.0 },
+            truncated
         ),
         String::new(),
         "| Tool Name | MCP | Calls | Sess | Errs | Err% | Trunc | Avg KB | p50/p95 Wait | Total Wait | Harnesses | Sample Error |".to_string(),
         "| :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | :--- | :--- |".to_string(),
     ];
-    for t in rows {
+    for t in shown {
         let p_wait = match (t.p50_wait_s, t.p95_wait_s) {
             (Some(p50), Some(p95)) => format!("{p50:.1}s/{p95:.1}s"),
             (Some(p50), None) => format!("{p50:.1}s/-"),
@@ -3504,6 +3520,12 @@ pub fn query_top_sessions(
     Ok(out)
 }
 
+/// Session ids are long UUIDs (or harness-prefixed paths); 10 chars is enough to grep transcripts.
+fn short_session_id(id: &str) -> &str {
+    let id = id.rsplit(['/', ':']).next().unwrap_or(id);
+    &id[..id.len().min(10)]
+}
+
 pub fn format_sessions_report(
     repo_name: &str,
     sort_by: &str,
@@ -3516,12 +3538,13 @@ pub fn format_sessions_report(
     let mut lines = vec![
         format!("# Top Sessions in `{repo_name}` (sorted by `{sort_by}`, showing {})", rows.len()),
         String::new(),
-        "| Harness | Model | Role | Started | Turns | Cmds | Tools | Model Toks | Cache Hit | Est $ | API/Tool Wall | Ctx% | Outcome | Errs | Top Families |".to_string(),
-        "| :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | :--- | ---: | :--- |".to_string(),
+        "| Session | Harness | Model | Role | Started | Turns | Cmds | Tools | Model Toks | Cache Hit | Est $ | API/Tool Wall | Ctx% | Outcome | Errs | Top Families |".to_string(),
+        "| :--- | :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | :--- | ---: | :--- |".to_string(),
     ];
     for s in rows {
         lines.push(format!(
-            "| `{}` | {} | {}{} | {} | {} | {} | {} | {} | {} | ${:.2} | {:.0}s/{:.0}s | {} | {} | {} | {} |",
+            "| `{}` | `{}` | {} | {}{} | {} | {} | {} | {} | {} | {} | ${:.2} | {:.0}s/{:.0}s | {} | {} | {} | {} |",
+            short_session_id(&s.session_id),
             s.agent_kind,
             s.model.as_deref().map(|m| trunc(m, 18)).unwrap_or_else(|| "-".into()),
             s.role,

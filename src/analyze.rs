@@ -3289,6 +3289,15 @@ pub fn inspect_finding(
         .iter()
         .chain(report.harness_overhead.iter())
         .find(|o| o.id.eq_ignore_ascii_case(query))
+        .or_else(|| {
+            // Stable issue keys (`kind:target`) from `bottledeck issues` resolve to the same finding.
+            let (kind, target) = issues::parse_issue_key(query)?;
+            report
+                .opportunities
+                .iter()
+                .chain(report.harness_overhead.iter())
+                .find(|o| o.kind == kind && o.target == target)
+        })
         .cloned();
     let target_match = opp
         .as_ref()
@@ -3301,7 +3310,10 @@ pub fn inspect_finding(
             }
             o.target.clone()
         })
-        .unwrap_or_else(|| query.to_string());
+        .unwrap_or_else(|| match issues::parse_issue_key(query) {
+            Some((_, target)) => target.to_string(),
+            None => query.to_string(),
+        });
     let target_lower = target_match.to_ascii_lowercase();
 
     let mut stmt = conn.prepare(&format!(
