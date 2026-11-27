@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod analyze;
 pub mod config;
+pub mod context;
 pub mod db;
 pub mod guide;
 pub mod ingest;

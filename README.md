@@ -39,7 +39,7 @@ Coding agents — **Claude Code**, **Codex**, **Antigravity**, and **Kimi Code**
 Run `bottledeck` in any terminal to sync local transcripts and open the dashboard:
 
 <p align="center">
-  <img src="assets/tui-insights.png" alt="bottledeck TUI — Tab 1 Insights: KPI strip, deduplicated signals table with harness attribution, and 2-column Insight Card" width="100%" />
+  <img src="assets/tui-insights.png" alt="bottledeck TUI — Tab 1 Insights: KPI strip, issues grouped by cost (waiting, context, failures, workflow gaps) with share of repo totals, and a detail pane with shapes, a real session episode, and fix" width="100%" />
 </p>
 
 <details>
@@ -65,7 +65,8 @@ Run `bottledeck` in any terminal to sync local transcripts and open the dashboar
 | :--- | :--- | :--- |
 | `1`–`6` / `Tab` / `Shift-Tab` | Global | Switch views (`1 Insights`, `2 Patterns`, `3 Harnesses`, `4 Commands`, `5 Brief`, `6 Issues`) |
 | `j` / `k` / `↑` / `↓` | Global | Navigate rows or scroll (`PgUp`/`PgDn`, `g`/`G` to jump) |
-| `Enter` | `1 Insights` | Open redacted trace drill-down for the selected signal (or pick repo in drawer) |
+| `Enter` | `1 Insights` | Open the session drill-down for the selected issue: every affected session, matched calls with the commands around them (or pick repo in drawer) |
+| `Tab` / `Shift-Tab` / `e` | Session drill-down | Jump to next / previous session · show or hide stderr for failed calls |
 | `f` | `1 Insights` | Cycle scope filter (`Repo fixes` → `All signals` → `Harness overhead`) |
 | `v` | `2 Patterns` | Cycle view (`Workflows` → `Burst Storms` → `Drift & Cold-Start`) |
 | `s` | `4 Commands` | Cycle sort/view (`Token Sinks` → `Slowest` → `Most Errors` → `MCP`) |

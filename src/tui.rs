@@ -3,10 +3,13 @@ use crate::analyze::issues::{
     list_markers, remove_marker, track_issues,
 };
 use crate::analyze::{
-    CommandStat, FleetReport, InspectResult, Opportunity, RepoReport, analyze_fleet, analyze_repo,
-    format_compact, format_duration_human, inspect_finding,
+    CommandStat, FleetReport, InspectResult, Opportunity, RepoKpis, RepoReport, analyze_fleet,
+    analyze_repo, format_compact, format_duration_human, inspect_finding,
 };
 use crate::config::{AdapterRoots, TimeRange, parse_window_ms};
+use crate::context::{
+    Episode, EpisodeLine, FindingContext, LineRole, ShapeSummary, finding_context,
+};
 use crate::ingest::sync_all;
 use crate::patterns::{
     CrossSessionPatternsReport, HarnessBreakdown, ToolStat, analyze_cross_session_patterns,
@@ -225,6 +228,12 @@ pub struct App {
     pub issues: Option<IssuesReport>,
     pub issues_state: TableState,
     pub issues_open_only: bool,
+    pub modal_show_stderr: bool,
+    modal_episode_offsets: Vec<u16>,
+    /// Display-row state for the grouped Insights list (group headers are extra rows).
+    opp_list_state: TableState,
+    /// Session episodes / shapes per finding, keyed by repo, window and finding id.
+    finding_ctx: HashMap<String, FindingContext>,
     pub status_msg: String,
     pub update_available: Option<String>,
     pub should_quit: bool,
@@ -301,6 +310,10 @@ impl App {
             issues: None,
             issues_state: TableState::default(),
             issues_open_only: false,
+            modal_show_stderr: false,
+            modal_episode_offsets: Vec::new(),
+            opp_list_state: TableState::default(),
+            finding_ctx: HashMap::new(),
             status_msg,
             update_available: crate::update::cached_available_update(),
             should_quit: false,
@@ -362,7 +375,73 @@ impl App {
         if self.scope_filter == ScopeFilter::All {
             raw.sort_by_key(|o| std::cmp::Reverse(o.score));
         }
-        merge_opportunities(&raw)
+        let mut merged = merge_opportunities(&raw);
+        // Group by what the finding costs; stable so score order holds within a group.
+        merged.sort_by_key(|m| cost_family(&m.primary.kind));
+        merged
+    }
+
+    fn ctx_key(&self, opp: &Opportunity) -> String {
+        let repo = self
+            .selected_repo
+            .as_ref()
+            .map(|r| r.repo_id.as_str())
+            .unwrap_or("");
+        format!("{repo}|{}|{}", self.window_label(), opp.id)
+    }
+
+    fn ctx_view(&self, opp: &Opportunity) -> CtxView<'_> {
+        match self.finding_ctx.get(&self.ctx_key(opp)) {
+            Some(c) => CtxView::Ready(c),
+            None => CtxView::Loading,
+        }
+    }
+
+    /// The finding whose detail pane is on screen, if any.
+    fn focused_finding(&self) -> Option<Opportunity> {
+        if self.modal.is_some() || self.focus != Focus::Main {
+            return None;
+        }
+        match self.tab {
+            DetailTab::Insights => {
+                let idx = self.opp_state.selected()?;
+                self.visible_insights().get(idx).map(|m| m.primary.clone())
+            }
+            DetailTab::Harnesses => {
+                let idx = self.harness_issue_state.selected()?;
+                match self.selected_harness_issues().get(idx) {
+                    Some(HarnessIssueItem::Opp(m)) => Some(m.primary.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// True when the visible detail pane is still waiting for its session context.
+    pub fn needs_context(&self) -> bool {
+        self.focused_finding()
+            .is_some_and(|o| !self.finding_ctx.contains_key(&self.ctx_key(&o)))
+    }
+
+    /// Loads session episodes for the visible finding. Returns whether anything was loaded.
+    pub fn prepare_context(&mut self, conn: &Connection) -> Result<bool> {
+        let Some(opp) = self.focused_finding() else {
+            return Ok(false);
+        };
+        let key = self.ctx_key(&opp);
+        if self.finding_ctx.contains_key(&key) {
+            return Ok(false);
+        }
+        let Some(repo_id) = self.selected_repo.as_ref().map(|r| r.repo_id.clone()) else {
+            return Ok(false);
+        };
+        let win_label = self.window_label();
+        let range = TimeRange::from_window(parse_window_ms(win_label)?, win_label);
+        // A failed lookup still caches an empty context so the pane stops showing "loading".
+        let ctx = finding_context(conn, &repo_id, &opp, &range, 3).unwrap_or_default();
+        self.finding_ctx.insert(key, ctx);
+        Ok(true)
     }
 
     fn visible_harness_rows(&self) -> Vec<HarnessRowSummary> {
@@ -714,6 +793,7 @@ impl App {
             .and_then(|i| self.fleet.repos.get(i))
             .and_then(|r| analyze_cross_session_patterns(conn, &r.repo_id, &range).ok());
         self.issues = None;
+        self.finding_ctx.clear();
         self.reset_tab_selections();
         self.refresh_cached_brief();
         Ok(())
@@ -789,7 +869,7 @@ impl App {
         state.select(Some(next));
     }
 
-    fn handle_key(
+    pub fn handle_key(
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
@@ -817,6 +897,26 @@ impl App {
                     self.modal = None;
                     self.modal_scroll = 0;
                 }
+                KeyCode::Char('e') => self.modal_show_stderr = !self.modal_show_stderr,
+                KeyCode::Tab | KeyCode::Char('n') => {
+                    if let Some(&next) = self
+                        .modal_episode_offsets
+                        .iter()
+                        .find(|&&o| o > self.modal_scroll)
+                    {
+                        self.modal_scroll = next;
+                    }
+                }
+                KeyCode::BackTab | KeyCode::Char('p') => {
+                    self.modal_scroll = self
+                        .modal_episode_offsets
+                        .iter()
+                        .rev()
+                        .find(|&&o| o < self.modal_scroll)
+                        .copied()
+                        .unwrap_or(0);
+                }
+                KeyCode::Char('g') => self.modal_scroll = 0,
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.modal_scroll = self.modal_scroll.saturating_add(2);
                 }
@@ -1216,11 +1316,17 @@ pub fn run_tui(
     let run_res = (|| -> Result<()> {
         while !app.should_quit {
             terminal.draw(|f| draw(f, &mut app))?;
-            if event::poll(Duration::from_millis(200))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                app.handle_key(key.code, key.modifiers, conn, roots)?;
+            // When the detail pane is waiting for session context, load it only once input is
+            // idle, so holding j/k scrolls freely and only the row you stop on is queried.
+            let wait = if app.needs_context() { 30 } else { 200 };
+            if event::poll(Duration::from_millis(wait))? {
+                if let Event::Key(key) = event::read()?
+                    && key.kind == KeyEventKind::Press
+                {
+                    app.handle_key(key.code, key.modifiers, conn, roots)?;
+                }
+            } else {
+                app.prepare_context(conn)?;
             }
             if app.tab == DetailTab::Issues
                 && let Err(e) = app.ensure_issues(conn)
@@ -1936,7 +2042,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_footer(frame, outer[2], app);
 
     if let Some(inspect) = &app.modal {
-        draw_inspect_modal(frame, area, inspect, app.modal_scroll);
+        let offsets = draw_inspect_modal(
+            frame,
+            area,
+            inspect,
+            app.modal_scroll,
+            app.modal_show_stderr,
+        );
+        app.modal_episode_offsets = offsets;
     } else if app.show_help {
         draw_help_modal(frame, area);
     }
@@ -2143,146 +2256,749 @@ fn draw_active_tab(frame: &mut Frame, area: Rect, app: &mut App) {
 // Shared Diagnosis Card Renderer (Used by Tab 1 Insights & Tab 3 Harnesses)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Finding context: cost families, denominators, definitions and episodes
+// ---------------------------------------------------------------------------
+
+/// What a finding costs, used to group the Insights list so rows in a group share one unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CostFamily {
+    Waiting,
+    Context,
+    Failures,
+    Shortcuts,
+}
+
+impl CostFamily {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Waiting => "WAITING",
+            Self::Context => "CONTEXT",
+            Self::Failures => "FAILURES/RETRIES",
+            Self::Shortcuts => "WORKFLOW GAPS",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Waiting => Color::Yellow,
+            Self::Context => Color::Cyan,
+            Self::Failures => Color::Red,
+            Self::Shortcuts => Color::LightBlue,
+        }
+    }
+}
+
+fn cost_family(kind: &str) -> CostFamily {
+    match kind {
+        "polling_tax" | "slow_task_latency" => CostFamily::Waiting,
+        "repeated_file_reread"
+        | "truncated_output_reread"
+        | "state_dir_bypass"
+        | "noisy_task_output"
+        | "output_filtering_tax"
+        | "context_handoff_bloat"
+        | "context_pressure"
+        | "low_cache_efficiency" => CostFamily::Context,
+        "broken_task_error_rate"
+        | "lossy_task_rebound"
+        | "flag_thrash"
+        | "tool_friction"
+        | "session_abort_rate"
+        | "file_edit_churn" => CostFamily::Failures,
+        _ => CostFamily::Shortcuts,
+    }
+}
+
+/// A finding's cost in its family's unit, plus its share of the repo-wide total when one exists.
+struct CostMeasure {
+    value: String,
+    amount: Option<f64>,
+    share: Option<f64>,
+}
+
+fn cost_measure(o: &Opportunity, k: &RepoKpis) -> CostMeasure {
+    let of = |amount: f64, total: f64| CostMeasure {
+        value: String::new(),
+        amount: Some(amount),
+        share: (total > 0.0).then(|| (amount / total).clamp(0.0, 1.0)),
+    };
+    let tok_key = match o.kind.as_str() {
+        "repeated_file_reread" | "truncated_output_reread" => Some("total_tokens"),
+        "state_dir_bypass" => Some("stdout_tokens"),
+        "noisy_task_output" => Some("effective_context_tokens"),
+        _ => None,
+    };
+    match o.kind.as_str() {
+        "polling_tax" | "slow_task_latency" => {
+            let w = ev_f64(o, "total_wait_s").unwrap_or(0.0);
+            CostMeasure {
+                value: format_duration(w),
+                ..of(w, k.total_tool_wait_s)
+            }
+        }
+        _ if tok_key.is_some() => {
+            let t = tok_key.and_then(|key| ev_u64(o, key)).unwrap_or(0) as i64;
+            CostMeasure {
+                value: format_compact(t),
+                ..of(t as f64, k.total_effective_tokens as f64)
+            }
+        }
+        _ => CostMeasure {
+            value: compact_opp_metric(o),
+            amount: None,
+            share: None,
+        },
+    }
+}
+
+fn family_denominator(f: CostFamily, k: &RepoKpis) -> Option<(f64, String)> {
+    match f {
+        CostFamily::Waiting if k.total_tool_wait_s > 0.0 => Some((
+            k.total_tool_wait_s,
+            format!("{} tool wait", format_duration(k.total_tool_wait_s)),
+        )),
+        CostFamily::Context if k.total_effective_tokens > 0 => Some((
+            k.total_effective_tokens as f64,
+            format!(
+                "{} tool-output tokens",
+                format_compact(k.total_effective_tokens)
+            ),
+        )),
+        _ => None,
+    }
+}
+
+fn pct_label(share: f64) -> String {
+    let p = share * 100.0;
+    if p > 0.0 && p < 1.0 {
+        "<1%".into()
+    } else {
+        format!("{p:.0}%")
+    }
+}
+
+/// Sessions with the finding, and their share of all analyzed sessions.
+fn finding_reach(o: &Opportunity, k: &RepoKpis) -> Option<(u64, f64)> {
+    let s = ev_u64(o, "sessions")?;
+    let total = k.sessions_analyzed as f64;
+    Some((s, if total > 0.0 { s as f64 / total } else { 0.0 }))
+}
+
+fn who_label(counts: &BTreeMap<String, usize>) -> (String, Color) {
+    let total: usize = counts.values().sum();
+    let Some((top, n)) = counts
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+    else {
+        return ("—".into(), Color::DarkGray);
+    };
+    if total > 0 && *n as f64 / total as f64 >= 0.65 {
+        (short_harness(top).to_string(), harness_color(top))
+    } else {
+        ("mixed".into(), Color::Gray)
+    }
+}
+
+fn who_spans(counts: &BTreeMap<String, usize>) -> Vec<Span<'static>> {
+    let total: usize = counts.values().sum();
+    let mut items: Vec<(&String, &usize)> = counts.iter().collect();
+    items.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let mut spans = Vec::new();
+    for (i, (name, n)) in items.iter().take(4).enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        let pct = if total > 0 {
+            (**n as f64 / total as f64 * 100.0).round() as usize
+        } else {
+            0
+        };
+        spans.push(Span::styled(
+            format!("{} {pct}%", short_harness(name)),
+            Style::default().fg(harness_color(name)),
+        ));
+    }
+    spans
+}
+
+/// The "where" of a finding, without the problem-type prefix the headline adds.
+fn where_label(o: &Opportunity) -> String {
+    match o.kind.as_str() {
+        "tool_friction" => clean_tool_label(&o.target),
+        "low_cache_efficiency" => short_harness(
+            o.target
+                .strip_suffix(" cache hit rate")
+                .unwrap_or(&o.target),
+        )
+        .to_string(),
+        "context_handoff_bloat" => "resumed / handoff threads".into(),
+        "orientation_tax" => "first 3 turns".into(),
+        "output_filtering_tax" => "repo CLI output".into(),
+        "cli_help_tax" => "repo CLI --help".into(),
+        "harness_divergence" => match (ev_str(o, "top_harness"), ev_str(o, "low_harness")) {
+            (Some(t), Some(l)) => format!(
+                "{} vs {}: {}",
+                short_harness(t),
+                short_harness(l),
+                ev_str(o, "metric").unwrap_or("")
+            ),
+            _ => o.target.clone(),
+        },
+        _ => o.target.clone(),
+    }
+}
+
+/// Paths keep their tail (the distinguishing part); other text keeps its head.
+fn fit_where(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max < 4 {
+        return truncate_ellipsis(s, max);
+    }
+    if s.contains('/') && !s.contains(' ') {
+        let tail: String = s.chars().skip(n - (max - 1)).collect();
+        format!("…{tail}")
+    } else {
+        truncate_ellipsis(s, max)
+    }
+}
+
+/// One plain sentence defining the problem type, shown above the numbers.
+fn problem_definition(kind: &str) -> &'static str {
+    match kind {
+        "polling_tax" => {
+            "The agent calls a wait/status command again and again instead of blocking once. Every call costs a model turn."
+        }
+        "slow_task_latency" => "A command blocks the agent for a long time on every run.",
+        "lossy_task_rebound" => {
+            "After a repo command runs, the agent falls back to raw shell commands to get what it actually needed."
+        }
+        "flag_thrash" => "A command fails and the agent retries it with different flags.",
+        "tool_friction" => {
+            "A tool call fails or returns truncated output, so the agent retries or works around it."
+        }
+        "broken_task_error_rate" => "A repo command fails on a large share of its runs.",
+        "state_dir_bypass" => {
+            "The agent reads a tool's state files directly instead of asking a CLI for the answer."
+        }
+        "output_filtering_tax" => {
+            "The agent pipes repo CLI output through tail/grep/sed because the full output is too noisy."
+        }
+        "noisy_task_output" => {
+            "A command prints far more output than the agent needs, and all of it lands in context."
+        }
+        "repeated_file_reread" => {
+            "The same file is read again and again, paying context tokens each time."
+        }
+        "truncated_output_reread" => {
+            "Output was cut off, so the agent re-reads the spilled file to recover it."
+        }
+        "file_edit_churn" => "The same file is edited over and over within sessions.",
+        "context_handoff_bloat" => {
+            "Resumed or handed-off threads carry far more tokens than fresh ones."
+        }
+        "context_pressure" => "Sessions run close to the context limit and get compacted.",
+        "session_abort_rate" => "Many sessions end aborted or interrupted.",
+        "low_cache_efficiency" => {
+            "Little of the prompt is served from cache, so tokens are paid at full price."
+        }
+        "orientation_tax" => "Sessions spend their first turns rediscovering the repo.",
+        "cli_help_tax" => "The agent looks up --help for the same commands again and again.",
+        "missing_composite_task" => "The agent types the same multi-step command chain by hand.",
+        "harness_divergence" => {
+            "One harness hits this far more often than another on the same repo."
+        }
+        _ => "A recurring friction pattern in agent sessions.",
+    }
+}
+
+/// The finding's current value in the same terms as its success target.
+fn current_value(o: &Opportunity) -> Option<String> {
+    let pct = |k: &str| ev_f64(o, k).map(|v| format!("{:.0}%", v * 100.0));
+    match o.kind.as_str() {
+        "polling_tax" => {
+            ev_f64(o, "avg_calls_per_session").map(|v| format!("{v:.1} calls/session"))
+        }
+        "slow_task_latency" => {
+            ev_f64(o, "p50_wait_s").map(|v| format!("p50 {}", format_duration(v)))
+        }
+        "repeated_file_reread" | "truncated_output_reread" => ev_u64(o, "total_tokens")
+            .map(|v| format!("{} tokens in re-reads", format_compact(v as i64))),
+        "state_dir_bypass" => ev_u64(o, "direct_reads").map(|v| format!("{v} direct reads")),
+        "lossy_task_rebound" => pct("rebound_rate").map(|p| format!("{p} of runs fall back")),
+        "broken_task_error_rate" => pct("error_rate").map(|p| format!("{p} of runs fail")),
+        "tool_friction" => {
+            if ev_u64(o, "errors").unwrap_or(0) >= 3 {
+                pct("error_rate").map(|p| format!("{p} of calls error"))
+            } else {
+                ev_u64(o, "truncated").map(|v| format!("{v} truncated outputs"))
+            }
+        }
+        "cli_help_tax" => ev_u64(o, "help_calls").map(|v| format!("{v} --help lookups")),
+        "missing_composite_task" | "flag_thrash" => {
+            ev_u64(o, "occurrences").map(|v| format!("{v} occurrences"))
+        }
+        "low_cache_efficiency" => pct("weighted_cache_hit").map(|p| format!("{p} cache hit")),
+        "context_handoff_bloat" => ev_f64(o, "multiplier").map(|m| format!("{m:.1}× fresh tokens")),
+        _ => None,
+    }
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+/// Greedy word wrap so panes can budget their height exactly.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let wl = word.chars().count();
+        let cl = cur.chars().count();
+        if cl > 0 && cl + 1 + wl > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        if wl > width {
+            // Hard-break very long tokens (paths, hashes).
+            let mut chars: Vec<char> = word.chars().collect();
+            while chars.len() > width {
+                let head: String = chars.drain(..width).collect();
+                if !cur.trim().is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                out.push(head);
+            }
+            cur.push_str(&chars.into_iter().collect::<String>());
+        } else {
+            cur.push_str(word);
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn section_header(label: &str, color: Color) -> Span<'static> {
+    Span::styled(
+        label.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn shape_letter(i: usize) -> char {
+    (b'A' + (i as u8).min(25)) as char
+}
+
+/// One episode line, pre-truncated to `width` so it never wraps.
+fn episode_line(l: &EpisodeLine, width: usize) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let turn = l
+        .turn_idx
+        .map(|t| format!("{t:>5}  "))
+        .unwrap_or_else(|| "       ".into());
+    match l.role {
+        LineRole::Gap => Line::from(vec![
+            Span::styled(turn, dim),
+            Span::styled(
+                truncate_ellipsis(&format!("· {}", l.text), width.saturating_sub(7)),
+                dim,
+            ),
+        ]),
+        LineRole::More => Line::from(Span::styled(
+            truncate_ellipsis(&format!("       … {}", l.text), width),
+            dim,
+        )),
+        LineRole::Match | LineRole::Context => {
+            let is_match = l.role == LineRole::Match;
+            let exit = l
+                .exit_code
+                .filter(|c| *c != 0)
+                .map(|c| format!("  exit {c}"))
+                .unwrap_or_default();
+            let rep = l
+                .repeat
+                .filter(|r| *r >= 2)
+                .map(|r| format!("  ← {} same call", ordinal(r)))
+                .unwrap_or_default();
+            let used = 7 + 2 + exit.chars().count() + rep.chars().count();
+            let text = truncate_ellipsis(&l.text, width.saturating_sub(used).max(12));
+            Line::from(vec![
+                Span::styled(turn, dim),
+                Span::styled(
+                    if is_match { "▸ " } else { "  " },
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    text,
+                    if is_match {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                ),
+                Span::styled(exit, Style::default().fg(Color::Red)),
+                Span::styled(rep, Style::default().fg(Color::LightYellow)),
+            ])
+        }
+    }
+}
+
+fn episode_header_spans(
+    ep: &Episode,
+    ctx: &FindingContext,
+    with_branch: bool,
+    with_shape: bool,
+) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![
+        Span::styled(
+            short_harness(&ep.agent_kind).to_string(),
+            Style::default().fg(harness_color(&ep.agent_kind)),
+        ),
+        Span::styled(format!(" · {}", ep.started_at), dim),
+    ];
+    if with_branch && let Some(b) = &ep.git_branch {
+        spans.push(Span::styled(
+            format!(" · {}", truncate_ellipsis(b, 24)),
+            dim,
+        ));
+    }
+    spans.push(Span::styled(
+        format!(
+            " · turns {}–{} of {}",
+            ep.first_turn, ep.last_turn, ep.turn_count
+        ),
+        dim,
+    ));
+    spans.push(Span::styled(
+        format!(" · {} matches", ep.matched),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    if with_shape && let Some((i, s)) = episode_shape(ep, ctx) {
+        spans.push(Span::styled(
+            format!("  {} {}", shape_letter(i), s.label),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans
+}
+
+fn episode_shape<'a>(ep: &Episode, ctx: &'a FindingContext) -> Option<(usize, &'a ShapeSummary)> {
+    let key = ep.shape.as_deref()?;
+    ctx.shapes.iter().enumerate().find(|(_, s)| s.key == key)
+}
+
+/// Whether the detail pane has the finding's episodes yet.
+#[derive(Clone, Copy)]
+enum CtxView<'a> {
+    Loading,
+    Ready(&'a FindingContext),
+}
+
 fn render_opportunity_diagnosis(
     frame: &mut Frame,
     area: Rect,
     item: &MergedInsight,
+    kpis: Option<&RepoKpis>,
+    ctx: CtxView<'_>,
     focused: bool,
 ) {
     let o = &item.primary;
-    let (_, sev_col) = human_problem(&o.kind);
-    let headline = insight_headline(o);
-    let (scope_badge, scope_col) = if o.scope == "harness" {
-        ("AGENT RUNTIME", Color::LightBlue)
-    } else {
-        ("REPO HARNESS", Color::Green)
+    let (problem, sev_col) = human_problem(&o.kind);
+    let dim = Style::default().fg(Color::DarkGray);
+    let w = area.width.saturating_sub(4) as usize;
+    let h = area.height.saturating_sub(2) as usize;
+    let fam = cost_family(&o.kind);
+    let ready = match ctx {
+        CtxView::Ready(c) => Some(c),
+        CtxView::Loading => None,
     };
 
-    let card_title = Line::from(vec![
+    let title = Line::from(vec![
         Span::styled(" ● ", Style::default().fg(sev_col)),
         Span::styled(
             format!(
-                "{} ",
-                truncate_ellipsis(&headline, area.width.saturating_sub(28).max(16) as usize)
+                "{problem} · {} ",
+                fit_where(
+                    &where_label(o),
+                    w.saturating_sub(problem.len() + 22).max(12)
+                )
             ),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!("[{scope_badge}] "),
-            Style::default().fg(scope_col).add_modifier(Modifier::BOLD),
-        ),
     ]);
+    let fix_in = Line::from(Span::styled(
+        format!(
+            " fix in: {} ",
+            if o.scope == "harness" {
+                "agent"
+            } else {
+                "repo"
+            }
+        ),
+        Style::default().fg(if o.scope == "harness" {
+            Color::LightBlue
+        } else {
+            Color::Green
+        }),
+    ))
+    .right_aligned();
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // 1. Plain-English Diagnosis
-    lines.push(Line::from(Span::styled(
-        "WHAT'S HAPPENING",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    for para in insight_story(o) {
-        lines.push(Line::from(para));
+    // 1. What it is, and what happened, in plain words.
+    let mut top: Vec<Line<'static>> = Vec::new();
+    for l in wrap_words(problem_definition(&o.kind), w) {
+        top.push(Line::styled(l, dim));
     }
+    for para in insight_story(o) {
+        for l in wrap_words(&para, w) {
+            top.push(Line::from(l));
+        }
+    }
+
+    // 2. Cost with denominators.
+    top.push(Line::from(""));
+    top.push(Line::from(section_header("COST IN CONTEXT", Color::Cyan)));
+    let bar_w = (w / 5).clamp(6, 16);
+    let label_w = 9;
+    if let Some(k) = kpis {
+        let m = cost_measure(o, k);
+        match (m.share, family_denominator(fam, k)) {
+            (Some(share), Some((_, den))) => {
+                let label = if fam == CostFamily::Waiting {
+                    "Wait"
+                } else {
+                    "Tokens"
+                };
+                top.push(Line::from(vec![
+                    Span::styled(format!("{label:<label_w$}"), dim),
+                    Span::styled(
+                        format!("{:>9}  ", m.value),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(bar_string(share, bar_w), Style::default().fg(fam.color())),
+                    Span::raw(format!("  {} ", pct_label(share))),
+                    Span::styled(format!("of {den}"), dim),
+                ]));
+            }
+            _ => top.push(Line::from(vec![
+                Span::styled(format!("{:<label_w$}", "Impact"), dim),
+                Span::styled(
+                    primary_metric_for(item),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ])),
+        }
+        if let Some((s, frac)) = finding_reach(o, k) {
+            top.push(Line::from(vec![
+                Span::styled(format!("{:<label_w$}", "Sessions"), dim),
+                Span::styled(
+                    format!("{s:>9}  "),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(bar_string(frac, bar_w), Style::default().fg(fam.color())),
+                Span::raw(format!("  {} ", pct_label(frac))),
+                Span::styled(format!("of {} sessions", k.sessions_analyzed), dim),
+            ]));
+        }
+    }
+    let mut who = vec![Span::styled(format!("{:<label_w$}", "Who"), dim)];
+    who.extend(who_spans(&o.by_harness));
+    top.push(Line::from(who));
     if !item.related.is_empty() {
         let also: Vec<String> = item
             .related
             .iter()
-            .map(|r| {
-                let (rl, _) = human_problem(&r.kind);
-                let m = compact_opp_metric(r);
-                format!("{rl} ({m})")
-            })
+            .map(|r| format!("{} ({})", human_problem(&r.kind).0, compact_opp_metric(r)))
             .collect();
-        lines.push(Line::from(vec![
+        top.push(Line::from(vec![
+            Span::styled(format!("{:<label_w$}", "Related"), dim),
             Span::styled(
-                "Related: ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                truncate_ellipsis(&also.join(" · "), w.saturating_sub(label_w)),
+                Style::default().fg(Color::Yellow),
             ),
-            Span::styled(also.join(" · "), Style::default().fg(Color::Yellow)),
         ]));
     }
 
-    // 2. Who hits this (visual harness bars)
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "WHICH HARNESS HITS THIS",
-        Style::default()
-            .fg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD),
-    )));
-    let bar_w = if area.width >= 56 { 14 } else { 10 };
-    lines.extend(harness_bar_lines(&o.by_harness, bar_w));
-
-    // 3. Cleaned Concrete Evidence
-    let cleaned_proofs: Vec<String> = o
-        .trace_proof
-        .iter()
-        .map(|tp| {
-            if let Some(rest) = tp.strip_prefix("Sample error: ") {
-                let unquoted = rest.trim_matches('`');
-                let c = clean_error_preview(unquoted);
-                if c.is_empty() {
-                    String::new()
-                } else {
-                    format!("Error: {c}")
+    // 3. Shapes: distinct behaviours behind this one row.
+    let mut shapes: Vec<Line<'static>> = Vec::new();
+    if let Some(c) = ready
+        && !c.shapes.is_empty()
+    {
+        shapes.push(Line::from(vec![
+            section_header("SHAPES", Color::Cyan),
+            Span::styled(
+                format!(
+                    "  all {} sessions with any matching call",
+                    c.affected_sessions
+                ),
+                dim,
+            ),
+        ]));
+        for (i, s) in c.shapes.iter().enumerate() {
+            let muted = s.key == "one_off";
+            shapes.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", shape_letter(i)),
+                    Style::default()
+                        .fg(if muted {
+                            Color::DarkGray
+                        } else {
+                            Color::Yellow
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<20}", s.label),
+                    if muted {
+                        dim
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    },
+                ),
+                Span::styled(format!("{} calls · {} sess", s.calls, s.sessions), dim),
+            ]));
+            if !muted {
+                for l in wrap_words(&s.description, w.saturating_sub(4)) {
+                    shapes.push(Line::styled(format!("    {l}"), dim));
                 }
-            } else {
-                tp.clone()
             }
-        })
-        .filter(|s| !s.is_empty())
-        .take(3)
-        .collect();
-    if !cleaned_proofs.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "REAL EVIDENCE FROM TRACES",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for tp in cleaned_proofs {
-            lines.push(Line::from(Span::styled(
-                format!("• {tp}"),
-                Style::default().fg(Color::Gray),
-            )));
         }
     }
 
-    // 4. Actionable Fix & Plain-English Goal
-    let (fix_text, goal_text) = insight_fix_guidance(o);
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "HOW TO FIX ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+    // 4. Fix: shape-specific where we know the shape, with the current value next to the target.
+    let (generic_fix, goal) = insight_fix_guidance(o);
+    let dominant = ready.and_then(|c| {
+        c.dominant_shape().map(|d| {
+            let i = c.shapes.iter().position(|s| s.key == d.key).unwrap_or(0);
+            (i, d)
+        })
+    });
+    let mut fix: Vec<Line<'static>> = Vec::new();
+    let (fix_text, fix_tag) = match dominant {
+        Some((i, d)) if o.scope == "repo" => (
+            d.fix.clone(),
+            format!("  for shape {}: {}", shape_letter(i), d.label),
         ),
-        Span::styled(
-            format!("({})", o.fix_target),
-            Style::default().fg(Color::DarkGray),
-        ),
+        _ => (generic_fix, format!("  ({})", o.fix_target)),
+    };
+    fix.push(Line::from(vec![
+        section_header("FIX", Color::Green),
+        Span::styled(truncate_ellipsis(&fix_tag, w.saturating_sub(4)), dim),
     ]));
-    lines.push(Line::from(fix_text));
-    lines.push(Line::from(vec![
-        Span::styled("Success target: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(goal_text, Style::default().fg(Color::Green)),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Press [Enter] to inspect full redacted command/tool trace samples",
-        Style::default().fg(Color::DarkGray),
-    )));
+    for l in wrap_words(&fix_text, w) {
+        fix.push(Line::from(l));
+    }
+    let mut target = Vec::new();
+    if let Some(now) = current_value(o) {
+        target.push(Span::styled("Now ", dim));
+        target.push(Span::raw(now));
+        target.push(Span::styled("  →  ", dim));
+    } else {
+        target.push(Span::styled("Target ", dim));
+    }
+    target.push(Span::styled(goal, Style::default().fg(Color::Green)));
+    fix.push(Line::from(target));
 
+    // 5. Example episode gets whatever height is left.
+    let fixed = top.len() + 1 + shapes.len() + usize::from(!shapes.is_empty()) + 1 + fix.len();
+    let room = h.saturating_sub(fixed);
+    let mut example: Vec<Line<'static>> = Vec::new();
+    match ready {
+        None => {
+            example.push(Line::from(vec![
+                section_header("EXAMPLE", Color::Cyan),
+                Span::styled("  loading session context…", dim),
+            ]));
+        }
+        Some(c) => {
+            if let Some(ep) = c.representative() {
+                let mut head = vec![section_header("EXAMPLE", Color::Cyan)];
+                if let Some((i, s)) = episode_shape(ep, c) {
+                    head.push(Span::styled(
+                        format!("  shape {} · {}", shape_letter(i), s.label),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                example.push(Line::from(head));
+                let mut meta = vec![Span::raw("       ")];
+                meta.extend(episode_header_spans(ep, c, false, false));
+                example.push(Line::from(meta));
+                let budget = room.saturating_sub(2);
+                let fits = ep.lines.len() <= budget;
+                let take = if fits {
+                    ep.lines.len()
+                } else {
+                    budget.saturating_sub(1)
+                };
+                for l in ep.lines.iter().take(take) {
+                    example.push(episode_line(l, w));
+                }
+                if !fits && budget > 0 {
+                    example.push(Line::styled(
+                        "       … press Enter for the full session and others",
+                        dim,
+                    ));
+                }
+            } else {
+                let proofs: Vec<String> = o
+                    .trace_proof
+                    .iter()
+                    .map(|tp| tp.strip_prefix("Sample error: ").unwrap_or(tp).to_string())
+                    .take(3)
+                    .collect();
+                if !proofs.is_empty() {
+                    example.push(Line::from(section_header("EVIDENCE", Color::Cyan)));
+                    for p in proofs {
+                        for l in wrap_words(&format!("• {p}"), w) {
+                            example.push(Line::styled(l, Style::default().fg(Color::Gray)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if example.len() > room.max(1) {
+        example.truncate(room.max(1));
+    }
+
+    let mut lines = top;
+    lines.push(Line::from(""));
+    if !shapes.is_empty() {
+        lines.extend(shapes);
+        lines.push(Line::from(""));
+    }
+    if !example.is_empty() {
+        lines.extend(example);
+        lines.push(Line::from(""));
+    }
+    lines.extend(fix);
+
+    let enter_hint = match ready {
+        Some(c) if c.affected_sessions > 0 => {
+            format!(" Enter: all {} sessions ", c.affected_sessions)
+        }
+        _ => " Enter: traces ".to_string(),
+    };
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(rounded_block(card_title, focused)),
+        Paragraph::new(lines).block(
+            rounded_block(title, focused)
+                .title_top(fix_in)
+                .title_bottom(Line::styled(enter_hint, dim).right_aligned()),
+        ),
         area,
     );
 }
@@ -2451,12 +3167,12 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
     let panes = if side_by_side {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(rows[1])
     } else {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(rows[1])
     };
 
@@ -2482,104 +3198,224 @@ fn draw_insights_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         .block(rounded_block(filter_title, focused));
         frame.render_widget(p, panes[0]);
     } else {
-        let max_score = merged
-            .iter()
-            .map(|m| m.primary.score.max(1))
-            .max()
-            .unwrap_or(1) as f64;
-        let show_load_bar = panes[0].width >= 56;
-        let issue_w = if show_load_bar {
-            panes[0].width.saturating_sub(38).max(16) as usize
+        let dim = Style::default().fg(Color::DarkGray);
+        // Inner width: borders (2) + padding (2) + highlight symbol (2).
+        let inner = panes[0].width.saturating_sub(6) as usize;
+        let wide = inner >= 96;
+        let medium = inner >= 62;
+        let problem_w = 18usize;
+        let cost_w = 7usize;
+        let bar_w = if wide { 10 } else { 6 };
+        let share_w = if medium { bar_w + 5 } else { 4 };
+        let reach_w = if wide {
+            10
+        } else if medium {
+            5
         } else {
-            panes[0].width.saturating_sub(30).max(16) as usize
+            0
         };
+        let who_w = if wide { 7 } else { 0 };
+        let fix_w = if wide { 5 } else { 0 };
+        let ncols = 4 + usize::from(reach_w > 0) + usize::from(who_w > 0) + usize::from(fix_w > 0);
+        let where_w = inner
+            .saturating_sub(problem_w + cost_w + share_w + reach_w + who_w + fix_w + (ncols - 1))
+            .max(10);
 
-        let header = if show_load_bar {
-            Row::new(vec![
-                Cell::from("Origin"),
-                Cell::from("Issue"),
-                Cell::from(Line::from("Impact").right_aligned()),
-                Cell::from("Load"),
-            ])
-        } else {
-            Row::new(vec![
-                Cell::from("Origin"),
-                Cell::from("Issue"),
-                Cell::from(Line::from("Impact").right_aligned()),
-            ])
+        let mut header_cells = vec![
+            Cell::from("PROBLEM"),
+            Cell::from("WHERE"),
+            Cell::from(Line::from("COST").right_aligned()),
+            Cell::from("SHARE"),
+        ];
+        if reach_w > 0 {
+            header_cells.push(Cell::from(Line::from("REACH").right_aligned()));
         }
-        .style(
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-        );
+        if who_w > 0 {
+            header_cells.push(Cell::from("WHO"));
+        }
+        if fix_w > 0 {
+            header_cells.push(Cell::from("FIX"));
+        }
+        let header = Row::new(header_cells).style(dim.add_modifier(Modifier::BOLD));
 
-        let table_rows: Vec<Row> = merged
-            .iter()
-            .map(|item| {
-                let o = &item.primary;
-                let (_, sev_col) = human_problem(&o.kind);
-                let (tag, tag_col) = if o.scope == "harness" {
-                    ("HARN", Color::LightBlue)
-                } else {
-                    ("REPO", Color::Green)
-                };
-                let origin_cell = Cell::from(Line::from(vec![
-                    Span::styled("● ", Style::default().fg(sev_col)),
-                    Span::styled(
-                        tag,
-                        Style::default().fg(tag_col).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                let headline = insight_headline(o);
-                let issue_cell = Cell::from(truncate_ellipsis(&headline, issue_w));
-                let metric = primary_metric_for(item);
-                let impact_cell = Cell::from(Line::from(metric).right_aligned())
-                    .style(Style::default().fg(Color::White));
-
-                if show_load_bar {
-                    let frac = (o.score.max(0) as f64 / max_score).sqrt().clamp(0.15, 1.0);
-                    let bar_cell =
-                        Cell::from(bar_string(frac, 6)).style(Style::default().fg(sev_col));
-                    Row::new(vec![origin_cell, issue_cell, impact_cell, bar_cell])
-                } else {
-                    Row::new(vec![origin_cell, issue_cell, impact_cell])
+        let mut table_rows: Vec<Row> = Vec::new();
+        let mut selected_row = None;
+        let mut current: Option<CostFamily> = None;
+        for (i, item) in merged.iter().enumerate() {
+            let o = &item.primary;
+            let fam = cost_family(&o.kind);
+            if current != Some(fam) {
+                current = Some(fam);
+                let members: Vec<&MergedInsight> = merged
+                    .iter()
+                    .filter(|m| cost_family(&m.primary.kind) == fam)
+                    .collect();
+                // Subtotal row: the group's total in the same columns as its members.
+                let mut cells = vec![Cell::from(Span::styled(
+                    format!("▾ {}", fam.label()),
+                    Style::default()
+                        .fg(fam.color())
+                        .add_modifier(Modifier::BOLD),
+                ))];
+                match family_denominator(fam, k) {
+                    Some((den, label)) => {
+                        let sum: f64 = members
+                            .iter()
+                            .filter_map(|m| cost_measure(&m.primary, k).amount)
+                            .sum();
+                        let value = if fam == CostFamily::Waiting {
+                            format_duration(sum)
+                        } else {
+                            format_compact(sum as i64)
+                        };
+                        let share = (sum / den).clamp(0.0, 1.0);
+                        cells.push(Cell::from(Span::styled(
+                            fit_where(&format!("of {label}"), where_w),
+                            dim,
+                        )));
+                        cells.push(
+                            Cell::from(Line::from(value).right_aligned()).style(
+                                Style::default()
+                                    .fg(fam.color())
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        );
+                        cells.push(Cell::from(if medium {
+                            Line::from(vec![
+                                Span::styled(
+                                    bar_string(share, bar_w),
+                                    Style::default().fg(fam.color()),
+                                ),
+                                Span::styled(
+                                    format!(" {:>4}", pct_label(share)),
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                            ])
+                        } else {
+                            Line::from(pct_label(share))
+                        }));
+                    }
+                    None => cells.push(Cell::from(Span::styled(
+                        format!(
+                            "{} issue{}",
+                            members.len(),
+                            if members.len() == 1 { "" } else { "s" }
+                        ),
+                        dim,
+                    ))),
                 }
-            })
-            .collect();
+                table_rows.push(Row::new(cells));
+            }
+            if app.opp_state.selected() == Some(i) {
+                selected_row = Some(table_rows.len());
+            }
 
-        let constraints: Vec<Constraint> = if show_load_bar {
-            vec![
-                Constraint::Length(6),
-                Constraint::Fill(1),
-                Constraint::Length(17),
-                Constraint::Length(6),
-            ]
-        } else {
-            vec![
-                Constraint::Length(6),
-                Constraint::Fill(1),
-                Constraint::Length(17),
-            ]
-        };
+            let (problem, sev_col) = human_problem(&o.kind);
+            let m = cost_measure(o, k);
+            let mut cells = vec![
+                Cell::from(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(sev_col)),
+                    Span::raw(problem),
+                ])),
+                Cell::from(fit_where(&where_label(o), where_w)),
+            ];
+            // Rows without a repo-wide denominator show "number | unit" across COST and SHARE.
+            let (num, unit) = match m.share {
+                Some(_) => (m.value.clone(), String::new()),
+                None => match m.value.split_once(' ') {
+                    Some((n, u)) if n.chars().count() <= cost_w => (n.to_string(), u.to_string()),
+                    _ => (String::new(), m.value.clone()),
+                },
+            };
+            cells.push(
+                Cell::from(Line::from(truncate_ellipsis(&num, cost_w)).right_aligned())
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+            );
+            cells.push(match m.share {
+                Some(share) if medium => Cell::from(Line::from(vec![
+                    Span::styled(bar_string(share, bar_w), Style::default().fg(fam.color())),
+                    Span::raw(format!(" {:>4}", pct_label(share))),
+                ])),
+                Some(share) => Cell::from(pct_label(share)),
+                None => Cell::from(Span::styled(truncate_ellipsis(&unit, share_w), dim)),
+            });
+            if reach_w > 0 {
+                let txt = match finding_reach(o, k) {
+                    Some((s, f)) if wide => format!("{s} · {}", pct_label(f)),
+                    Some((_, f)) => pct_label(f),
+                    None => "—".into(),
+                };
+                cells.push(Cell::from(Line::from(txt).right_aligned()));
+            }
+            if who_w > 0 {
+                let (who, col) = who_label(&o.by_harness);
+                cells.push(Cell::from(Span::styled(who, Style::default().fg(col))));
+            }
+            if fix_w > 0 {
+                cells.push(Cell::from(Span::styled(
+                    if o.scope == "harness" {
+                        "agent"
+                    } else {
+                        "repo"
+                    },
+                    dim,
+                )));
+            }
+            table_rows.push(Row::new(cells));
+        }
+
+        let mut constraints = vec![
+            Constraint::Length(problem_w as u16),
+            Constraint::Fill(1),
+            Constraint::Length(cost_w as u16),
+            Constraint::Length(share_w as u16),
+        ];
+        if reach_w > 0 {
+            constraints.push(Constraint::Length(reach_w as u16));
+        }
+        if who_w > 0 {
+            constraints.push(Constraint::Length(who_w as u16));
+        }
+        if fix_w > 0 {
+            constraints.push(Constraint::Length(fix_w as u16));
+        }
+
+        let legend = Line::from(vec![
+            Span::styled(" ● ", Style::default().fg(Color::Red)),
+            Span::styled("breaks work ", dim),
+            Span::styled("● ", Style::default().fg(Color::Yellow)),
+            Span::styled("wastes time/tokens ", dim),
+            Span::styled("● ", Style::default().fg(Color::Cyan)),
+            Span::styled("missing shortcut ", dim),
+            Span::styled(
+                if wide {
+                    "· share: of repo total · reach: of sessions "
+                } else {
+                    ""
+                },
+                dim,
+            ),
+        ]);
 
         let table = Table::new(table_rows, constraints)
             .header(header)
             .column_spacing(1)
-            .block(rounded_block(filter_title, focused))
+            .block(rounded_block(filter_title, focused).title_bottom(legend))
             .row_highlight_style(row_highlight_style())
             .highlight_symbol("▶ ");
-        frame.render_stateful_widget(table, panes[0], &mut app.opp_state);
+        app.opp_list_state.select(selected_row);
+        frame.render_stateful_widget(table, panes[0], &mut app.opp_list_state);
     }
 
-    // 3. Full Plain-English Diagnosis Panel
+    // 3. Detail panel: definition, cost in context, shapes, a real episode, fix.
     if let Some(idx) = app.opp_state.selected()
         && let Some(item) = merged.get(idx)
     {
-        render_opportunity_diagnosis(frame, panes[1], item, false);
+        let ctx = app.ctx_view(&item.primary);
+        render_opportunity_diagnosis(frame, panes[1], item, Some(k), ctx, false);
     } else {
         let p = Paragraph::new(
-            "Select an issue on the left to read its plain-English diagnosis, harness split, real trace evidence, and fix guidance.",
+            "Select an issue on the left to see what it costs, how it happened in real sessions, and how to fix it.",
         )
         .wrap(Wrap { trim: true })
         .block(rounded_block(" Diagnosis ", false));
@@ -3680,7 +4516,9 @@ fn draw_harnesses_tab(frame: &mut Frame, area: Rect, app: &mut App) {
         .and_then(|i| issues.get(i));
     match sel_issue {
         Some(HarnessIssueItem::Opp(m)) => {
-            render_opportunity_diagnosis(frame, bottom[1], m, false);
+            let ctx = app.ctx_view(&m.primary);
+            let kpis = app.selected_repo.as_ref().map(|r| &r.kpis);
+            render_opportunity_diagnosis(frame, bottom[1], m, kpis, ctx, false);
         }
         Some(HarnessIssueItem::McpTool(t)) => {
             render_mcp_tool_diagnosis(frame, bottom[1], t);
@@ -4435,7 +5273,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::raw("Traces  "));
+            spans.push(Span::raw("Sessions  "));
         }
         DetailTab::Patterns => {
             spans.push(Span::styled(
@@ -4565,114 +5403,218 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_inspect_modal(frame: &mut Frame, area: Rect, res: &InspectResult, scroll: u16) {
-    let popup = centered_rect(84, 80, area);
+/// Draws the trace drill-down and returns the scroll offset of each session episode header
+/// (used by Tab / Shift-Tab to jump between sessions).
+fn draw_inspect_modal(
+    frame: &mut Frame,
+    area: Rect,
+    res: &InspectResult,
+    scroll: u16,
+    show_stderr: bool,
+) -> Vec<u16> {
+    let popup = centered_rect(90, 86, area);
     frame.render_widget(Clear, popup);
+    let w = popup.width.saturating_sub(4) as usize;
+    let dim = Style::default().fg(Color::DarkGray);
+    let ctx = &res.context;
 
-    let mut lines = Vec::new();
-    if let Some(opp) = &res.opportunity {
-        let (_, sev_col) = human_problem(&opp.kind);
-        let headline = insight_headline(opp);
-        let badge = if opp.scope == "harness" {
-            "AGENT RUNTIME"
-        } else {
-            "REPO HARNESS"
-        };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut offsets: Vec<u16> = Vec::new();
+
+    let title = if let Some(opp) = &res.opportunity {
+        let (problem, sev_col) = human_problem(&opp.kind);
         lines.push(Line::from(vec![
             Span::styled("● ", Style::default().fg(sev_col)),
             Span::styled(
-                format!("{headline} "),
+                format!("{problem} · {}", where_label(opp)),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("[{badge}]"), Style::default().fg(Color::Gray)),
-        ]));
-        for para in insight_story(opp) {
-            lines.push(Line::from(para));
-        }
-        lines.push(Line::from(vec![
             Span::styled(
-                "Harnesses: ",
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
+                format!(
+                    "   fix in: {}",
+                    if opp.scope == "harness" {
+                        "agent"
+                    } else {
+                        "repo"
+                    }
+                ),
+                dim,
             ),
-            Span::raw(opp.harness_summary.clone()),
         ]));
-        let (fix_text, _) = insight_fix_guidance(opp);
-        lines.push(Line::from(vec![
-            Span::styled("How to fix: ", Style::default().fg(Color::Green)),
-            Span::raw(fix_text),
-        ]));
-        lines.push(Line::from(""));
-    }
-
-    lines.push(Line::from(Span::styled(
+        for l in wrap_words(problem_definition(&opp.kind), w) {
+            lines.push(Line::styled(l, dim));
+        }
+        for para in insight_story(opp) {
+            for l in wrap_words(&para, w) {
+                lines.push(Line::from(l));
+            }
+        }
+        let mut who = vec![Span::styled("Who  ", dim)];
+        who.extend(who_spans(&opp.by_harness));
+        lines.push(Line::from(who));
+        if !ctx.shapes.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(section_header("SHAPES", Color::Cyan)));
+            for (i, s) in ctx.shapes.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", shape_letter(i)),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:<20}", s.label),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        truncate_ellipsis(
+                            &format!(
+                                "{:>4} calls · {:>3} sess — {}",
+                                s.calls, s.sessions, s.description
+                            ),
+                            w.saturating_sub(24),
+                        ),
+                        dim,
+                    ),
+                ]));
+            }
+        }
+        let (problem, _) = human_problem(&opp.kind);
         format!(
-            "Showing {} of {} matching redacted span(s):",
-            res.samples.len(),
+            " {problem} · {} — {} sessions · {} matches ",
+            truncate_ellipsis(&where_label(opp), 40),
+            ctx.affected_sessions,
+            ctx.total_matches
+        )
+    } else {
+        format!(
+            " Traces: {} — {} sessions · {} matches ",
+            truncate_ellipsis(&res.query, 50),
+            ctx.affected_sessions,
             res.total_matching_spans
-        ),
-        Style::default().fg(Color::Gray),
-    )));
+        )
+    };
     lines.push(Line::from(""));
 
-    for (i, s) in res.samples.iter().enumerate() {
-        let wait = s
-            .duration_ms
-            .map(|d| format_duration(d as f64 / 1000.0))
-            .unwrap_or_else(|| "—".into());
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("#{} ", i + 1),
+    if !ctx.episodes.is_empty() {
+        lines.push(Line::styled(
+            truncate_ellipsis(
+                "Sessions with the most matches first.  ▸ matched call   · other calls (collapsed)   ← Nth same call = exact repeat",
+                w,
+            ),
+            dim,
+        ));
+        lines.push(Line::from(""));
+        for ep in &ctx.episodes {
+            offsets.push(lines.len().min(u16::MAX as usize) as u16);
+            let mut head = vec![Span::styled(
+                "▾ ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{} ", short_harness(&s.agent_kind)),
-                Style::default().fg(harness_color(&s.agent_kind)),
-            ),
-            Span::raw(format!(
-                "· {} · turn {} · exit={} · {} toks · {wait}",
-                &s.started_at[..s.started_at.len().min(19)],
-                s.turn_idx,
-                s.exit_code.map_or("n/a".into(), |c| c.to_string()),
-                format_compact(s.stdout_tokens)
-            )),
-        ]));
-        lines.push(Line::from(format!("   cmd:  {}", s.raw_redacted)));
-        if let Some(err) = &s.stderr_preview {
-            lines.push(Line::from(Span::styled(
-                format!("   err:  {err}"),
-                Style::default().fg(Color::Red),
-            )));
+            )];
+            head.extend(episode_header_spans(ep, ctx, true, true));
+            lines.push(Line::from(head));
+            for l in &ep.lines {
+                lines.push(episode_line(l, w));
+                if show_stderr
+                    && matches!(l.role, LineRole::Match | LineRole::Context)
+                    && let Some(err) = &l.stderr
+                {
+                    for e in wrap_words(err, w.saturating_sub(12)).into_iter().take(3) {
+                        lines.push(Line::styled(
+                            format!("         ↳ {e}"),
+                            Style::default().fg(Color::Red),
+                        ));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
         }
-        if let Some(nx) = &s.next_cmd {
-            lines.push(Line::from(Span::styled(
-                format!("   next: {nx}"),
-                Style::default().fg(Color::Yellow),
-            )));
+        let hidden = ctx.affected_sessions.saturating_sub(ctx.episodes.len());
+        if hidden > 0 {
+            lines.push(Line::styled(
+                format!("+ {hidden} more sessions not shown (bottledeck inspect <id> --format json lists every match)"),
+                dim,
+            ));
         }
+    } else {
+        lines.push(Line::styled(
+            format!(
+                "Showing {} of {} matching sample(s):",
+                res.samples.len(),
+                res.total_matching_spans
+            ),
+            dim,
+        ));
         lines.push(Line::from(""));
+        for (i, s) in res.samples.iter().enumerate() {
+            let wait = s
+                .duration_ms
+                .map(|d| format_duration(d as f64 / 1000.0))
+                .unwrap_or_else(|| "—".into());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("#{} ", i + 1),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} ", short_harness(&s.agent_kind)),
+                    Style::default().fg(harness_color(&s.agent_kind)),
+                ),
+                Span::styled(
+                    format!(
+                        "· {} · turn {} · {} toks · {wait}",
+                        &s.started_at[..s.started_at.len().min(16)],
+                        s.turn_idx,
+                        format_compact(s.stdout_tokens)
+                    ),
+                    dim,
+                ),
+            ]));
+            for l in wrap_words(&s.raw_redacted, w.saturating_sub(3)) {
+                lines.push(Line::from(format!("   {l}")));
+            }
+            if show_stderr && let Some(err) = &s.stderr_preview {
+                for e in wrap_words(err, w.saturating_sub(5)).into_iter().take(3) {
+                    lines.push(Line::styled(
+                        format!("   ↳ {e}"),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+            }
+            lines.push(Line::from(""));
+        }
     }
 
-    let modal = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(format!(
-                    " Trace Drill-Down: {} (Esc/Enter close · j/k scroll) ",
-                    res.query
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan))
-                .padding(Padding::uniform(1)),
-        );
+    let modal = Paragraph::new(lines).scroll((scroll, 0)).block(
+        Block::default()
+            .title(Span::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(
+                Line::styled(
+                    format!(
+                        " Esc close · j/k scroll · Tab / Shift-Tab next / prev session · e {} errors ",
+                        if show_stderr { "hide" } else { "show" }
+                    ),
+                    dim,
+                )
+                .right_aligned(),
+            )
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .padding(Padding::horizontal(1)),
+    );
     frame.render_widget(modal, popup);
+    offsets
 }
 
 fn draw_help_modal(frame: &mut Frame, area: Rect) {
@@ -4704,7 +5646,10 @@ fn draw_help_modal(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(
-            "  Insights:   f = Filter scope (All / Repo harness / Agent runtime)  ·  Enter = Traces",
+            "  Insights:   f = Filter scope (All / Repo harness / Agent runtime)  ·  Enter = Sessions",
+        ),
+        Line::from(
+            "  Sessions:   Tab / Shift-Tab = Next / prev session  ·  e = Show/hide errors  ·  g = Top",
         ),
         Line::from("  Patterns:   v = Switch view (Workflows / Burst Storms / Drift & Cold-Start)"),
         Line::from(

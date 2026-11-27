@@ -268,6 +268,12 @@ pub struct TraceSample {
     pub noise_kind: Option<String>,
     pub stderr_preview: Option<String>,
     pub next_cmd: Option<String>,
+    /// Raw epoch-ms start, used to locate the occurrence inside its session timeline.
+    #[serde(skip)]
+    pub started_ms: i64,
+    /// `cmd:<raw>` / `tool:<name>` identity of the occurrence; `None` matches any item at that instant.
+    #[serde(skip)]
+    pub match_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -278,6 +284,7 @@ pub struct InspectResult {
     pub opportunity: Option<Opportunity>,
     pub total_matching_spans: usize,
     pub samples: Vec<TraceSample>,
+    pub context: crate::context::FindingContext,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3283,9 +3290,6 @@ pub fn inspect_finding(
     samples: usize,
 ) -> Result<InspectResult> {
     let report = analyze_repo(conn, repo_id, range, 20)?;
-    let since_ms = range.since_ms;
-    let until_ms = range.upper_bound();
-
     let opp = report
         .opportunities
         .iter()
@@ -3301,6 +3305,33 @@ pub fn inspect_finding(
                 .find(|o| o.kind == kind && o.target == target)
         })
         .cloned();
+    let mut matched = match_finding_samples(conn, repo_id, opp.as_ref(), query, range)?;
+    let context = crate::context::build_finding_context(conn, opp.as_ref(), &matched, 12)?;
+    let total = matched.len();
+    matched.truncate(samples);
+    Ok(InspectResult {
+        repo_id: repo_id.to_string(),
+        repo_name: report.repo_name,
+        query: query.to_string(),
+        opportunity: opp,
+        total_matching_spans: total,
+        samples: matched,
+        context,
+    })
+}
+
+/// Every trace occurrence (command span, tool call, file read or session) that backs a finding,
+/// in the order the matcher ranks them. `opp` is `None` for free-form command-template queries.
+pub fn match_finding_samples(
+    conn: &Connection,
+    repo_id: &str,
+    opp: Option<&Opportunity>,
+    query: &str,
+    range: &TimeRange,
+) -> Result<Vec<TraceSample>> {
+    let since_ms = range.since_ms;
+    let until_ms = range.upper_bound();
+    let opp = opp.cloned();
     let target_match = opp
         .as_ref()
         .map(|o| {
@@ -3395,18 +3426,11 @@ pub fn inspect_finding(
                 },
                 stderr_preview: clean_err,
                 next_cmd: None,
+                started_ms: ts,
+                match_text: Some(format!("tool:{name}")),
             });
         }
-        let total = matched.len();
-        matched.truncate(samples);
-        return Ok(InspectResult {
-            repo_id: repo_id.to_string(),
-            repo_name: report.repo_name,
-            query: query.to_string(),
-            opportunity: opp,
-            total_matching_spans: total,
-            samples: matched,
-        });
+        return Ok(matched);
     }
 
     // Handle file_edit_churn directly from `tool_calls`
@@ -3455,18 +3479,11 @@ pub fn inspect_finding(
                     .map(clean_error_preview)
                     .filter(|s| !s.is_empty()),
                 next_cmd: None,
+                started_ms: ts,
+                match_text: Some(format!("tool:{name}")),
             });
         }
-        let total = matched.len();
-        matched.truncate(samples);
-        return Ok(InspectResult {
-            repo_id: repo_id.to_string(),
-            repo_name: report.repo_name,
-            query: query.to_string(),
-            opportunity: opp,
-            total_matching_spans: total,
-            samples: matched,
-        });
+        return Ok(matched);
     }
 
     // Handle repeated_file_reread and truncated_output_reread directly from `file_reads`
@@ -3510,18 +3527,11 @@ pub fn inspect_finding(
                 noise_kind: None,
                 stderr_preview: None,
                 next_cmd: None,
+                started_ms: ts,
+                match_text: Some(format!("read:{fname}")),
             });
         }
-        let total = matched.len();
-        matched.truncate(samples);
-        return Ok(InspectResult {
-            repo_id: repo_id.to_string(),
-            repo_name: report.repo_name,
-            query: query.to_string(),
-            opportunity: opp,
-            total_matching_spans: total,
-            samples: matched,
-        });
+        return Ok(matched);
     }
 
     // Handle session-level findings directly from `sessions`
@@ -3618,18 +3628,11 @@ pub fn inspect_finding(
                 noise_kind: None,
                 stderr_preview: None,
                 next_cmd: None,
+                started_ms: s.started_at,
+                match_text: None,
             });
         }
-        let total = matched.len();
-        matched.truncate(samples);
-        return Ok(InspectResult {
-            repo_id: repo_id.to_string(),
-            repo_name: report.repo_name,
-            query: query.to_string(),
-            opportunity: opp,
-            total_matching_spans: total,
-            samples: matched,
-        });
+        return Ok(matched);
     }
 
     let div_metric = opp
@@ -3699,6 +3702,8 @@ pub fn inspect_finding(
                 noise_kind: sp.noise_kind.clone(),
                 stderr_preview: clean_err,
                 next_cmd: next.map(|n| n.cmd_template.clone()),
+                started_ms: sp.started_at,
+                match_text: Some(format!("cmd:{}", sp.raw_redacted)),
             });
         }
     }
@@ -3713,17 +3718,7 @@ pub fn inspect_finding(
                 },
         )
     });
-    let total = matched.len();
-    matched.truncate(samples);
-
-    Ok(InspectResult {
-        repo_id: repo_id.to_string(),
-        repo_name: report.repo_name,
-        query: query.to_string(),
-        opportunity: opp,
-        total_matching_spans: total,
-        samples: matched,
-    })
+    Ok(matched)
 }
 
 pub fn resolve_since_timestamp(since: &str, repo_cwd: &Path) -> Result<(i64, String)> {

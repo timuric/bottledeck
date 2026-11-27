@@ -508,7 +508,12 @@ fn end_to_end_ingest_analysis_diff_and_tui_render() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(rendered.contains("bottledeck"));
-    assert!(rendered.contains("Trace Drill-Down"));
+    let ctx = &app.modal.as_ref().unwrap().context;
+    let title = format!(
+        "{} sessions · {} matches",
+        ctx.affected_sessions, ctx.total_matches
+    );
+    assert!(rendered.contains(&title), "missing `{title}`");
 }
 
 #[test]
